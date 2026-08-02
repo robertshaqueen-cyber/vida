@@ -21,8 +21,11 @@ jobs:
       - name: Enable Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install age CLI
-        run: brew install age
+      - name: Install age CLI + expect
+        # age: required by age_cli_interop test (design rule: decryptable by
+        # standard age CLI). expect: drives age's interactive TTY passphrase
+        # prompt. Both must be explicit system deps, not assumed preinstalled.
+        run: brew install age expect
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check

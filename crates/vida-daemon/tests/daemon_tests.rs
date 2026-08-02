@@ -953,6 +953,17 @@ fn conflict_resolve_remote_replaces_vault() {
             .any(|h| h.name == "host-a" || h.name == "host-a2")
     );
 
+    // After resolving to remote, the local state must equal the remote:
+    // a follow-up sync must report NoChange (not re-upload).
+    // Regression guard: a hardcoded remote revision of 0 would make
+    // last_synced_revision < local revision and trigger a false re-upload.
+    let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
+    assert!(
+        matches!(result, SyncResult::NoChange),
+        "sync after resolve-to-remote must be NoChange, got {:?}",
+        result
+    );
+
     // Verify no write-back
     add_test_host(&mut state_b, "new-after-resolve");
     let ct_check = std::fs::read(&state_b.vault_path).unwrap();

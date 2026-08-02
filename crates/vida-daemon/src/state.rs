@@ -324,6 +324,11 @@ impl DaemonState {
                     remote_ciphertext.context(self.i18n.tr("daemon_conflict_no_remote"))?;
                 match choice {
                     ConflictChoice::Remote => {
+                        // Real remote revision from the decrypted remote vault;
+                        // a hardcoded 0 would make the next sync think the local
+                        // side changed and re-upload.
+                        let remote_vault = vida_core::vault::decrypt(&remote_ct, &passphrase)?;
+                        let remote_revision = remote_vault.revision;
                         let new_vault = self
                             .sync
                             .as_mut()
@@ -333,7 +338,7 @@ impl DaemonState {
                                 &remote_meta,
                                 &ct,
                                 revision,
-                                0,
+                                remote_revision,
                                 &passphrase,
                             )
                             .await?;

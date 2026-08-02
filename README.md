@@ -1,13 +1,13 @@
 # vida
 
-**给 AI Agent 和开发者用的终端管理器：加密金库 + SSH 终端 + MCP 服务端。**
+**加密金库 + 主机管理，正在长成一个 AI Agent 可直接操作的终端。**
 
 vida 解决两个问题：
 
 1. **主机凭据安全**：所有 SSH 主机、口令、私钥存进一个 age 加密的金库（`vault.age`），
    标准 `age` CLI 即可解密，支持本地文件夹同步（Dropbox/Syncthing 友好）。
-2. **让 AI Agent 直接操作你的主机**：内置 MCP 服务端，AI 编码助手
-   （Claude Code、Cursor 等）可以通过 MCP 协议读写金库、连接主机，
+2. **让 AI Agent 直接操作你的主机（规划中，M5）**：将内置 MCP 服务端，
+   让 AI 编码助手（Claude Code、Cursor 等）可以通过 MCP 协议读写金库、连接主机，
    无需把凭据喂给任何第三方。
 
 ## 当前状态
@@ -82,7 +82,17 @@ SSH/PTY 终端（规划 M2-M3）
 
 ## 构建与运行
 
+**前置依赖：**
+
+- Rust 工具链（stable）
+- `age` CLI —— 互操作测试（`age_cli_interop`）会真实调用标准 age
+  解密金库，验证「软件停止维护后数据仍可用标准工具解密」
+- `expect` —— age CLI 的交互式口令提示需要 TTY，测试用 expect 驱动
+
 ```bash
+# macOS
+brew install age expect
+
 # 构建
 cargo build --release
 
@@ -92,9 +102,12 @@ cargo run --bin vida-daemon
 # 启动 GUI（第二个终端）
 cargo run --bin vida
 
-# 运行测试
+# 运行测试（需要 age + expect）
 cargo test --workspace
 ```
+
+> 没有安装 age/expect 时，`age_cli_interop` 测试会**失败**（而不是跳过）——
+> 这是有意为之：该测试是设计铁律「金库必须可用标准 age CLI 解密」的唯一验证。
 
 ## 开发文档
 
