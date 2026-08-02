@@ -1,10 +1,10 @@
-use vida_daemon::protocol::{HostRequest, ConflictChoice};
-use vida_daemon::state::DaemonState;
-use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
+use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
+use vida_daemon::protocol::{ConflictChoice, HostRequest};
+use vida_daemon::state::DaemonState;
 
 /// Serialize tests that modify VIDA_CONFIG_DIR env var
 /// to prevent parallel test interference.
@@ -25,18 +25,20 @@ fn test_state(token: &str) -> (DaemonState, tempfile::TempDir) {
 }
 
 fn add_test_host(state: &mut DaemonState, name: &str) {
-    state.update_host(HostRequest {
-        id: None,
-        name: name.to_string(),
-        host: "10.0.0.1".to_string(),
-        user: "root".to_string(),
-        port: 22,
-        tags: vec![],
-        group: None,
-        color: None,
-        password: Some("secret-password-123".to_string()),
-        notes: None,
-    }).unwrap();
+    state
+        .update_host(HostRequest {
+            id: None,
+            name: name.to_string(),
+            host: "10.0.0.1".to_string(),
+            user: "root".to_string(),
+            port: 22,
+            tags: vec![],
+            group: None,
+            color: None,
+            password: Some("secret-password-123".to_string()),
+            notes: None,
+        })
+        .unwrap();
 }
 
 /// Start the real daemon server, return (addr, token, tempdir).
@@ -59,30 +61,44 @@ async fn start_daemon() -> (std::net::SocketAddr, String, tempfile::TempDir) {
     (addr, token, dir)
 }
 
-async fn connect(addr: std::net::SocketAddr) -> (
+async fn connect(
+    addr: std::net::SocketAddr,
+) -> (
     futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
         Message,
     >,
     futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
 ) {
-    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}", addr)).await.unwrap();
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}", addr))
+        .await
+        .unwrap();
     ws.split()
 }
 
 async fn send_recv(
     ws: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
         Message,
     >,
     reader: &mut futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
     msg: &str,
 ) -> serde_json::Value {
-    ws.send(Message::Text(msg.to_string().into())).await.unwrap();
+    ws.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
     match reader.next().await {
         Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
         other => panic!("expected Text, got {:?}", other),
@@ -102,9 +118,17 @@ async fn ws_no_auth_then_list_hosts_rejected() {
 
     // ResponsePayload::Error with #[serde(tag="type")] flattens to:
     // {"id":1,"type":"Error","code":-2,"message":"未认证：首条消息必须是 auth"}
-    assert_eq!(resp["code"], -2, "should return unauthenticated error: {}", resp);
+    assert_eq!(
+        resp["code"], -2,
+        "should return unauthenticated error: {}",
+        resp
+    );
     let resp_str = resp.to_string();
-    assert!(!resp_str.contains("10.0.0.1"), "must not leak host data: {}", resp_str);
+    assert!(
+        !resp_str.contains("10.0.0.1"),
+        "must not leak host data: {}",
+        resp_str
+    );
 }
 
 #[tokio::test]
@@ -113,9 +137,11 @@ async fn ws_wrong_token_rejected() {
     let (mut ws, mut reader) = connect(addr).await;
 
     let resp = send_recv(
-        &mut ws, &mut reader,
+        &mut ws,
+        &mut reader,
         r#"{"method":"Auth","params":{"token":"wrong-token"},"id":1}"#,
-    ).await;
+    )
+    .await;
 
     assert_eq!(resp["code"], -3, "should return token mismatch: {}", resp);
 }
@@ -125,16 +151,32 @@ async fn ws_correct_token_allows_list_hosts() {
     let (addr, token, _dir) = start_daemon().await;
     let (mut ws, mut reader) = connect(addr).await;
 
-    let auth_msg = format!(r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token);
+    let auth_msg = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
     let resp = send_recv(&mut ws, &mut reader, &auth_msg).await;
     assert!(resp["result"]["authenticated"].as_bool().unwrap());
 
     // Create vault so list_hosts won't fail with "vault locked"
-    let resp = send_recv(&mut ws, &mut reader, r#"{"method":"CreateVault","params":{"passphrase":"test-pass"},"id":2}"#).await;
-    assert!(resp["result"].is_object(), "CreateVault should succeed: {}", resp);
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"CreateVault","params":{"passphrase":"test-pass"},"id":2}"#,
+    )
+    .await;
+    assert!(
+        resp["result"].is_object(),
+        "CreateVault should succeed: {}",
+        resp
+    );
 
     let resp = send_recv(&mut ws, &mut reader, r#"{"method":"ListHosts","id":3}"#).await;
-    assert!(resp["result"].is_array(), "should return host list: {}", resp);
+    assert!(
+        resp["result"].is_array(),
+        "should return host list: {}",
+        resp
+    );
 }
 
 #[tokio::test]
@@ -149,9 +191,11 @@ async fn ws_origin_header_rejected() {
         .body(())
         .unwrap();
     let result = tokio_tungstenite::connect_async(request).await;
-    assert!(result.is_err(),
+    assert!(
+        result.is_err(),
         "handshake with Origin + correct token must be rejected at HTTP level, got: {:?}",
-        result.ok());
+        result.ok()
+    );
 
     // Case 2: Origin alone (no token) → same rejection
     let request2 = tokio_tungstenite::tungstenite::http::Request::builder()
@@ -160,7 +204,10 @@ async fn ws_origin_header_rejected() {
         .body(())
         .unwrap();
     let result2 = tokio_tungstenite::connect_async(request2).await;
-    assert!(result2.is_err(), "handshake with Origin alone must also be rejected");
+    assert!(
+        result2.is_err(),
+        "handshake with Origin alone must also be rejected"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -240,14 +287,21 @@ fn remote_missing_after_delete() {
     let dir = tempfile::tempdir().unwrap();
 
     let mut state = DaemonState {
-        token: "t".to_string(), vault: None, passphrase: None,
-        vault_path: dir.path().join("vault.age"), sync: None,
+        token: "t".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state.vault = Some(vida_core::vault::Vault::default());
     state.passphrase = Some("pass".to_string());
     let backend = Box::new(LocalPathBackend::new(dir.path().to_path_buf()));
-    state.sync = Some(SyncCoordinator::with_state(backend, state.vault_path.clone(), None));
+    state.sync = Some(SyncCoordinator::with_state(
+        backend,
+        state.vault_path.clone(),
+        None,
+    ));
 
     // Add a host directly in memory (no disk write)
     {
@@ -271,7 +325,11 @@ fn remote_missing_after_delete() {
 
     // First sync: no remote file → Uploaded
     let (result, _) = tokio_test::block_on(state.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Uploaded { .. }), "expected Uploaded, got {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Uploaded { .. }),
+        "expected Uploaded, got {:?}",
+        result
+    );
 
     // Delete the vault file (simulate remote deletion)
     std::fs::remove_file(&state.vault_path).unwrap();
@@ -279,33 +337,49 @@ fn remote_missing_after_delete() {
     // Don't change local vault — only remote is missing
     // Sync → should detect remote missing
     let (result, _) = tokio_test::block_on(state.sync()).unwrap();
-    assert!(matches!(result, SyncResult::RemoteMissing), "expected RemoteMissing, got {:?}", result);
+    assert!(
+        matches!(result, SyncResult::RemoteMissing),
+        "expected RemoteMissing, got {:?}",
+        result
+    );
 }
 
 #[test]
 fn remote_missing_clear_state_removes_sync_state() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = DaemonState {
-        token: "t".to_string(), vault: None, passphrase: None,
-        vault_path: dir.path().join("vault.age"), sync: None,
+        token: "t".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     // Set up without writing file
     state.vault = Some(vida_core::vault::Vault::default());
     state.passphrase = Some("pass".to_string());
     let backend = Box::new(LocalPathBackend::new(dir.path().to_path_buf()));
-    state.sync = Some(SyncCoordinator::with_state(backend, state.vault_path.clone(), None));
+    state.sync = Some(SyncCoordinator::with_state(
+        backend,
+        state.vault_path.clone(),
+        None,
+    ));
 
     // Sync to establish state (uploads to non-existent remote)
     let (result, _) = tokio_test::block_on(state.sync()).unwrap();
     assert!(matches!(result, SyncResult::Uploaded { .. }));
 
-    let state_path = vida_core::config::config_dir().unwrap().join("sync_state.json");
+    let state_path = vida_core::config::config_dir()
+        .unwrap()
+        .join("sync_state.json");
     assert!(state_path.exists(), "sync state should exist");
 
     state.handle_remote_missing("clear_state").unwrap();
 
-    assert!(!state_path.exists(), "sync state should be deleted after clear_state");
+    assert!(
+        !state_path.exists(),
+        "sync state should be deleted after clear_state"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -318,8 +392,11 @@ fn write_failure_does_not_update_sync_state() {
     let vault_path = dir.path().join("vault.age");
 
     let mut state = DaemonState {
-        token: "t".to_string(), vault: None, passphrase: None,
-        vault_path: vault_path.clone(), sync: None,
+        token: "t".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: vault_path.clone(),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state.create_vault("pass").unwrap();
@@ -328,7 +405,9 @@ fn write_failure_does_not_update_sync_state() {
     let mut sync = SyncCoordinator::with_state(backend, vault_path.clone(), None);
     let ct = vida_core::vault::encrypt(state.vault.as_ref().unwrap(), "pass").unwrap();
     let local = vida_core::sync::LocalVaultInfo {
-        ciphertext: ct, revision: 1, device_id: "test".to_string(),
+        ciphertext: ct,
+        revision: 1,
+        device_id: "test".to_string(),
     };
     tokio_test::block_on(sync.sync(&local)).unwrap();
 
@@ -345,12 +424,17 @@ fn write_failure_does_not_update_sync_state() {
     // NoChange sync should not touch SyncState
     let ct2 = vida_core::vault::encrypt(state.vault.as_ref().unwrap(), "pass").unwrap();
     let local2 = vida_core::sync::LocalVaultInfo {
-        ciphertext: ct2, revision: 1, device_id: "test".to_string(),
+        ciphertext: ct2,
+        revision: 1,
+        device_id: "test".to_string(),
     };
     let _ = tokio_test::block_on(sync.sync(&local2));
 
     let hash_after = sync.state().map(|s| s.last_synced_hash.clone());
-    assert_eq!(hash_before, hash_after, "SyncState must not change on NoChange");
+    assert_eq!(
+        hash_before, hash_after,
+        "SyncState must not change on NoChange"
+    );
 
     #[cfg(unix)]
     {
@@ -375,7 +459,9 @@ fn token_generation_and_persistence() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::metadata(dir.path().join("daemon.token")).unwrap().permissions();
+        let perms = std::fs::metadata(dir.path().join("daemon.token"))
+            .unwrap()
+            .permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
     unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
@@ -468,19 +554,30 @@ fn reveal_credential_returns_plaintext() {
     state.create_vault("pass").unwrap();
     add_test_host(&mut state, "server1");
     let host_id = state.list_hosts().unwrap()[0].id.clone();
-    assert_eq!(state.reveal_credential(&host_id).unwrap(), "secret-password-123");
+    assert_eq!(
+        state.reveal_credential(&host_id).unwrap(),
+        "secret-password-123"
+    );
 }
 
 #[test]
 fn add_host_with_password() {
     let (mut state, _dir) = test_state("tok");
     state.create_vault("pass").unwrap();
-    let summary = state.update_host(HostRequest {
-        id: None, name: "web".to_string(), host: "1.2.3.4".to_string(),
-        user: "admin".to_string(), port: 22, tags: vec!["prod".to_string()],
-        group: Some("servers".to_string()), color: Some("#ff0000".to_string()),
-        password: Some("mypassword".to_string()), notes: Some("notes".to_string()),
-    }).unwrap();
+    let summary = state
+        .update_host(HostRequest {
+            id: None,
+            name: "web".to_string(),
+            host: "1.2.3.4".to_string(),
+            user: "admin".to_string(),
+            port: 22,
+            tags: vec!["prod".to_string()],
+            group: Some("servers".to_string()),
+            color: Some("#ff0000".to_string()),
+            password: Some("mypassword".to_string()),
+            notes: Some("notes".to_string()),
+        })
+        .unwrap();
     assert_eq!(summary.name, "web");
 }
 
@@ -490,12 +587,24 @@ fn update_host_keep_credential() {
     state.create_vault("pass").unwrap();
     add_test_host(&mut state, "original");
     let host_id = state.list_hosts().unwrap()[0].id.clone();
-    state.update_host(HostRequest {
-        id: Some(host_id.clone()), name: "updated".to_string(), host: "10.0.0.1".to_string(),
-        user: "root".to_string(), port: 22, tags: vec![], group: None, color: None,
-        password: None, notes: None,
-    }).unwrap();
-    assert_eq!(state.reveal_credential(&host_id).unwrap(), "secret-password-123");
+    state
+        .update_host(HostRequest {
+            id: Some(host_id.clone()),
+            name: "updated".to_string(),
+            host: "10.0.0.1".to_string(),
+            user: "root".to_string(),
+            port: 22,
+            tags: vec![],
+            group: None,
+            color: None,
+            password: None,
+            notes: None,
+        })
+        .unwrap();
+    assert_eq!(
+        state.reveal_credential(&host_id).unwrap(),
+        "secret-password-123"
+    );
 }
 
 #[test]
@@ -532,7 +641,9 @@ fn read_conflict_file_decrypts() {
     let ct = vida_core::vault::encrypt(vault, "pass").unwrap();
     let conflict_path = dir.path().join("vault (conflicted copy 2026-08-01).age");
     std::fs::write(&conflict_path, &ct).unwrap();
-    let hosts = state.read_conflict_file(conflict_path.to_str().unwrap()).unwrap();
+    let hosts = state
+        .read_conflict_file(conflict_path.to_str().unwrap())
+        .unwrap();
     assert_eq!(hosts.len(), 1);
     assert_eq!(hosts[0].name, "conflict-host");
 }
@@ -545,9 +656,14 @@ fn adopt_conflict_file_replaces_vault() {
 
     let mut conflict_vault = vida_core::vault::Vault::default();
     conflict_vault.hosts.push(vida_core::vault::HostEntry {
-        id: uuid::Uuid::new_v4().to_string(), name: "conflict-host".to_string(),
-        host: "192.168.1.1".to_string(), user: "admin".to_string(), port: 22,
-        tags: vec![], group: None, color: None,
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "conflict-host".to_string(),
+        host: "192.168.1.1".to_string(),
+        user: "admin".to_string(),
+        port: 22,
+        tags: vec![],
+        group: None,
+        color: None,
         auth: vida_core::vault::AuthMethod::Password {
             password: vida_core::vault::SecureString::new("conflict-pass".to_string()),
         },
@@ -557,11 +673,17 @@ fn adopt_conflict_file_replaces_vault() {
     let conflict_path = dir.path().join("vault (conflicted copy).age");
     std::fs::write(&conflict_path, &ct).unwrap();
 
-    let hosts = state.adopt_conflict_file(conflict_path.to_str().unwrap()).unwrap();
+    let hosts = state
+        .adopt_conflict_file(conflict_path.to_str().unwrap())
+        .unwrap();
     assert_eq!(hosts.len(), 1);
     assert_eq!(hosts[0].name, "conflict-host");
     assert!(!conflict_path.exists());
-    assert!(dir.path().join("vault (conflicted copy).age.reviewed").exists());
+    assert!(
+        dir.path()
+            .join("vault (conflicted copy).age.reviewed")
+            .exists()
+    );
 }
 
 #[test]
@@ -570,9 +692,15 @@ fn ignore_conflict_file_renames() {
     state.create_vault("pass").unwrap();
     let conflict_path = dir.path().join("vault (conflicted copy).age");
     std::fs::write(&conflict_path, b"fake").unwrap();
-    state.ignore_conflict_file(conflict_path.to_str().unwrap()).unwrap();
+    state
+        .ignore_conflict_file(conflict_path.to_str().unwrap())
+        .unwrap();
     assert!(!conflict_path.exists());
-    assert!(dir.path().join("vault (conflicted copy).age.reviewed").exists());
+    assert!(
+        dir.path()
+            .join("vault (conflicted copy).age.reviewed")
+            .exists()
+    );
 }
 
 #[test]
@@ -582,8 +710,11 @@ fn downloaded_writes_file_and_updates_vault() {
 
     // Device A: create vault with host
     let mut state_a = DaemonState {
-        token: "a".to_string(), vault: None, passphrase: None,
-        vault_path: dir_a.path().join("vault.age"), sync: None,
+        token: "a".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_a.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_a.create_vault("pass").unwrap();
@@ -591,14 +722,21 @@ fn downloaded_writes_file_and_updates_vault() {
 
     // Device B: set up without writing file
     let mut state_b = DaemonState {
-        token: "b".to_string(), vault: None, passphrase: None,
-        vault_path: dir_b.path().join("vault.age"), sync: None,
+        token: "b".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_b.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
     let backend_b = Box::new(LocalPathBackend::new(dir_b.path().to_path_buf()));
-    state_b.sync = Some(SyncCoordinator::with_state(backend_b, state_b.vault_path.clone(), None));
+    state_b.sync = Some(SyncCoordinator::with_state(
+        backend_b,
+        state_b.vault_path.clone(),
+        None,
+    ));
     assert_eq!(state_b.list_hosts().unwrap().len(), 0);
 
     // B uploads empty vault to establish state
@@ -611,7 +749,11 @@ fn downloaded_writes_file_and_updates_vault() {
 
     // B syncs → Downloaded
     let (result, hosts) = tokio_test::block_on(state_b.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Downloaded { .. }), "expected Downloaded, got {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Downloaded { .. }),
+        "expected Downloaded, got {:?}",
+        result
+    );
     assert!(hosts.is_some());
     assert_eq!(hosts.unwrap().len(), 1);
     assert_eq!(state_b.list_hosts().unwrap()[0].name, "host-from-a");
@@ -628,8 +770,11 @@ fn downloaded_write_failure_preserves_sync_state() {
 
     // Device A: create vault with host
     let mut state_a = DaemonState {
-        token: "a".to_string(), vault: None, passphrase: None,
-        vault_path: dir_a.path().join("vault.age"), sync: None,
+        token: "a".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_a.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_a.create_vault("pass").unwrap();
@@ -637,14 +782,21 @@ fn downloaded_write_failure_preserves_sync_state() {
 
     // Device B: set up without writing file
     let mut state_b = DaemonState {
-        token: "b".to_string(), vault: None, passphrase: None,
-        vault_path: dir_b.path().join("vault.age"), sync: None,
+        token: "b".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_b.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
     let backend_b = Box::new(LocalPathBackend::new(dir_b.path().to_path_buf()));
-    state_b.sync = Some(SyncCoordinator::with_state(backend_b, state_b.vault_path.clone(), None));
+    state_b.sync = Some(SyncCoordinator::with_state(
+        backend_b,
+        state_b.vault_path.clone(),
+        None,
+    ));
 
     // B uploads empty vault to establish state
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
@@ -657,8 +809,18 @@ fn downloaded_write_failure_preserves_sync_state() {
     assert!(matches!(result, SyncResult::Downloaded { .. }));
 
     // Record SyncState before the failed sync
-    let hash_before = state_b.sync.as_ref().unwrap().state().map(|s| s.last_synced_hash.clone());
-    let rev_before = state_b.sync.as_ref().unwrap().state().map(|s| s.last_synced_revision);
+    let hash_before = state_b
+        .sync
+        .as_ref()
+        .unwrap()
+        .state()
+        .map(|s| s.last_synced_hash.clone());
+    let rev_before = state_b
+        .sync
+        .as_ref()
+        .unwrap()
+        .state()
+        .map(|s| s.last_synced_revision);
 
     // A adds another host and creates new ciphertext — write to B's dir while still writable
     add_test_host(&mut state_a, "host-from-a2");
@@ -674,13 +836,33 @@ fn downloaded_write_failure_preserves_sync_state() {
 
     // B syncs → coordinator reads file OK (Downloaded), daemon's write_atomic fails
     let result = tokio_test::block_on(state_b.sync());
-    assert!(result.is_err(), "sync should fail when directory is read-only, got: {:?}", result.ok());
+    assert!(
+        result.is_err(),
+        "sync should fail when directory is read-only, got: {:?}",
+        result.ok()
+    );
 
     // SyncState must be unchanged — system still knows it hasn't synced
-    let hash_after = state_b.sync.as_ref().unwrap().state().map(|s| s.last_synced_hash.clone());
-    let rev_after = state_b.sync.as_ref().unwrap().state().map(|s| s.last_synced_revision);
-    assert_eq!(hash_before, hash_after, "SyncState hash must not change on write failure");
-    assert_eq!(rev_before, rev_after, "SyncState revision must not change on write failure");
+    let hash_after = state_b
+        .sync
+        .as_ref()
+        .unwrap()
+        .state()
+        .map(|s| s.last_synced_hash.clone());
+    let rev_after = state_b
+        .sync
+        .as_ref()
+        .unwrap()
+        .state()
+        .map(|s| s.last_synced_revision);
+    assert_eq!(
+        hash_before, hash_after,
+        "SyncState hash must not change on write failure"
+    );
+    assert_eq!(
+        rev_before, rev_after,
+        "SyncState revision must not change on write failure"
+    );
 
     // Fix permissions and sync again → should still return Downloaded (retry succeeds)
     #[cfg(unix)]
@@ -689,7 +871,11 @@ fn downloaded_write_failure_preserves_sync_state() {
         std::fs::set_permissions(dir_b.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let (result, hosts) = tokio_test::block_on(state_b.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Downloaded { .. }), "after fixing permissions, sync should succeed with Downloaded, got {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Downloaded { .. }),
+        "after fixing permissions, sync should succeed with Downloaded, got {:?}",
+        result
+    );
     assert!(hosts.is_some());
     assert!(hosts.unwrap().iter().any(|h| h.name == "host-from-a2"));
 }
@@ -701,8 +887,11 @@ fn conflict_resolve_remote_replaces_vault() {
 
     // Device A: create vault with host
     let mut state_a = DaemonState {
-        token: "a".to_string(), vault: None, passphrase: None,
-        vault_path: dir_a.path().join("vault.age"), sync: None,
+        token: "a".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_a.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_a.create_vault("pass").unwrap();
@@ -710,14 +899,21 @@ fn conflict_resolve_remote_replaces_vault() {
 
     // Device B: set up without writing file
     let mut state_b = DaemonState {
-        token: "b".to_string(), vault: None, passphrase: None,
-        vault_path: dir_b.path().join("vault.age"), sync: None,
+        token: "b".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_b.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
     let backend_b = Box::new(LocalPathBackend::new(dir_b.path().to_path_buf()));
-    state_b.sync = Some(SyncCoordinator::with_state(backend_b, state_b.vault_path.clone(), None));
+    state_b.sync = Some(SyncCoordinator::with_state(
+        backend_b,
+        state_b.vault_path.clone(),
+        None,
+    ));
 
     // B uploads empty vault to establish state
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
@@ -729,7 +925,11 @@ fn conflict_resolve_remote_replaces_vault() {
 
     // B syncs → Downloaded
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Downloaded { .. }), "expected Downloaded, got {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Downloaded { .. }),
+        "expected Downloaded, got {:?}",
+        result
+    );
 
     // Both sides change
     add_test_host(&mut state_a, "host-a2");
@@ -739,17 +939,39 @@ fn conflict_resolve_remote_replaces_vault() {
 
     // B syncs → Conflict
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Conflict { .. }), "expected Conflict, got {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Conflict { .. }),
+        "expected Conflict, got {:?}",
+        result
+    );
 
     // Resolve choosing remote
     let (hosts,) = tokio_test::block_on(state_b.resolve_conflict(ConflictChoice::Remote)).unwrap();
-    assert!(hosts.iter().any(|h| h.name == "host-a" || h.name == "host-a2"));
+    assert!(
+        hosts
+            .iter()
+            .any(|h| h.name == "host-a" || h.name == "host-a2")
+    );
+
+    // After resolving to remote, the local state must equal the remote:
+    // a follow-up sync must report NoChange (not re-upload).
+    // Regression guard: a hardcoded remote revision of 0 would make
+    // last_synced_revision < local revision and trigger a false re-upload.
+    let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
+    assert!(
+        matches!(result, SyncResult::NoChange),
+        "sync after resolve-to-remote must be NoChange, got {:?}",
+        result
+    );
 
     // Verify no write-back
     add_test_host(&mut state_b, "new-after-resolve");
     let ct_check = std::fs::read(&state_b.vault_path).unwrap();
     let vault_check = vida_core::vault::decrypt(&ct_check, "pass").unwrap();
-    assert!(!vault_check.hosts.iter().any(|h| h.name == "host-b"), "old local host-b must not be written back");
+    assert!(
+        !vault_check.hosts.iter().any(|h| h.name == "host-b"),
+        "old local host-b must not be written back"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -762,19 +984,33 @@ async fn get_settings_returns_vault_settings() {
     let (mut ws, mut reader) = connect(addr).await;
 
     // Auth
-    send_recv(&mut ws, &mut reader, &format!(
-        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token
-    )).await;
+    send_recv(
+        &mut ws,
+        &mut reader,
+        &format!(
+            r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+            token
+        ),
+    )
+    .await;
 
     // Create vault
-    send_recv(&mut ws, &mut reader, r#"{"method":"CreateVault","params":{"passphrase":"test123"},"id":2}"#).await;
+    send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"CreateVault","params":{"passphrase":"test123"},"id":2}"#,
+    )
+    .await;
 
     // Get settings — should return defaults
     let resp = send_recv(&mut ws, &mut reader, r#"{"method":"GetSettings","id":3}"#).await;
     assert_eq!(resp["type"], "Ok", "GetSettings should succeed: {}", resp);
     let result = &resp["result"];
     assert_eq!(result["scrollback_lines"], 5000, "default scrollback_lines");
-    assert!(result["sync_local_path"].is_null(), "default sync_local_path is null");
+    assert!(
+        result["sync_local_path"].is_null(),
+        "default sync_local_path is null"
+    );
 }
 
 #[tokio::test]
@@ -783,12 +1019,23 @@ async fn sync_response_includes_new_fields() {
     let (mut ws, mut reader) = connect(addr).await;
 
     // Auth
-    send_recv(&mut ws, &mut reader, &format!(
-        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token
-    )).await;
+    send_recv(
+        &mut ws,
+        &mut reader,
+        &format!(
+            r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+            token
+        ),
+    )
+    .await;
 
     // Create vault
-    send_recv(&mut ws, &mut reader, r#"{"method":"CreateVault","params":{"passphrase":"test123"},"id":2}"#).await;
+    send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"CreateVault","params":{"passphrase":"test123"},"id":2}"#,
+    )
+    .await;
 
     // Sync — should return a valid SyncResponse with new fields
     let resp = send_recv(&mut ws, &mut reader, r#"{"method":"Sync","id":3}"#).await;
@@ -816,8 +1063,11 @@ fn conflict_sync_returns_remote_hosts() {
 
     // Device A: create vault + host (writes to disk, won't sync until later)
     let mut state_a = DaemonState {
-        token: "a".to_string(), vault: None, passphrase: None,
-        vault_path: dir_a.path().join("vault.age"), sync: None,
+        token: "a".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_a.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_a.create_vault("pass").unwrap();
@@ -825,39 +1075,71 @@ fn conflict_sync_returns_remote_hosts() {
 
     // Device B: vault in memory only (no file on disk)
     let mut state_b = DaemonState {
-        token: "b".to_string(), vault: None, passphrase: None,
-        vault_path: dir_b.path().join("vault.age"), sync: None,
+        token: "b".to_string(),
+        vault: None,
+        passphrase: None,
+        vault_path: dir_b.path().join("vault.age"),
+        sync: None,
         i18n: vida_core::i18n::I18n::default(),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
     let backend_b = Box::new(LocalPathBackend::new(dir_b.path().to_path_buf()));
-    state_b.sync = Some(SyncCoordinator::with_state(backend_b, state_b.vault_path.clone(), None));
+    state_b.sync = Some(SyncCoordinator::with_state(
+        backend_b,
+        state_b.vault_path.clone(),
+        None,
+    ));
 
     // B1: upload empty vault to establish state (no file on disk → upload)
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Uploaded { .. }), "B1 should be Uploaded, got: {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Uploaded { .. }),
+        "B1 should be Uploaded, got: {:?}",
+        result
+    );
 
     // A's file overwrites B's → B2: sync → Downloaded (B's local unchanged)
     let ct_a = std::fs::read(&state_a.vault_path).unwrap();
     std::fs::write(&state_b.vault_path, &ct_a).unwrap();
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
-    assert!(matches!(result, SyncResult::Downloaded { .. }), "B2 should be Downloaded, got: {:?}", result);
+    assert!(
+        matches!(result, SyncResult::Downloaded { .. }),
+        "B2 should be Downloaded, got: {:?}",
+        result
+    );
 
     // NOW both sides change → B3: sync → Conflict
     add_test_host(&mut state_a, "host-a2");
     add_test_host(&mut state_b, "host-b");
     let (result, _) = tokio_test::block_on(state_b.sync()).unwrap();
     match &result {
-        SyncResult::Conflict { remote_ciphertext, .. } => {
-            assert!(remote_ciphertext.is_some(), "Conflict must have remote_ciphertext");
-            let remote = state_b.decrypt_remote_hosts(remote_ciphertext.as_ref().unwrap()).unwrap();
+        SyncResult::Conflict {
+            remote_ciphertext, ..
+        } => {
+            assert!(
+                remote_ciphertext.is_some(),
+                "Conflict must have remote_ciphertext"
+            );
+            let remote = state_b
+                .decrypt_remote_hosts(remote_ciphertext.as_ref().unwrap())
+                .unwrap();
             assert!(!remote.is_empty(), "remote_hosts must not be empty");
-            assert!(remote.iter().any(|h| h.name == "host-a" || h.name == "host-a2"),
-                "remote_hosts should contain A's hosts: {:?}", remote);
+            assert!(
+                remote
+                    .iter()
+                    .any(|h| h.name == "host-a" || h.name == "host-a2"),
+                "remote_hosts should contain A's hosts: {:?}",
+                remote
+            );
             for host in &remote {
-                assert!(host.auth_kind == "password" || host.auth_kind == "key" || host.auth_kind == "key_inline",
-                    "auth_kind must be sanitized, got: {}", host.auth_kind);
+                assert!(
+                    host.auth_kind == "password"
+                        || host.auth_kind == "key"
+                        || host.auth_kind == "key_inline",
+                    "auth_kind must be sanitized, got: {}",
+                    host.auth_kind
+                );
             }
         }
         other => panic!("expected Conflict, got {:?}", other),

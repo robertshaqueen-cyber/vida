@@ -108,15 +108,13 @@ pub fn load_sync_state() -> Result<Option<SyncState>> {
         return Ok(None);
     }
     let data = std::fs::read(&path).context("Failed to read sync state")?;
-    let state: SyncState = serde_json::from_slice(&data)
-        .context("Failed to parse sync state")?;
+    let state: SyncState = serde_json::from_slice(&data).context("Failed to parse sync state")?;
     Ok(Some(state))
 }
 
 pub fn save_sync_state(state: &SyncState) -> Result<()> {
     let path = sync_state_path()?;
-    let data = serde_json::to_vec_pretty(state)
-        .context("Failed to serialize sync state")?;
+    let data = serde_json::to_vec_pretty(state).context("Failed to serialize sync state")?;
     persist::write_atomic(&path, &data)
 }
 
@@ -263,19 +261,20 @@ impl SyncBackend for LocalPathBackend {
 
         // Optimistic concurrency: check current state matches expected
         if let Some(exp) = expected
-            && target.exists() {
-                let current = std::fs::read(&target)
-                    .context("Failed to read remote file for concurrency check")?;
-                let current_hash = sha256_hex(&current);
-                if current_hash != exp.bytes_hash {
-                    anyhow::bail!(
-                        "Conflict: remote file changed since last sync \
+            && target.exists()
+        {
+            let current = std::fs::read(&target)
+                .context("Failed to read remote file for concurrency check")?;
+            let current_hash = sha256_hex(&current);
+            if current_hash != exp.bytes_hash {
+                anyhow::bail!(
+                    "Conflict: remote file changed since last sync \
                          (expected hash {}, got {})",
-                        exp.bytes_hash,
-                        current_hash
-                    );
-                }
+                    exp.bytes_hash,
+                    current_hash
+                );
             }
+        }
 
         // Atomic write: temp → full_fsync → rename → fsync parent
         let dir = self.base_path.clone();
@@ -284,15 +283,13 @@ impl SyncBackend for LocalPathBackend {
         let temp_name = format!(".vault-sync-{}.tmp", uuid::Uuid::new_v4());
         let temp_path = dir.join(&temp_name);
 
-        std::fs::write(&temp_path, data)
-            .context("Failed to write temp sync file")?;
+        std::fs::write(&temp_path, data).context("Failed to write temp sync file")?;
 
         let f = std::fs::File::open(&temp_path)?;
         persist::full_fsync(&f)?;
         drop(f);
 
-        std::fs::rename(&temp_path, &target)
-            .context("Failed to rename sync temp file")?;
+        std::fs::rename(&temp_path, &target).context("Failed to rename sync temp file")?;
 
         let dir_file = std::fs::File::open(&dir)?;
         persist::full_fsync(&dir_file)?;
@@ -327,8 +324,7 @@ impl SyncBackend for LocalPathBackend {
             ));
         }
 
-        let data = std::fs::read(&target)
-            .context("Failed to read remote vault file")?;
+        let data = std::fs::read(&target).context("Failed to read remote vault file")?;
 
         // Truncation check: age files have a minimum reasonable size
         if data.len() < 200 {
@@ -347,12 +343,15 @@ impl SyncBackend for LocalPathBackend {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
 
-        Ok((data, RemoteMeta {
-            bytes_hash: hash,
-            size,
-            modified_at,
-            etag: None,
-        }))
+        Ok((
+            data,
+            RemoteMeta {
+                bytes_hash: hash,
+                size,
+                modified_at,
+                etag: None,
+            },
+        ))
     }
 
     async fn exists(&self, _path: &str) -> Result<bool> {
@@ -362,8 +361,8 @@ impl SyncBackend for LocalPathBackend {
     async fn scan_conflict_files(&self, _dir: &str) -> Result<Vec<ConflictFile>> {
         let mut results = vec![];
 
-        let read_dir = std::fs::read_dir(&self.base_path)
-            .context("Failed to scan for conflict files")?;
+        let read_dir =
+            std::fs::read_dir(&self.base_path).context("Failed to scan for conflict files")?;
 
         for entry in read_dir {
             let entry = entry?;
@@ -446,11 +445,14 @@ impl SyncCoordinator {
     /// Run a sync cycle. `local` contains the current local vault info.
     pub async fn sync(&mut self, local: &LocalVaultInfo) -> Result<SyncResult> {
         // Scan for cloud-service conflict files first
-        let dir = self.vault_path.parent()
+        let dir = self
+            .vault_path
+            .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let conflicts = self.backend.scan_conflict_files(
-            &dir.to_string_lossy()
-        ).await?;
+        let conflicts = self
+            .backend
+            .scan_conflict_files(&dir.to_string_lossy())
+            .await?;
         if !conflicts.is_empty() {
             warn!("Cloud-service conflict files detected: {}", conflicts.len());
             return Ok(SyncResult::ConflictFilesDetected { files: conflicts });
@@ -482,9 +484,10 @@ impl SyncCoordinator {
         match (remote_exists, remote_changed, local_changed) {
             // Remote doesn't exist + local changed → upload
             (false, _, true) => {
-                let meta = self.backend.upload(
-                    &local.ciphertext, &vault_str, None
-                ).await?;
+                let meta = self
+                    .backend
+                    .upload(&local.ciphertext, &vault_str, None)
+                    .await?;
                 self.update_state(local.revision, &meta.bytes_hash);
                 Ok(SyncResult::Uploaded { new_meta: meta })
             }
@@ -500,9 +503,10 @@ impl SyncCoordinator {
             // Remote unchanged + local changed → upload (with optimistic concurrency)
             (true, false, true) => {
                 let expected = remote.map(|(_, m)| m);
-                let meta = self.backend.upload(
-                    &local.ciphertext, &vault_str, expected.as_ref()
-                ).await?;
+                let meta = self
+                    .backend
+                    .upload(&local.ciphertext, &vault_str, expected.as_ref())
+                    .await?;
                 self.update_state(local.revision, &meta.bytes_hash);
                 Ok(SyncResult::Uploaded { new_meta: meta })
             }
@@ -552,9 +556,7 @@ impl SyncCoordinator {
 
         // Step 1: Backup local ciphertext
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let backup_path = backup_dir.join(format!(
-            "vault.local-{}-rev{}.age", ts, local_rev
-        ));
+        let backup_path = backup_dir.join(format!("vault.local-{}-rev{}.age", ts, local_rev));
         std::fs::write(&backup_path, local_ciphertext)
             .context("Failed to write conflict backup")?;
 
@@ -605,9 +607,7 @@ impl SyncCoordinator {
 
         // Step 1: Backup remote ciphertext
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let backup_path = backup_dir.join(format!(
-            "vault.remote-{}.age", ts
-        ));
+        let backup_path = backup_dir.join(format!("vault.remote-{}.age", ts));
         std::fs::write(&backup_path, remote_ciphertext)
             .context("Failed to write conflict backup")?;
 
@@ -623,9 +623,10 @@ impl SyncCoordinator {
 
         // Step 3: Upload local with optimistic concurrency
         let vault_str = self.vault_path.to_string_lossy().to_string();
-        let new_meta = self.backend.upload(
-            local_ciphertext, &vault_str, Some(remote_meta)
-        ).await?;
+        let new_meta = self
+            .backend
+            .upload(local_ciphertext, &vault_str, Some(remote_meta))
+            .await?;
 
         // Step 4: Update SyncState
         let new_state = SyncState {
@@ -655,8 +656,7 @@ impl SyncCoordinator {
         self.state = None;
         let path = sync_state_path()?;
         if path.exists() {
-            std::fs::remove_file(&path)
-                .context("Failed to remove sync state file")?;
+            std::fs::remove_file(&path).context("Failed to remove sync state file")?;
         }
         Ok(())
     }
@@ -741,15 +741,18 @@ pub fn build_conflict_info(
     let local_names: Vec<String> = local.hosts.iter().map(|h| h.name.clone()).collect();
     let remote_names: Vec<String> = remote.hosts.iter().map(|h| h.name.clone()).collect();
 
-    let only_local: Vec<String> = local_names.iter()
+    let only_local: Vec<String> = local_names
+        .iter()
         .filter(|n| !remote_names.contains(n))
         .cloned()
         .collect();
-    let only_remote: Vec<String> = remote_names.iter()
+    let only_remote: Vec<String> = remote_names
+        .iter()
         .filter(|n| !local_names.contains(n))
         .cloned()
         .collect();
-    let both: Vec<String> = local_names.iter()
+    let both: Vec<String> = local_names
+        .iter()
         .filter(|n| remote_names.contains(n))
         .cloned()
         .collect();
@@ -776,7 +779,7 @@ pub fn build_conflict_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{AuthMethod, HostEntry, SecureString, Settings, CURRENT_VAULT_VERSION};
+    use crate::vault::{AuthMethod, CURRENT_VAULT_VERSION, HostEntry, SecureString, Settings};
 
     fn test_vault(name: &str, host_count: usize) -> Vault {
         let hosts = (0..host_count)
@@ -837,9 +840,13 @@ mod tests {
         // Standard Dropbox conflicted copy
         assert!(is_dropbox_copy("vault (conflicted copy 2026-08-01).age"));
         // With username
-        assert!(is_dropbox_copy("vault (Jane's conflicted copy 2026-08-01).age"));
+        assert!(is_dropbox_copy(
+            "vault (Jane's conflicted copy 2026-08-01).age"
+        ));
         // Chinese macOS
-        assert!(is_dropbox_copy("vault (MacBook Pro \u{7684}\u{51b2}\u{7a81}\u{526f}\u{672c} 2026-08-01).age"));
+        assert!(is_dropbox_copy(
+            "vault (MacBook Pro \u{7684}\u{51b2}\u{7a81}\u{526f}\u{672c} 2026-08-01).age"
+        ));
         // Should not match
         assert!(!is_dropbox_copy("vault.age"));
         assert!(!is_dropbox_copy("vault-conflict-notes.age"));
@@ -847,7 +854,9 @@ mod tests {
 
     #[test]
     fn test_syncthing_pattern() {
-        assert!(is_syncthing_conflict("vault.age.sync-conflict-20260801-123456"));
+        assert!(is_syncthing_conflict(
+            "vault.age.sync-conflict-20260801-123456"
+        ));
         assert!(!is_syncthing_conflict("vault.age"));
     }
 
@@ -871,9 +880,7 @@ mod tests {
             device_id: "local-device".into(),
         };
 
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
 
         let result = tokio_test::block_on(coord.sync(&local)).unwrap();
         assert!(matches!(result, SyncResult::Uploaded { .. }));
@@ -896,9 +903,7 @@ mod tests {
             revision: 1,
             device_id: "local-device".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
         tokio_test::block_on(coord.sync(&local)).unwrap();
 
         // Same revision again
@@ -925,9 +930,7 @@ mod tests {
             revision: 1,
             device_id: "device-a".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
         tokio_test::block_on(coord.sync(&local1)).unwrap();
 
         // Manually overwrite remote with v2 (simulating another device)
@@ -964,9 +967,7 @@ mod tests {
             revision: 1,
             device_id: "device-a".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
         tokio_test::block_on(coord.sync(&local1)).unwrap();
 
         // Remote changed
@@ -1009,9 +1010,7 @@ mod tests {
             revision: 1,
             device_id: "device-a".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
         tokio_test::block_on(coord.sync(&local1)).unwrap();
 
         // Delete remote
@@ -1043,9 +1042,7 @@ mod tests {
             revision: 1,
             device_id: "local-device".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
 
         let result = tokio_test::block_on(coord.sync(&local)).unwrap();
         assert!(matches!(result, SyncResult::Conflict { .. }));
@@ -1069,9 +1066,7 @@ mod tests {
             revision: 1,
             device_id: "device-local".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
         tokio_test::block_on(coord.sync(&local)).unwrap();
 
         // Simulate remote v2
@@ -1107,14 +1102,18 @@ mod tests {
         let mut entries: Vec<_> = std::fs::read_dir(&backup_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("vault.local-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("vault.local-"))
             .collect();
         // Sort by modification time descending to get the most recent backup
         entries.sort_by(|a, b| {
-            let t_a = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let t_b = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let t_a = a
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let t_b = b
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             t_b.cmp(&t_a)
         });
         assert!(!entries.is_empty(), "local backup should exist");
@@ -1135,8 +1134,11 @@ mod tests {
             device_id: "device-remote".into(),
         };
         let result2 = tokio_test::block_on(coord.sync(&local2)).unwrap();
-        assert!(matches!(result2, SyncResult::NoChange),
-            "subsequent sync should be NoChange, got {:?}", result2);
+        assert!(
+            matches!(result2, SyncResult::NoChange),
+            "subsequent sync should be NoChange, got {:?}",
+            result2
+        );
     }
 
     #[test]
@@ -1153,9 +1155,7 @@ mod tests {
             revision: 1,
             device_id: "device-a".into(),
         };
-        let mut coord = SyncCoordinator::with_state(
-            Box::new(backend), vault_path.clone(), None
-        );
+        let mut coord = SyncCoordinator::with_state(Box::new(backend), vault_path.clone(), None);
         tokio_test::block_on(coord.sync(&local)).unwrap();
 
         // Remote changed
@@ -1174,12 +1174,8 @@ mod tests {
         let ct_local2 = encrypt_vault(&vault_local2, "pass");
 
         // Resolve choosing local
-        tokio_test::block_on(coord.resolve_conflict_local(
-            &ct_local2,
-            2,
-            &ct_remote,
-            &remote_meta,
-        )).unwrap();
+        tokio_test::block_on(coord.resolve_conflict_local(&ct_local2, 2, &ct_remote, &remote_meta))
+            .unwrap();
 
         // Assert: local file = local v2
         let local_file = std::fs::read(&vault_path).unwrap();
@@ -1190,9 +1186,7 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&backup_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("vault.remote-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("vault.remote-"))
             .collect();
         assert!(!entries.is_empty(), "remote backup should exist");
     }
@@ -1207,25 +1201,49 @@ mod tests {
         let backend = LocalPathBackend::new(dir.path().to_path_buf());
 
         // Create various conflict files
-        std::fs::write(dir.path().join("vault (conflicted copy 2026-08-01).age"), b"").unwrap();
+        std::fs::write(
+            dir.path().join("vault (conflicted copy 2026-08-01).age"),
+            b"",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("vault 2.age"), b"").unwrap();
-        std::fs::write(dir.path().join("vault.age.sync-conflict-20260801-123456"), b"").unwrap();
+        std::fs::write(
+            dir.path().join("vault.age.sync-conflict-20260801-123456"),
+            b"",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("vault-abcd-conflict-1234.age"), b"").unwrap();
 
         // Non-conflict files
         std::fs::write(dir.path().join("vault.age"), b"main").unwrap();
         std::fs::write(dir.path().join("vault backup.age"), b"").unwrap();
 
-        let conflicts = tokio_test::block_on(
-            backend.scan_conflict_files(&dir.path().to_string_lossy())
-        ).unwrap();
+        let conflicts =
+            tokio_test::block_on(backend.scan_conflict_files(&dir.path().to_string_lossy()))
+                .unwrap();
 
         assert_eq!(conflicts.len(), 4, "should find 4 conflict files");
 
         let patterns: Vec<_> = conflicts.iter().map(|c| &c.pattern).collect();
-        assert!(patterns.iter().any(|p| matches!(p, ConflictPattern::DropboxCopy)));
-        assert!(patterns.iter().any(|p| matches!(p, ConflictPattern::DropboxVersion)));
-        assert!(patterns.iter().any(|p| matches!(p, ConflictPattern::Syncthing)));
-        assert!(patterns.iter().any(|p| matches!(p, ConflictPattern::Generic)));
+        assert!(
+            patterns
+                .iter()
+                .any(|p| matches!(p, ConflictPattern::DropboxCopy))
+        );
+        assert!(
+            patterns
+                .iter()
+                .any(|p| matches!(p, ConflictPattern::DropboxVersion))
+        );
+        assert!(
+            patterns
+                .iter()
+                .any(|p| matches!(p, ConflictPattern::Syncthing))
+        );
+        assert!(
+            patterns
+                .iter()
+                .any(|p| matches!(p, ConflictPattern::Generic))
+        );
     }
 }

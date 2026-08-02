@@ -1,14 +1,19 @@
 # vida
 
-**给 AI Agent 和开发者用的终端管理器：加密金库 + SSH 终端 + MCP 服务端。**
+**加密金库 + 主机管理，正在长成一个 AI Agent 可直接操作的终端。**
 
 vida 解决两个问题：
 
 1. **主机凭据安全**：所有 SSH 主机、口令、私钥存进一个 age 加密的金库（`vault.age`），
    标准 `age` CLI 即可解密，支持本地文件夹同步（Dropbox/Syncthing 友好）。
-2. **让 AI Agent 直接操作你的主机**：内置 MCP 服务端，AI 编码助手
-   （Claude Code、Cursor 等）可以通过 MCP 协议读写金库、连接主机，
+2. **让 AI Agent 直接操作你的主机（规划中，M5）**：将内置 MCP 服务端，
+   让 AI 编码助手（Claude Code、Cursor 等）可以通过 MCP 协议读写金库、连接主机，
    无需把凭据喂给任何第三方。
+
+## 当前状态
+
+**早期开发中。** 已实现：加密金库、本地路径同步、主机管理界面。
+规划中：SSH 终端（M2-M3）、标签页/终端会话（M4）、MCP 服务端（M5）。
 
 ## 截图
 
@@ -16,13 +21,19 @@ vida 解决两个问题：
 
 ## 特性
 
+已实现：
+
 - 🔐 **age 加密金库**：scrypt KDF（log_n=18），可用标准 `age` CLI 解密验证
 - 🗝️ **系统钥匙串集成**：可选记住主口令（Keychain）
 - 🔄 **本地路径同步**：Dropbox / Syncthing / iCloud 文件夹同步，带冲突检测
 - 🖥️ **Tabby 风格界面**：标签页 + 快速连接面板 + 搜索
 - 🌐 **多语言**：中文 / English，跟随系统语言
-- 🤖 **MCP 服务端**：AI Agent 通过 stdio↔WebSocket 桥接访问金库与主机
-- 🧹 **零泄漏**：敏感字段 zeroize、原子写入 + fsync、日志永不含凭据
+- 🔒 **凭据保护**：口令显示 15 秒自动隐藏，复制 45 秒后自动清除剪贴板
+
+规划中：
+
+- 🤖 **MCP 服务端**（M5）：AI Agent 通过 stdio↔WebSocket 桥接访问金库与主机
+- 💻 **SSH 终端 / 本地终端**（M2-M3）
 
 ## 安全说明（重要）
 
@@ -36,10 +47,18 @@ vida 解决两个问题：
 - 口令缓存：仅显式勾选时写入系统钥匙串
 
 **不保护什么：**
-- 主机名、地址、端口为明文（为可搜索性和 MCP 工具可用性）
+- 主机数据（名称/地址/端口/用户名）在金库解密后可见 ——
+  金库文件本身是加密的，但解密后这些字段不额外加密
 - 已解锁状态：金库内容驻留内存，具备本机权限的进程理论可读取
 - 主口令丢失：数据永久丢失，无后门、无恢复通道
 - 本机恶意软件：攻击者获得你的用户级权限后，可读取解锁后的内存
+
+### 安全措施（具体做法，非绝对保证）
+
+- 密码与私钥内容永不写入日志
+- 敏感字段使用 zeroize 在 drop 时清零
+- 金库写入采用原子写入 + fsync，避免半写状态
+- `daemon.token`（WebSocket 认证）权限 0600
 
 详细说明见 [SECURITY.md](SECURITY.md)。漏洞上报请走
 [GitHub Security Advisory](https://github.com/robertshaqueen-cyber/vida/security/advisories/new)，
@@ -48,11 +67,12 @@ vida 解决两个问题：
 ## 架构
 
 ```
-vida (GUI)  ──WebSocket──▶  vida-daemon (PTY/SSH/MCP)
+vida (GUI)  ──WebSocket──▶  vida-daemon (金库/同步)
                               │
                               └── 金库 (vault.age, age 加密)
 
-AI Agent ──MCP stdio──▶ vida-mcp-cli ──WebSocket──▶ vida-daemon
+AI Agent ──MCP stdio(规划 M5)──▶ vida-mcp-cli ──WebSocket──▶ vida-daemon
+SSH/PTY 终端（规划 M2-M3）
 ```
 
 - **vida-core** — 金库、加密、同步、多语言（纯逻辑库）
@@ -62,7 +82,17 @@ AI Agent ──MCP stdio──▶ vida-mcp-cli ──WebSocket──▶ vida-dae
 
 ## 构建与运行
 
+**前置依赖：**
+
+- Rust 工具链（stable）
+- `age` CLI —— 互操作测试（`age_cli_interop`）会真实调用标准 age
+  解密金库，验证「软件停止维护后数据仍可用标准工具解密」
+- `expect` —— age CLI 的交互式口令提示需要 TTY，测试用 expect 驱动
+
 ```bash
+# macOS
+brew install age expect
+
 # 构建
 cargo build --release
 
@@ -72,9 +102,12 @@ cargo run --bin vida-daemon
 # 启动 GUI（第二个终端）
 cargo run --bin vida
 
-# 运行测试
+# 运行测试（需要 age + expect）
 cargo test --workspace
 ```
+
+> 没有安装 age/expect 时，`age_cli_interop` 测试会**失败**（而不是跳过）——
+> 这是有意为之：该测试是设计铁律「金库必须可用标准 age CLI 解密」的唯一验证。
 
 ## 开发文档
 

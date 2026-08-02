@@ -2,16 +2,15 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
-use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
 use crate::protocol::{Request, Response, ResponsePayload, SyncResponse};
 use crate::state::DaemonState;
 use vida_core::sync::SyncResult;
-
 
 // ---------------------------------------------------------------------------
 // Token management
@@ -74,24 +73,26 @@ fn tokens_match(a: &str, b: &str) -> bool {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(
-    stream: TcpStream,
-    addr: SocketAddr,
-    state: Arc<Mutex<DaemonState>>,
-) {
+async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<DaemonState>>) {
     info!("New WebSocket connection from {}", addr);
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, #[allow(clippy::result_large_err)]
-    |req: &tokio_tungstenite::tungstenite::http::Request<()>, resp: tokio_tungstenite::tungstenite::http::Response<()>| {
-        if req.headers().contains_key("Origin") {
-            warn!("Rejected connection from {} with Origin header", addr);
-            return Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                .status(403)
-                .body(Some("Origin header not allowed".to_string()))
-                .unwrap());
-        }
-        Ok(resp)
-    }).await {
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        stream,
+        #[allow(clippy::result_large_err)]
+        |req: &tokio_tungstenite::tungstenite::http::Request<()>,
+         resp: tokio_tungstenite::tungstenite::http::Response<()>| {
+            if req.headers().contains_key("Origin") {
+                warn!("Rejected connection from {} with Origin header", addr);
+                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("Origin header not allowed".to_string()))
+                    .unwrap());
+            }
+            Ok(resp)
+        },
+    )
+    .await
+    {
         Ok(ws) => ws,
         Err(e) => {
             error!("WebSocket handshake failed for {}: {}", addr, e);
@@ -246,7 +247,10 @@ async fn handle_request(
             let info = state.create_vault(&passphrase)?;
             Ok(serde_json::to_value(info)?)
         }
-        Request::Unlock { passphrase, remember } => {
+        Request::Unlock {
+            passphrase,
+            remember,
+        } => {
             let info = state.unlock(&passphrase, remember)?;
             Ok(serde_json::to_value(info)?)
         }
@@ -297,13 +301,13 @@ async fn handle_request(
 
             // Extract files and remote_hosts from SyncResult
             let (files, remote_hosts) = match &result {
-                SyncResult::ConflictFilesDetected { files } => {
-                    (Some(files.clone()), None)
-                }
-                SyncResult::Conflict { remote_ciphertext, .. } => {
-                    let remote_hosts = remote_ciphertext.as_ref().and_then(|ct| {
-                        state.decrypt_remote_hosts(ct).ok()
-                    });
+                SyncResult::ConflictFilesDetected { files } => (Some(files.clone()), None),
+                SyncResult::Conflict {
+                    remote_ciphertext, ..
+                } => {
+                    let remote_hosts = remote_ciphertext
+                        .as_ref()
+                        .and_then(|ct| state.decrypt_remote_hosts(ct).ok());
                     (None, remote_hosts)
                 }
                 _ => (None, None),

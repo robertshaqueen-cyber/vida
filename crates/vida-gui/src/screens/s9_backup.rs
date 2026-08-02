@@ -37,8 +37,8 @@ impl State {
             .secure(true)
             .width(Length::Fill);
 
-        let can_export = !self.exporting
-            && (self.use_current || !self.export_passphrase.is_empty());
+        let can_export =
+            !self.exporting && (self.use_current || !self.export_passphrase.is_empty());
 
         let export_btn = if self.exporting {
             button(i18n.tr("backup_exporting")).width(Length::Shrink)

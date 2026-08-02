@@ -129,10 +129,7 @@ mod tests {
             "Host not found: web01"
         );
         let zh = I18n::new(Lang::ZhCn);
-        assert_eq!(
-            zh.trf("backup_exported", &["123"]),
-            "备份已导出 (123 字节)"
-        );
+        assert_eq!(zh.trf("backup_exported", &["123"]), "备份已导出 (123 字节)");
     }
 
     #[test]

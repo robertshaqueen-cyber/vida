@@ -16,9 +16,9 @@ pub fn config_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!(
-            "无法确定配置目录路径。请设置环境变量 VIDA_CONFIG_DIR 指定配置目录。"
-        ))
+        .ok_or_else(|| {
+            anyhow::anyhow!("无法确定配置目录路径。请设置环境变量 VIDA_CONFIG_DIR 指定配置目录。")
+        })
         .map(|d| d.join("vida"))
 }
 
@@ -56,7 +56,10 @@ pub fn load_language_choice() -> Option<String> {
     let path = language_path().ok()?;
     let content = std::fs::read_to_string(path).ok()?;
     let table: toml::Table = toml::from_str(&content).ok()?;
-    table.get("language").and_then(|v| v.as_str()).map(String::from)
+    table
+        .get("language")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Save the language choice to config file.

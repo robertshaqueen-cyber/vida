@@ -21,13 +21,24 @@ pub struct HostItem {
 
 #[derive(Debug, Clone)]
 pub struct State {
-    pub hosts: Vec<HostItem>,
-    pub search_query: String,
+    /// Currently revealed credential `(host_id, plaintext)` for a host,
+    /// auto-hides after 15s. Only shown when the host_id matches the
+    /// currently viewed host.
+    pub revealed_credential: Option<(String, String)>,
+    /// True right after copy, shows "copied, auto-clears in 45s".
+    pub credential_copied: bool,
 }
 
 impl State {
-    /// Top tab bar: tabs on the left, spacer, then settings/lock on the right
-    pub fn view_tab_bar<'a>(tabs: &'a [Tab], active_tab_id: &'a str, i18n: &'a I18n, show_connect_panel: bool) -> Element<'a, AppMessage> {
+    /// Top tab bar: tabs on the left, spacer, then sync/settings/lock on the right
+    pub fn view_tab_bar<'a>(
+        tabs: &'a [Tab],
+        active_tab_id: &'a str,
+        i18n: &'a I18n,
+        show_connect_panel: bool,
+        sync_symbol: &'static str,
+        sync_label: String,
+    ) -> Element<'a, AppMessage> {
         // Tab buttons: text-only, active tab has bottom indicator, with X close button
         let tab_buttons: Vec<Element<'a, AppMessage>> = tabs
             .iter()
@@ -40,19 +51,18 @@ impl State {
                     i18n.tr("main_tab_close"),
                     tooltip::Position::Bottom,
                 );
-                let tab_content = row![label, close_btn].spacing(4).align_y(iced::Alignment::Center);
+                let tab_content = row![label, close_btn]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center);
                 let is_active = tab.id == active_tab_id;
                 let btn = button(tab_content)
                     .on_press(AppMessage::SwitchTab(tab.id.clone()))
                     .style(button::text)
                     .width(Length::Shrink);
                 if is_active {
-                    container(
-                        column![
-                            btn,
-                            rule::horizontal(2),
-                        ]
-                    ).width(Length::Shrink).into()
+                    container(column![btn, rule::horizontal(2),])
+                        .width(Length::Shrink)
+                        .into()
                 } else {
                     btn.into()
                 }
@@ -73,7 +83,11 @@ impl State {
         let connect_panel_btn = tooltip(
             button(text("⊞").size(14))
                 .on_press(AppMessage::ToggleConnectPanel)
-                .style(if show_connect_panel { button::secondary } else { button::text }),
+                .style(if show_connect_panel {
+                    button::secondary
+                } else {
+                    button::text
+                }),
             i18n.tr("main_tab_connect"),
             tooltip::Position::Bottom,
         );
@@ -98,8 +112,21 @@ impl State {
             i18n.tr("main_tab_lock"),
             tooltip::Position::Bottom,
         );
+        // Sync indicator: shows state (synced / local changes / syncing / error),
+        // click to trigger sync
+        let sync_btn = tooltip(
+            button(text(sync_symbol).size(14))
+                .on_press(AppMessage::SyncTriggered)
+                .style(if sync_symbol == "⟳" || sync_symbol == "▲" {
+                    button::secondary
+                } else {
+                    button::text
+                }),
+            text(sync_label),
+            tooltip::Position::Bottom,
+        );
 
-        let right_buttons = row![settings_btn, lock_btn]
+        let right_buttons = row![sync_btn, settings_btn, lock_btn]
             .spacing(4)
             .align_y(iced::Alignment::Center);
 
@@ -156,7 +183,8 @@ impl State {
 
         // All hosts section (filtered by search)
         let search_lower = search.to_lowercase();
-        let filtered: Vec<&HostItem> = hosts.iter()
+        let filtered: Vec<&HostItem> = hosts
+            .iter()
             .filter(|h| {
                 search.is_empty()
                     || h.name.to_lowercase().contains(&search_lower)
@@ -167,9 +195,11 @@ impl State {
 
         if !filtered.is_empty() {
             items.push(text(i18n.tr("main_connect_all_hosts")).size(12).into());
-            let host_items: Vec<Element<'a, AppMessage>> = filtered.iter()
+            let host_items: Vec<Element<'a, AppMessage>> = filtered
+                .iter()
                 .map(|host| {
-                    let label = text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(13);
+                    let label =
+                        text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(13);
                     button(label)
                         .on_press(AppMessage::QuickConnectHost(host.id.clone()))
                         .style(button::text)
@@ -187,26 +217,27 @@ impl State {
                 .on_press(AppMessage::QuickAddHost)
                 .style(button::text)
                 .width(Length::Fill)
-                .into()
+                .into(),
         );
 
-        let panel = column(items)
-            .spacing(4)
-            .padding(8)
-            .width(Length::Fill);
+        let panel = column(items).spacing(4).padding(8).width(Length::Fill);
 
-        container(panel)
-            .padding(4)
-            .into()
+        container(panel).padding(4).into()
     }
 
-    pub fn view_host_detail(&self, host_id: &str, i18n: &I18n) -> Element<'_, AppMessage> {
-        if let Some(host) = self.hosts.iter().find(|h| h.id == host_id) {
+    pub fn view_host_detail<'a>(
+        &'a self,
+        hosts: &'a [HostItem],
+        host_id: &'a str,
+        i18n: &'a I18n,
+    ) -> Element<'a, AppMessage> {
+        if let Some(host) = hosts.iter().find(|h| h.id == host_id) {
             let name = text(&host.name).size(24);
             let conn = text(format!("{}@{}:{}", host.user, host.host, host.port)).size(14);
             let auth = text(i18n.trf("main_auth_kind", &[&host.auth_kind])).size(14);
 
-            let edit_btn = button(i18n.tr("main_edit")).on_press(AppMessage::EditHost(host.id.clone()));
+            let edit_btn =
+                button(i18n.tr("main_edit")).on_press(AppMessage::EditHost(host.id.clone()));
             let reveal_btn = button(i18n.tr("main_reveal_credential"))
                 .on_press(AppMessage::RevealCredential(host.id.clone()));
             let delete_btn = button(i18n.tr("main_delete"))
@@ -217,10 +248,38 @@ impl State {
                 _ => text("").size(13),
             };
 
-            let buttons = row![edit_btn, reveal_btn, delete_btn].spacing(12);
-            let detail = column![name, conn, auth, buttons, notes]
-                .spacing(12)
-                .padding(20);
+            let mut detail_items: Vec<Element<'_, AppMessage>> =
+                vec![name.into(), conn.into(), auth.into()];
+
+            // Revealed credential block: plaintext + copy button, auto-hides in 15s.
+            // Only shown when the revealed credential belongs to THIS host, so
+            // switching tabs never leaks another host's password into this view.
+            let revealed_for_this_host = self
+                .revealed_credential
+                .as_ref()
+                .filter(|(revealed_host_id, _)| revealed_host_id == host_id)
+                .map(|(_, cred)| cred);
+            if let Some(cred) = revealed_for_this_host {
+                let cred_label = text(i18n.tr("main_credential_revealed")).size(12);
+                let cred_value = text(cred.as_str()).size(14);
+                let copy_btn = button(i18n.tr("main_credential_copy"))
+                    .on_press(AppMessage::CopyCredential(cred.clone()))
+                    .width(Length::Shrink);
+                let mut cred_row = row![cred_value, copy_btn]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center);
+                if self.credential_copied {
+                    cred_row = cred_row.push(text(i18n.tr("main_credential_copied")).size(12));
+                }
+                detail_items.push(cred_label.into());
+                detail_items.push(cred_row.into());
+                detail_items.push(text(i18n.tr("main_credential_auto_hide")).size(11).into());
+            }
+
+            detail_items.push(column![row![edit_btn, reveal_btn, delete_btn].spacing(12)].into());
+            detail_items.push(notes.into());
+
+            let detail = column(detail_items).spacing(12).padding(20);
 
             container(detail)
                 .width(Length::Fill)

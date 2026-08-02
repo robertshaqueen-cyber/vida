@@ -11,7 +11,9 @@ pub struct State {
 
 impl State {
     pub fn new(error: String) -> Self {
-        Self { error_message: error }
+        Self {
+            error_message: error,
+        }
     }
 
     pub fn view(&self, i18n: &I18n) -> Element<'_, AppMessage> {
@@ -19,8 +21,7 @@ impl State {
         let subtitle = text(i18n.tr("connection_title")).size(18);
         let error_text = text(&self.error_message).size(14);
 
-        let retry_btn = button(i18n.tr("connection_retry"))
-            .on_press(AppMessage::RetryConnection);
+        let retry_btn = button(i18n.tr("connection_retry")).on_press(AppMessage::RetryConnection);
 
         let content = column![title, subtitle, error_text, retry_btn]
             .spacing(16)

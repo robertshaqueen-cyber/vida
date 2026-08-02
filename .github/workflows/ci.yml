@@ -9,19 +9,29 @@ jobs:
   test:
     name: cargo test + clippy (macOS)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Enable Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - name: Install age CLI + expect
+        # age: required by age_cli_interop test (design rule: decryptable by
+        # standard age CLI). expect: drives age's interactive TTY passphrase
+        # prompt. Both must be explicit system deps, not assumed preinstalled.
+        run: brew install age expect
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo test --workspace (--locked)
+        run: cargo test --workspace --locked
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

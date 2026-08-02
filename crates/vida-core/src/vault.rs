@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
 use age::secrecy::SecretString;
 use age::{Decryptor, Encryptor};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::iter;
@@ -91,7 +91,9 @@ pub struct HostEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthMethod {
-    Password { password: SecureString },
+    Password {
+        password: SecureString,
+    },
     Key {
         private_key_path: String,
         passphrase: Option<SecureString>,
@@ -151,8 +153,8 @@ pub fn encrypt(vault: &Vault, passphrase: &str) -> Result<Vec<u8>> {
 /// Internal encrypt with explicit work factor.
 /// `pub(crate)` for persist.rs's `save_vault_inner`; tests also access directly.
 pub(crate) fn encrypt_inner(vault: &Vault, passphrase: &str, log_n: u8) -> Result<Vec<u8>> {
-    let mut plaintext = Zeroizing::new(serde_json::to_vec_pretty(vault)
-        .context("Failed to serialize vault")?);
+    let mut plaintext =
+        Zeroizing::new(serde_json::to_vec_pretty(vault).context("Failed to serialize vault")?);
 
     let secret = SecretString::from(passphrase.to_owned());
     let mut recipient = age::scrypt::Recipient::new(secret);
@@ -192,8 +194,7 @@ pub fn decrypt(ciphertext: &[u8], passphrase: &str) -> Result<Vault> {
     let mut identity = age::scrypt::Identity::new(secret);
     identity.set_max_work_factor(MAX_DECRYPT_LOG_N);
 
-    let decryptor = Decryptor::new(ciphertext)
-        .context("Failed to parse age encryption header")?;
+    let decryptor = Decryptor::new(ciphertext).context("Failed to parse age encryption header")?;
 
     let mut reader = decryptor
         .decrypt(iter::once(&identity as _))
@@ -236,8 +237,8 @@ pub fn decrypt(ciphertext: &[u8], passphrase: &str) -> Result<Vault> {
 /// Apply JSON-level migration from old_version to CURRENT_VAULT_VERSION.
 /// Missing version field is treated as v1 (pre-versioning era).
 fn migrate_json(plaintext: &[u8], from_version: u32) -> Result<Vec<u8>> {
-    let mut root: serde_json::Value = serde_json::from_slice(plaintext)
-        .context("Failed to parse vault JSON for migration")?;
+    let mut root: serde_json::Value =
+        serde_json::from_slice(plaintext).context("Failed to parse vault JSON for migration")?;
 
     if from_version < 2 {
         migrate_json_v1_to_v2(&mut root)?;
@@ -249,8 +250,7 @@ fn migrate_json(plaintext: &[u8], from_version: u32) -> Result<Vec<u8>> {
         migrate_json_v3_to_v4(&mut root)?;
     }
 
-    serde_json::to_vec_pretty(&root)
-        .context("Failed to serialize migrated vault")
+    serde_json::to_vec_pretty(&root).context("Failed to serialize migrated vault")
 }
 
 /// Migrate raw vault JSON bytes from an old version to current.
@@ -260,17 +260,12 @@ fn migrate_json(plaintext: &[u8], from_version: u32) -> Result<Vec<u8>> {
 /// old formats may not deserialize into current structs.
 ///
 /// Used by `persist::load_vault` when it detects a version mismatch.
-pub fn migrate_vault_json(
-    plaintext: &[u8],
-    backup_path: &Path,
-) -> Result<Vec<u8>> {
-    let mut root: serde_json::Value = serde_json::from_slice(plaintext)
-        .context("Failed to parse vault JSON for migration")?;
+pub fn migrate_vault_json(plaintext: &[u8], backup_path: &Path) -> Result<Vec<u8>> {
+    let mut root: serde_json::Value =
+        serde_json::from_slice(plaintext).context("Failed to parse vault JSON for migration")?;
 
     // Missing version field → treat as v1 (pre-versioning)
-    let version = root.get("version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
+    let version = root.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
     if version > CURRENT_VAULT_VERSION {
         anyhow::bail!(
@@ -285,8 +280,7 @@ pub fn migrate_vault_json(
     }
 
     // Backup original before migration
-    std::fs::write(backup_path, plaintext)
-        .context("Failed to create pre-migration backup")?;
+    std::fs::write(backup_path, plaintext).context("Failed to create pre-migration backup")?;
 
     // Apply migration chain at JSON level
     if version < 2 {
@@ -299,8 +293,8 @@ pub fn migrate_vault_json(
         migrate_json_v3_to_v4(&mut root)?;
     }
 
-    let migrated = serde_json::to_vec_pretty(&root)
-        .context("Failed to serialize migrated vault")?;
+    let migrated =
+        serde_json::to_vec_pretty(&root).context("Failed to serialize migrated vault")?;
     Ok(migrated)
 }
 
@@ -363,9 +357,10 @@ fn migrate_json_v3_to_v4(root: &mut serde_json::Value) -> Result<()> {
 
     // Add sync_local_path to settings (null = sync disabled)
     if let Some(settings) = root.get_mut("settings")
-        && settings.get("sync_local_path").is_none() {
-            settings["sync_local_path"] = serde_json::Value::Null;
-        }
+        && settings.get("sync_local_path").is_none()
+    {
+        settings["sync_local_path"] = serde_json::Value::Null;
+    }
 
     Ok(())
 }
@@ -411,6 +406,11 @@ mod tests {
 
     /// age CLI interop MUST use production work factor (log_n=18).
     /// This test is slow (~0.36s) but validates real-world compatibility.
+    ///
+    /// This is the only validation of design rule "vault must be decryptable
+    /// by the standard age CLI" — it decrypts with the REAL `age` binary.
+    /// It must NOT skip when age/expect is missing; it fails loudly instead,
+    /// because CI installs both via `brew install age expect`.
     #[test]
     fn age_cli_interop() {
         let mut vault = Vault::default();
@@ -437,11 +437,56 @@ mod tests {
         assert!(header.contains("scrypt"), "should be scrypt recipient");
         assert!(header.contains("18"), "should contain log_n=18");
 
-        // Decrypt back
+        // Decrypt back with our own implementation
         let decrypted = decrypt(&encrypted, passphrase).unwrap();
         assert_eq!(decrypted.hosts.len(), 1);
         assert_eq!(decrypted.hosts[0].name, "interop-test");
         assert_eq!(decrypted.hosts[0].user, "root");
+
+        // Now decrypt with the REAL standard age CLI. age requires a TTY for
+        // passphrase input, so we drive it with `expect` (present on macOS CI).
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+        std::fs::write(&vault_path, &encrypted).unwrap();
+
+        let script_path = tmp.path().join("decrypt.exp");
+        let script = format!(
+            "set timeout 60\n\
+             spawn age -d {path}\n\
+             expect \"Enter passphrase\"\n\
+             send \"{pass}\\r\"\n\
+             expect eof\n",
+            path = vault_path.display(),
+            pass = passphrase,
+        );
+        std::fs::write(&script_path, script).unwrap();
+
+        let output = std::process::Command::new("expect")
+            .arg(&script_path)
+            .output()
+            .expect("expect not found: standard age CLI interop requires `expect` (preinstalled on macOS)");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "age CLI decryption failed. stdout: {}\nstderr: {}",
+            stdout,
+            stderr
+        );
+
+        // The decrypted output must be the vault JSON that our own decrypt produces.
+        // expect echoes the spawn line and terminal control chars; extract the JSON
+        // between the first `{` and the last `}`.
+        let start = stdout.find('{').expect("no JSON in age CLI output");
+        let end = stdout.rfind('}').expect("no JSON in age CLI output");
+        let theirs_json: serde_json::Value =
+            serde_json::from_str(&stdout[start..=end]).expect("age CLI output is not valid JSON");
+        let ours_json = serde_json::to_value(decrypt(&encrypted, passphrase).unwrap()).unwrap();
+        assert_eq!(
+            theirs_json, ours_json,
+            "age CLI output differs from our decryption"
+        );
     }
 
     /// Verify Debug output never leaks secrets.
@@ -463,8 +508,16 @@ mod tests {
             notes: None,
         };
         let debug_str = format!("{:?}", entry);
-        assert!(!debug_str.contains("hunter2"), "Debug leaked password: {}", debug_str);
-        assert!(debug_str.contains("[REDACTED]"), "should contain [REDACTED]: {}", debug_str);
+        assert!(
+            !debug_str.contains("hunter2"),
+            "Debug leaked password: {}",
+            debug_str
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should contain [REDACTED]: {}",
+            debug_str
+        );
 
         // Settings with s3_secret_key
         let settings = Settings {
@@ -476,8 +529,15 @@ mod tests {
             scrollback_lines: 5000,
         };
         let settings_debug = format!("{:?}", settings);
-        assert!(!settings_debug.contains("super-secret-key"), "Debug leaked s3_secret_key: {}", settings_debug);
-        assert!(settings_debug.contains("[REDACTED]"), "s3_secret_key should be [REDACTED]");
+        assert!(
+            !settings_debug.contains("super-secret-key"),
+            "Debug leaked s3_secret_key: {}",
+            settings_debug
+        );
+        assert!(
+            settings_debug.contains("[REDACTED]"),
+            "s3_secret_key should be [REDACTED]"
+        );
 
         // Full Vault
         let vault = Vault {
@@ -489,9 +549,18 @@ mod tests {
             settings,
         };
         let vault_debug = format!("{:?}", vault);
-        assert!(!vault_debug.contains("hunter2"), "Vault Debug leaked password");
-        assert!(!vault_debug.contains("super-secret-key"), "Vault Debug leaked s3_secret_key");
-        assert!(vault_debug.contains("[REDACTED]"), "Vault Debug should contain [REDACTED]");
+        assert!(
+            !vault_debug.contains("hunter2"),
+            "Vault Debug leaked password"
+        );
+        assert!(
+            !vault_debug.contains("super-secret-key"),
+            "Vault Debug leaked s3_secret_key"
+        );
+        assert!(
+            vault_debug.contains("[REDACTED]"),
+            "Vault Debug should contain [REDACTED]"
+        );
 
         // SecureString directly
         let secret = SecureString::new("my-secret-key".to_owned());
@@ -581,7 +650,10 @@ mod tests {
         assert_eq!(vault.hosts[0].tags, vec!["prod"]);
         assert_eq!(vault.hosts[0].group.as_deref(), Some("servers"));
         assert_eq!(vault.hosts[0].color.as_deref(), Some("#ff6b6b"));
-        assert_eq!(vault.hosts[0].notes.as_deref(), Some("Production web server"));
+        assert_eq!(
+            vault.hosts[0].notes.as_deref(),
+            Some("Production web server")
+        );
 
         // Host 2: password migrated (empty, needs re-entry)
         assert_eq!(vault.hosts[1].name, "staging-db");
@@ -593,7 +665,10 @@ mod tests {
         }
 
         // Settings preserved
-        assert_eq!(vault.settings.s3_endpoint.as_deref(), Some("https://s3.example.com"));
+        assert_eq!(
+            vault.settings.s3_endpoint.as_deref(),
+            Some("https://s3.example.com")
+        );
         assert_eq!(vault.settings.s3_bucket.as_deref(), Some("my-vault"));
         assert_eq!(vault.settings.scrollback_lines, 10000);
     }
@@ -676,7 +751,10 @@ mod tests {
         // Migrated should be v4 with sync_local_path
         let vault: Vault = serde_json::from_slice(&migrated_bytes).unwrap();
         assert_eq!(vault.version, 4);
-        assert!(vault.settings.sync_local_path.is_none(), "sync_local_path defaults to null");
+        assert!(
+            vault.settings.sync_local_path.is_none(),
+            "sync_local_path defaults to null"
+        );
         assert_eq!(vault.settings.scrollback_lines, 5000);
 
         // Existing v3 fields preserved
@@ -684,7 +762,10 @@ mod tests {
         assert_eq!(vault.hosts[0].name, "my-server");
         assert_eq!(vault.revision, 5);
         assert_eq!(vault.device_id, "test-device-id");
-        assert_eq!(vault.settings.s3_endpoint.as_deref(), Some("https://s3.example.com"));
+        assert_eq!(
+            vault.settings.s3_endpoint.as_deref(),
+            Some("https://s3.example.com")
+        );
     }
 
     /// Snapshot test: lock current version ↔ structure correspondence.
@@ -727,11 +808,17 @@ mod tests {
         assert!(json.contains("\"version\": 4"), "version must be 4");
         assert!(json.contains("\"revision\""), "must have revision field");
         assert!(json.contains("\"device_id\""), "must have device_id field");
-        assert!(json.contains("\"modified_at\""), "must have modified_at field");
+        assert!(
+            json.contains("\"modified_at\""),
+            "must have modified_at field"
+        );
         assert!(json.contains("\"id\""), "HostEntry must have id field");
         assert!(json.contains("\"Password\""), "auth variant name");
         assert!(json.contains("\"password\""), "password field in auth");
-        assert!(json.contains("\"sync_local_path\""), "settings must have sync_local_path");
+        assert!(
+            json.contains("\"sync_local_path\""),
+            "settings must have sync_local_path"
+        );
         assert!(json.contains("\"s3_secret_key\""), "settings field");
 
         // Verify it roundtrips

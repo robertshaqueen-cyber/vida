@@ -57,10 +57,17 @@ impl State {
             None => text(""),
         };
 
-        let content = column![title, subtitle, pass_input, error_text, remember_check, unlock_btn]
-            .spacing(10)
-            .padding(40)
-            .max_width(400);
+        let content = column![
+            title,
+            subtitle,
+            pass_input,
+            error_text,
+            remember_check,
+            unlock_btn
+        ]
+        .spacing(10)
+        .padding(40)
+        .max_width(400);
 
         container(content)
             .width(Length::Fill)

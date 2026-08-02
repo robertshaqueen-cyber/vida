@@ -17,16 +17,20 @@ pub struct State {
 }
 
 impl State {
-    #[allow(dead_code)] // revived with sync trigger entry
     pub fn new(files: Vec<ConflictFileInfo>, remote_hosts: Vec<String>) -> Self {
-        Self { files, remote_hosts }
+        Self {
+            files,
+            remote_hosts,
+        }
     }
 
     pub fn view(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("conflict_file_title")).size(24);
-        let subtitle = text(i18n.trf("conflict_file_count", &[&self.files.len().to_string()])).size(14);
+        let subtitle =
+            text(i18n.trf("conflict_file_count", &[&self.files.len().to_string()])).size(14);
 
-        let file_items: Vec<Element<_>> = self.files
+        let file_items: Vec<Element<_>> = self
+            .files
             .iter()
             .map(|f| {
                 let name = text(&f.path).size(13);
@@ -39,20 +43,29 @@ impl State {
 
         let content = if !self.remote_hosts.is_empty() {
             let remote_header = text(i18n.tr("conflict_file_hosts")).size(14);
-            let remote_items: Vec<Element<_>> = self.remote_hosts
+            let remote_items: Vec<Element<_>> = self
+                .remote_hosts
                 .iter()
                 .map(|h| text(h.as_str()).size(13).into())
                 .collect();
             let remote_list = column(remote_items).spacing(4);
 
-            let adopt_btn = button(i18n.tr("conflict_file_adopt"))
-                .on_press(AppMessage::ConflictFileAdopt);
-            let ignore_btn = button(i18n.tr("conflict_file_ignore"))
-                .on_press(AppMessage::ConflictFileIgnore);
+            let adopt_btn =
+                button(i18n.tr("conflict_file_adopt")).on_press(AppMessage::ConflictFileAdopt);
+            let ignore_btn =
+                button(i18n.tr("conflict_file_ignore")).on_press(AppMessage::ConflictFileIgnore);
 
-            column![title, subtitle, file_list, remote_header, remote_list, adopt_btn, ignore_btn]
-                .spacing(12)
-                .padding(40)
+            column![
+                title,
+                subtitle,
+                file_list,
+                remote_header,
+                remote_list,
+                adopt_btn,
+                ignore_btn
+            ]
+            .spacing(12)
+            .padding(40)
         } else {
             let adopt_btn = button(i18n.tr("conflict_file_adopt_short"))
                 .on_press(AppMessage::ConflictFileAdopt);
