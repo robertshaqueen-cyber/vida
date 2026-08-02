@@ -23,8 +23,10 @@ pub struct HostItem {
 pub struct State {
     pub hosts: Vec<HostItem>,
     pub search_query: String,
-    /// Currently revealed credential (plaintext) for a host, auto-hides after 15s.
-    pub revealed_credential: Option<String>,
+    /// Currently revealed credential `(host_id, plaintext)` for a host,
+    /// auto-hides after 15s. Only shown when the host_id matches the
+    /// currently viewed host.
+    pub revealed_credential: Option<(String, String)>,
     /// True right after copy, shows "copied, auto-clears in 45s".
     pub credential_copied: bool,
 }
@@ -117,7 +119,7 @@ impl State {
         let sync_btn = tooltip(
             button(text(sync_symbol).size(14))
                 .on_press(AppMessage::SyncTriggered)
-                .style(if sync_symbol == "⟳" {
+                .style(if sync_symbol == "⟳" || sync_symbol == "▲" {
                     button::secondary
                 } else {
                     button::text
@@ -246,10 +248,17 @@ impl State {
             let mut detail_items: Vec<Element<'_, AppMessage>> =
                 vec![name.into(), conn.into(), auth.into()];
 
-            // Revealed credential block: plaintext + copy button, auto-hides in 15s
-            if let Some(cred) = &self.revealed_credential {
+            // Revealed credential block: plaintext + copy button, auto-hides in 15s.
+            // Only shown when the revealed credential belongs to THIS host, so
+            // switching tabs never leaks another host's password into this view.
+            let revealed_for_this_host = self
+                .revealed_credential
+                .as_ref()
+                .filter(|(revealed_host_id, _)| revealed_host_id == host_id)
+                .map(|(_, cred)| cred);
+            if let Some(cred) = revealed_for_this_host {
                 let cred_label = text(i18n.tr("main_credential_revealed")).size(12);
-                let cred_value = text(cred).size(14);
+                let cred_value = text(cred.as_str()).size(14);
                 let copy_btn = button(i18n.tr("main_credential_copy"))
                     .on_press(AppMessage::CopyCredential(cred.clone()))
                     .width(Length::Shrink);

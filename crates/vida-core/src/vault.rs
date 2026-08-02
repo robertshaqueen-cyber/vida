@@ -410,7 +410,7 @@ mod tests {
     /// This is the only validation of design rule "vault must be decryptable
     /// by the standard age CLI" — it decrypts with the REAL `age` binary.
     /// It must NOT skip when age/expect is missing; it fails loudly instead,
-    /// because CI installs age via `brew install age`.
+    /// because CI installs both via `brew install age expect`.
     #[test]
     fn age_cli_interop() {
         let mut vault = Vault::default();

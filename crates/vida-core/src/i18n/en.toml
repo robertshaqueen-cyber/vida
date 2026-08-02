@@ -158,3 +158,14 @@ main_credential_revealed = "Password:"
 main_credential_copy = "Copy"
 main_credential_copied = "Copied (auto-clears in 45s)"
 main_credential_auto_hide = "Auto-hides in 15 seconds"
+
+# ---- Sync state ----
+sync_state_unknown = "Not synced yet, click to start"
+sync_state_needs_attention = "Needs attention, click to review"
+
+# ---- S6 conflict diff ----
+conflict_side_count = "Hosts: {0}"
+conflict_diff_title = "Host differences"
+conflict_diff_only_local = "Local only"
+conflict_diff_only_remote = "Remote only"
+conflict_diff_both = "On both sides"

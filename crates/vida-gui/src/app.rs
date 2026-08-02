@@ -41,13 +41,22 @@ pub struct VidaApp {
     recent_host_ids: Vec<String>,
     // Sync status for the tab bar indicator
     sync_state: SyncState,
+    /// Monotonic token: invalidates pending credential-hide timers when the
+    /// user switches tabs or reveals another credential.
+    cred_hide_token: u64,
+    /// Clipboard guard: (token, written content). ClearClipboard only wipes
+    /// the clipboard if the current content still matches what we wrote.
+    clipboard_guard: Option<(u64, String)>,
+    clipboard_token: u64,
 }
 
 /// Sync status shown by the tab bar sync button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncState {
-    /// Last sync completed successfully.
+    /// No sync has run yet in this session; state is unverified.
     #[default]
+    Unknown,
+    /// Last sync completed successfully.
     Synced,
     /// Hosts changed locally; sync not yet run.
     LocalChanges,
@@ -55,25 +64,32 @@ pub enum SyncState {
     Syncing,
     /// Last sync failed.
     Error,
+    /// Sync completed but requires user attention (conflict / conflict files /
+    /// remote missing).
+    NeedsAttention,
 }
 
 impl SyncState {
     /// Symbol for the tab bar button.
     pub fn symbol(&self) -> &'static str {
         match self {
+            SyncState::Unknown => "—",
             SyncState::Synced => "✓",
             SyncState::LocalChanges => "●",
             SyncState::Syncing => "⟳",
             SyncState::Error => "✗",
+            SyncState::NeedsAttention => "▲",
         }
     }
 
     pub fn label(&self, i18n: &I18n) -> String {
         match self {
+            SyncState::Unknown => i18n.tr("sync_state_unknown").to_string(),
             SyncState::Synced => i18n.tr("sync_state_synced").to_string(),
             SyncState::LocalChanges => i18n.tr("sync_state_local_changes").to_string(),
             SyncState::Syncing => i18n.tr("sync_state_syncing").to_string(),
             SyncState::Error => i18n.tr("sync_state_error").to_string(),
+            SyncState::NeedsAttention => i18n.tr("sync_state_needs_attention").to_string(),
         }
     }
 }
@@ -119,9 +135,9 @@ pub enum AppMessage {
     DeleteHost,
     RevealCredential(String),
     ShowCredential(String), // credential (from RevealCredential)
-    HideCredential,
+    HideCredential(u64),    // hide token; stale timers are ignored
     CopyCredential(String),
-    ClearClipboard,
+    ClearClipboard(u64), // clipboard token; only clears if content matches
     SyncTriggered,
     SyncCompleted(serde_json::Value),
     LockVault,
@@ -187,6 +203,9 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         connect_panel_search: String::new(),
         recent_host_ids: Vec::new(),
         sync_state: SyncState::default(),
+        cred_hide_token: 0,
+        clipboard_guard: None,
+        clipboard_token: 0,
     };
 
     let connect = Task::perform(
@@ -378,6 +397,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         // ---- Tab management ----
         AppMessage::SwitchTab(tab_id) => {
             app.active_tab_id = tab_id;
+            // Invalidate any pending credential-hide timer and clear the
+            // revealed credential: it belongs to the previous host.
+            app.cred_hide_token += 1;
+            if let Screen::Main(s) = &mut app.screen {
+                s.revealed_credential = None;
+                s.credential_copied = false;
+            }
             Task::none()
         }
         AppMessage::OpenAddHostTab => {
@@ -588,46 +614,81 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::ShowCredential(cred) => {
-            // Store plaintext for display, auto-hide after 15 seconds
+            // Store plaintext bound to the CURRENT host tab, auto-hide after
+            // 15 seconds. The token invalidates any earlier pending hide timer.
+            app.cred_hide_token += 1;
+            let hide_token = app.cred_hide_token;
+            let host_id = if matches!(
+                app.tabs.iter().find(|t| t.id == app.active_tab_id),
+                Some(t) if matches!(t.kind, crate::screens::TabKind::Host { .. })
+            ) {
+                app.active_tab_id.clone()
+            } else {
+                String::new()
+            };
             if let Screen::Main(s) = &mut app.screen {
-                s.revealed_credential = Some(cred);
+                s.revealed_credential = Some((host_id, cred));
                 s.credential_copied = false;
             }
             Task::perform(
-                async {
+                async move {
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                    AppMessage::HideCredential
+                    AppMessage::HideCredential(hide_token)
                 },
                 |r| r,
             )
         }
-        AppMessage::HideCredential => {
-            if let Screen::Main(s) = &mut app.screen {
+        AppMessage::HideCredential(hide_token) => {
+            // Only a timer whose token is still current may clear the display;
+            // stale timers (tab switched, another reveal happened) are ignored.
+            if hide_token == app.cred_hide_token
+                && let Screen::Main(s) = &mut app.screen
+            {
                 s.revealed_credential = None;
                 s.credential_copied = false;
             }
             Task::none()
         }
         AppMessage::CopyCredential(cred) => {
-            // Write to clipboard, auto-clear after 45 seconds
+            // Write to clipboard, auto-clear after 45 seconds. The clipboard
+            // guard records (token, content); ClearClipboard only wipes when
+            // the token is current AND the clipboard still holds our content,
+            // so user-copied text after ours is never cleared.
+            app.clipboard_token += 1;
+            let clear_token = app.clipboard_token;
+            app.clipboard_guard = Some((clear_token, cred.clone()));
             if let Screen::Main(s) = &mut app.screen {
                 s.credential_copied = true;
             }
             let copy = iced::clipboard::write::<AppMessage>(cred);
             let clear_after = Task::perform(
-                async {
+                async move {
                     tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-                    AppMessage::ClearClipboard
+                    AppMessage::ClearClipboard(clear_token)
                 },
                 |r| r,
             );
             Task::batch([copy, clear_after])
         }
-        AppMessage::ClearClipboard => {
+        AppMessage::ClearClipboard(clear_token) => {
             if let Screen::Main(s) = &mut app.screen {
                 s.credential_copied = false;
             }
-            iced::clipboard::write::<AppMessage>(String::new())
+            // Stale timer (a newer copy happened after this one) → do nothing.
+            let expected = match &app.clipboard_guard {
+                Some((token, content)) if *token == clear_token => content.clone(),
+                _ => return Task::none(),
+            };
+            app.clipboard_guard = None;
+            // Read the clipboard first; only clear if it still contains what
+            // we wrote (user may have copied something else since).
+            iced::clipboard::read().then(move |current| {
+                if current.as_deref() == Some(expected.as_str()) {
+                    iced::clipboard::write::<AppMessage>(String::new())
+                } else {
+                    Task::none()
+                }
+            })
         }
 
         // ---- S4: Host editor ----
@@ -816,12 +877,31 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 .unwrap_or("unknown");
             match status {
                 "conflict" => {
-                    app.sync_state = SyncState::Synced;
-                    // TODO: Extract local/remote hosts for conflict display
-                    app.screen = Screen::Conflict(s6_conflict::State::new(vec![], vec![]));
+                    // Sync finished but requires a decision: the abandoned side
+                    // goes to a backup file. Show real data, never empty lists.
+                    app.sync_state = SyncState::NeedsAttention;
+                    let remote_hosts: Vec<String> = val
+                        .get("remote_hosts")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|h| {
+                                    h.get("name").and_then(|n| n.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let local_hosts: Vec<String> = if let Screen::Main(s) = &app.screen {
+                        s.hosts.iter().map(|h| h.name.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    app.screen =
+                        Screen::Conflict(s6_conflict::State::new(local_hosts, remote_hosts));
                 }
                 "conflict_files_detected" => {
-                    app.sync_state = SyncState::Synced;
+                    // Requires user attention (adopt/ignore conflict files)
+                    app.sync_state = SyncState::NeedsAttention;
                     let files: Vec<s7_conflict_file::ConflictFileInfo> = val
                         .get("files")
                         .and_then(|f| f.as_array())
@@ -870,7 +950,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                         Screen::ConflictFile(s7_conflict_file::State::new(files, remote_hosts));
                 }
                 "remote_missing" => {
-                    app.sync_state = SyncState::Synced;
+                    // Requires user action (re-upload / clear state)
+                    app.sync_state = SyncState::NeedsAttention;
                     app.screen = Screen::RemoteMissing(s8_remote_missing::State::new());
                 }
                 "downloaded" => {
@@ -1049,6 +1130,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::ConflictResolved => {
+            // User resolved the situation; the follow-up list reload reflects
+            // the synced state, so the indicator can leave NeedsAttention.
+            app.sync_state = SyncState::Synced;
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
@@ -1105,6 +1189,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::ConflictFileHandled => {
+            // User resolved the situation; the follow-up list reload reflects
+            // the synced state, so the indicator can leave NeedsAttention.
+            app.sync_state = SyncState::Synced;
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
@@ -1134,6 +1221,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::RemoteMissingHandled => {
+            // User resolved the situation; the follow-up list reload reflects
+            // the synced state, so the indicator can leave NeedsAttention.
+            app.sync_state = SyncState::Synced;
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {

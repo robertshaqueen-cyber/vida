@@ -158,3 +158,14 @@ main_credential_revealed = "口令："
 main_credential_copy = "复制"
 main_credential_copied = "已复制（45 秒后自动清除）"
 main_credential_auto_hide = "15 秒后自动隐藏"
+
+# ---- 同步状态 ----
+sync_state_unknown = "尚未同步，点击开始"
+sync_state_needs_attention = "需要处理，点击查看"
+
+# ---- S6 冲突差异 ----
+conflict_side_count = "主机数: {0}"
+conflict_diff_title = "主机差异"
+conflict_diff_only_local = "仅本地有"
+conflict_diff_only_remote = "仅远端有"
+conflict_diff_both = "两边都有"
