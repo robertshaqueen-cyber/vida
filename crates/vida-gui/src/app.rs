@@ -957,10 +957,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     // Replace business data directly; no dependence on the
                     // current screen (sync may have been triggered elsewhere).
                     app.hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
-                    if let Screen::Main(s) = &mut app.screen {
-                        // keep the Main screen's view state as-is
-                        let _ = s;
-                    } else {
+                    if !matches!(app.screen, Screen::Main(_)) {
                         app.screen = Screen::Main(s3_main::State {
                             revealed_credential: None,
                             credential_copied: false,
