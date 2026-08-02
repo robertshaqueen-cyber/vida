@@ -262,8 +262,8 @@ impl SyncBackend for LocalPathBackend {
         let target = self.vault_file();
 
         // Optimistic concurrency: check current state matches expected
-        if let Some(exp) = expected {
-            if target.exists() {
+        if let Some(exp) = expected
+            && target.exists() {
                 let current = std::fs::read(&target)
                     .context("Failed to read remote file for concurrency check")?;
                 let current_hash = sha256_hex(&current);
@@ -276,7 +276,6 @@ impl SyncBackend for LocalPathBackend {
                     );
                 }
             }
-        }
 
         // Atomic write: temp → full_fsync → rename → fsync parent
         let dir = self.base_path.clone();
@@ -691,10 +690,10 @@ fn now_unix() -> i64 {
 
 fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<std::io::Error>()
-        .map_or(false, |e| e.kind() == std::io::ErrorKind::NotFound)
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
-fn check_icloud_status(dir: &PathBuf) -> Result<()> {
+fn check_icloud_status(dir: &std::path::Path) -> Result<()> {
     let icloud_marker = dir.join(".vault.age.icloud");
     if icloud_marker.exists() {
         #[cfg(target_os = "macos")]

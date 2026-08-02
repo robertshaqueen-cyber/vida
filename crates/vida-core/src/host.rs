@@ -18,8 +18,8 @@ impl HostProfile {
     /// Render the notes as a full Markdown document.
     pub fn render_markdown(&self) -> String {
         let mut doc = format!("# {}\n\n", self.entry.name);
-        doc.push_str(&format!("- 用途：\n"));
-        doc.push_str(&format!("- 系统：\n"));
+        doc.push_str("- 用途：\n");
+        doc.push_str("- 系统：\n");
         let auth_str = match &self.entry.auth {
             AuthMethod::Password { .. } => "密码".to_owned(),
             AuthMethod::Key { private_key_path, .. } => format!("密钥文件: {}", private_key_path),

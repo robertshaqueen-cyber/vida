@@ -25,6 +25,7 @@ enum WsResponse {
     #[serde(rename = "Error")]
     Error {
         id: u64,
+        #[allow(dead_code)] // error code reserved for protocol debugging
         code: i32,
         message: String,
     },
@@ -213,10 +214,6 @@ impl WsClient {
 
     pub async fn update_settings(&self, settings: serde_json::Value) -> Result<serde_json::Value> {
         self.send("UpdateSettings", serde_json::json!({"settings": settings})).await
-    }
-
-    pub async fn sync(&self) -> Result<serde_json::Value> {
-        self.send_no_params("Sync").await
     }
 
     pub async fn reveal_credential(&self, host_id: &str) -> Result<serde_json::Value> {

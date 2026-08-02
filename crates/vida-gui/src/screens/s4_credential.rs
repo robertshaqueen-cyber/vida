@@ -19,6 +19,7 @@ pub struct State {
     pub port: String,
     pub tags: String,
     pub group: String,
+    #[allow(dead_code)] // reserved for future use
     pub color: String,
     pub password: String,
     pub notes: String,
@@ -49,6 +50,7 @@ impl State {
     }
 
     /// Create editor pre-filled with existing host data for editing.
+    #[allow(clippy::too_many_arguments)] // host fields map 1:1 to HostEntry
     pub fn new_edit(
         host_id: String,
         name: String,
@@ -131,9 +133,9 @@ impl State {
             && (is_edit || !self.password.is_empty()); // new host requires password
 
         let save_btn = if self.saving {
-            button(i18n.tr("common_saving")).width(Length::Fill)
+            button(i18n.tr("common_saving")).width(Length::Shrink)
         } else {
-            button(i18n.tr("common_save")).width(Length::Fill)
+            button(i18n.tr("common_save")).width(Length::Shrink)
         };
 
         let save_btn = if can_save {
