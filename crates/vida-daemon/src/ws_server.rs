@@ -81,7 +81,8 @@ async fn handle_connection(
 ) {
     info!("New WebSocket connection from {}", addr);
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, |req: &tokio_tungstenite::tungstenite::http::Request<()>, resp: tokio_tungstenite::tungstenite::http::Response<()>| {
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, #[allow(clippy::result_large_err)]
+    |req: &tokio_tungstenite::tungstenite::http::Request<()>, resp: tokio_tungstenite::tungstenite::http::Response<()>| {
         if req.headers().contains_key("Origin") {
             warn!("Rejected connection from {} with Origin header", addr);
             return Err(tokio_tungstenite::tungstenite::http::Response::builder()

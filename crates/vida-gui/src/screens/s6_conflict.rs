@@ -11,6 +11,7 @@ pub struct State {
 }
 
 impl State {
+    #[allow(dead_code)] // revived with sync trigger entry
     pub fn new(local_hosts: Vec<String>, remote_hosts: Vec<String>) -> Self {
         Self { local_hosts, remote_hosts }
     }

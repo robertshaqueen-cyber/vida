@@ -62,10 +62,12 @@ pub enum Screen {
     Setup(s1_setup::State),
     Unlock(s2_unlock::State),
     Main(s3_main::State),
-    Credential(s4_credential::State),
-    Settings(s5_settings::State),
+    // Sync conflict screens: revived when a sync trigger entry is added back
+    #[allow(dead_code)]
     Conflict(s6_conflict::State),
+    #[allow(dead_code)]
     ConflictFile(s7_conflict_file::State),
+    #[allow(dead_code)]
     RemoteMissing(s8_remote_missing::State),
     Backup(s9_backup::State),
 }
@@ -77,8 +79,6 @@ impl Screen {
             Screen::Setup(s) => s.view(i18n),
             Screen::Unlock(s) => s.view(i18n),
             Screen::Main(_) => text("").into(), // handled by app::view with tab bar
-            Screen::Credential(s) => s.view(i18n),
-            Screen::Settings(_) => text("").into(), // handled by app::view with tab bar
             Screen::Conflict(s) => s.view(i18n),
             Screen::ConflictFile(s) => s.view(i18n),
             Screen::RemoteMissing(s) => s.view(i18n),

@@ -99,7 +99,7 @@ impl DaemonState {
             Some(p) => p.to_string(),
             None => self.ensure_passphrase()?.to_string(),
         };
-        Ok(vida_core::vault::encrypt(vault, &p)?)
+        vida_core::vault::encrypt(vault, &p)
     }
 
     fn init_sync(&mut self) -> Result<()> {

@@ -512,8 +512,10 @@ fn delete_host() {
 fn update_settings_persists() {
     let (mut state, _dir) = test_state("tok");
     state.create_vault("pass").unwrap();
-    let mut settings = vida_core::vault::Settings::default();
-    settings.scrollback_lines = 10000;
+    let settings = vida_core::vault::Settings {
+        scrollback_lines: 10000,
+        ..Default::default()
+    };
     state.update_settings(settings).unwrap();
     state.lock();
     let ct = std::fs::read(&state.vault_path).unwrap();

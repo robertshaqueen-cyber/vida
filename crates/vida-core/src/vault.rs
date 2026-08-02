@@ -362,11 +362,10 @@ fn migrate_json_v3_to_v4(root: &mut serde_json::Value) -> Result<()> {
     root["version"] = serde_json::json!(4);
 
     // Add sync_local_path to settings (null = sync disabled)
-    if let Some(settings) = root.get_mut("settings") {
-        if settings.get("sync_local_path").is_none() {
+    if let Some(settings) = root.get_mut("settings")
+        && settings.get("sync_local_path").is_none() {
             settings["sync_local_path"] = serde_json::Value::Null;
         }
-    }
 
     Ok(())
 }

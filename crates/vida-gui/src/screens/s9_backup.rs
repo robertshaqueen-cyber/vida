@@ -41,9 +41,9 @@ impl State {
             && (self.use_current || !self.export_passphrase.is_empty());
 
         let export_btn = if self.exporting {
-            button(i18n.tr("backup_exporting")).width(Length::Fill)
+            button(i18n.tr("backup_exporting")).width(Length::Shrink)
         } else {
-            button(i18n.tr("backup_title")).width(Length::Fill)
+            button(i18n.tr("backup_title")).width(Length::Shrink)
         };
 
         let export_btn = if can_export {

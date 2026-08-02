@@ -3,7 +3,7 @@ use iced::{Element, Length};
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
-use crate::screens::{Tab, TabKind};
+use crate::screens::Tab;
 
 #[derive(Debug, Clone)]
 pub struct HostItem {
@@ -22,28 +22,10 @@ pub struct HostItem {
 #[derive(Debug, Clone)]
 pub struct State {
     pub hosts: Vec<HostItem>,
-    pub selected_host_id: Option<String>,
-    pub vault_status: Option<VaultStatus>,
     pub search_query: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct VaultStatus {
-    pub locked: bool,
-    pub host_count: usize,
-    pub revision: u64,
-}
-
 impl State {
-    pub fn new() -> Self {
-        Self {
-            hosts: Vec::new(),
-            selected_host_id: None,
-            vault_status: None,
-            search_query: String::new(),
-        }
-    }
-
     /// Top tab bar: tabs on the left, spacer, then settings/lock on the right
     pub fn view_tab_bar<'a>(tabs: &'a [Tab], active_tab_id: &'a str, i18n: &'a I18n, show_connect_panel: bool) -> Element<'a, AppMessage> {
         // Tab buttons: text-only, active tab has bottom indicator, with X close button
