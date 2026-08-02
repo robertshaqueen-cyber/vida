@@ -8,8 +8,8 @@ use tokio_tungstenite::tungstenite::Message;
 /// Reads JSON-RPC from stdin, forwards to daemon WebSocket, returns responses to stdout.
 #[tokio::main]
 async fn main() -> Result<()> {
-    let daemon_url = std::env::var("VIDA_DAEMON_URL")
-        .unwrap_or_else(|_| "ws://127.0.0.1:9527".to_string());
+    let daemon_url =
+        std::env::var("VIDA_DAEMON_URL").unwrap_or_else(|_| "ws://127.0.0.1:9527".to_string());
 
     let (ws_stream, _) = connect_async(&daemon_url)
         .await

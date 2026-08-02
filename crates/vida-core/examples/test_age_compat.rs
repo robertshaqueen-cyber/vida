@@ -17,7 +17,9 @@ fn main() {
                 tags: vec!["production".into(), "hong-kong".into()],
                 group: Some("servers".into()),
                 color: Some("#ff6b6b".into()),
-                auth: AuthMethod::Password { password: SecureString::new("vps-root-pass".to_owned()) },
+                auth: AuthMethod::Password {
+                    password: SecureString::new("vps-root-pass".to_owned()),
+                },
                 notes: None,
             },
             HostEntry {

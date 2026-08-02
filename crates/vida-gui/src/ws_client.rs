@@ -18,10 +18,7 @@ struct WsRequest {
 #[serde(tag = "type")]
 enum WsResponse {
     #[serde(rename = "Ok")]
-    Ok {
-        id: u64,
-        result: serde_json::Value,
-    },
+    Ok { id: u64, result: serde_json::Value },
     #[serde(rename = "Error")]
     Error {
         id: u64,
@@ -72,18 +69,24 @@ impl WsClient {
             id: auth_id,
         };
         let auth_text = serde_json::to_string(&auth_req).unwrap();
-        ws_write.send(Message::Text(auth_text.into())).await
+        ws_write
+            .send(Message::Text(auth_text.into()))
+            .await
             .context("Failed to send auth message")?;
 
         // Read auth response
         let auth_response = loop {
             match ws_read.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(WsResponse::Ok { id, result }) = serde_json::from_str::<WsResponse>(&text) {
+                    if let Ok(WsResponse::Ok { id, result }) =
+                        serde_json::from_str::<WsResponse>(&text)
+                    {
                         if id == auth_id {
                             break result;
                         }
-                    } else if let Ok(WsResponse::Error { message, .. }) = serde_json::from_str::<WsResponse>(&text) {
+                    } else if let Ok(WsResponse::Error { message, .. }) =
+                        serde_json::from_str::<WsResponse>(&text)
+                    {
                         anyhow::bail!("认证失败: {}", message);
                     }
                 }
@@ -99,10 +102,8 @@ impl WsClient {
         }
 
         // Auth succeeded — now create the mpsc channel and spawn the background R/W task
-        let (tx, mut rx) = mpsc::unbounded_channel::<(
-            WsRequest,
-            oneshot::Sender<Result<serde_json::Value>>,
-        )>();
+        let (tx, mut rx) =
+            mpsc::unbounded_channel::<(WsRequest, oneshot::Sender<Result<serde_json::Value>>)>();
 
         tokio::spawn(async move {
             let mut pending: PendingMap = HashMap::new();
@@ -193,11 +194,16 @@ impl WsClient {
     }
 
     pub async fn create_vault(&self, passphrase: &str) -> Result<serde_json::Value> {
-        self.send("CreateVault", serde_json::json!({"passphrase": passphrase})).await
+        self.send("CreateVault", serde_json::json!({"passphrase": passphrase}))
+            .await
     }
 
     pub async fn unlock(&self, passphrase: &str, remember: bool) -> Result<serde_json::Value> {
-        self.send("Unlock", serde_json::json!({"passphrase": passphrase, "remember": remember})).await
+        self.send(
+            "Unlock",
+            serde_json::json!({"passphrase": passphrase, "remember": remember}),
+        )
+        .await
     }
 
     pub async fn lock(&self) -> Result<serde_json::Value> {
@@ -213,11 +219,13 @@ impl WsClient {
     }
 
     pub async fn update_settings(&self, settings: serde_json::Value) -> Result<serde_json::Value> {
-        self.send("UpdateSettings", serde_json::json!({"settings": settings})).await
+        self.send("UpdateSettings", serde_json::json!({"settings": settings}))
+            .await
     }
 
     pub async fn reveal_credential(&self, host_id: &str) -> Result<serde_json::Value> {
-        self.send("RevealCredential", serde_json::json!({"host_id": host_id})).await
+        self.send("RevealCredential", serde_json::json!({"host_id": host_id}))
+            .await
     }
 }
 
@@ -236,9 +244,15 @@ fn read_token() -> Result<String> {
 /// Read daemon port from config dir (e.g. ~/Library/Application Support/vida/daemon.port on macOS)
 fn read_port() -> Result<u16> {
     let path = vida_core::config::config_dir()?.join("daemon.port");
-    let port_str = std::fs::read_to_string(&path)
-        .with_context(|| format!("无法读取守护进程端口文件: {}。请确认 vida-daemon 正在运行。", path.display()))?;
-    let port: u16 = port_str.trim().parse()
+    let port_str = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "无法读取守护进程端口文件: {}。请确认 vida-daemon 正在运行。",
+            path.display()
+        )
+    })?;
+    let port: u16 = port_str
+        .trim()
+        .parse()
         .with_context(|| format!("守护进程端口格式无效: '{}'", port_str.trim()))?;
     Ok(port)
 }

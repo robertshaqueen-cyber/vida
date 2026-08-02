@@ -26,8 +26,7 @@ fn service_name() -> Result<String> {
 /// the app falls back to manual passphrase entry.
 pub fn cache_passphrase(passphrase: &SecretString) -> Result<()> {
     let svc = service_name()?;
-    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME)
-        .context("Failed to open keyring entry")?;
+    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME).context("Failed to open keyring entry")?;
     // Delete existing entry first (macOS keychain errors on duplicate)
     let _ = entry.delete_credential();
     entry
@@ -52,8 +51,7 @@ pub fn get_cached_passphrase() -> Option<SecretString> {
 /// After this, the user must enter their passphrase manually.
 pub fn clear_cache() -> Result<()> {
     let svc = service_name()?;
-    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME)
-        .context("Failed to open keyring entry")?;
+    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME).context("Failed to open keyring entry")?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()), // Already cleared
@@ -85,7 +83,10 @@ pub fn unlock_vault(
         match vault::decrypt(encrypted, cached.expose_secret()) {
             Ok(vault) => return Ok((vault, UnlockMethod::Keyring)),
             Err(e) => {
-                warn!("keyring cache decrypt failed ({}), falling back to manual passphrase", e);
+                warn!(
+                    "keyring cache decrypt failed ({}), falling back to manual passphrase",
+                    e
+                );
             }
         }
     }
@@ -140,7 +141,9 @@ mod tests {
             tags: vec!["prod".to_owned()],
             group: None,
             color: None,
-            auth: AuthMethod::Password { password: SecureString::new("deploy-pass".to_owned()) },
+            auth: AuthMethod::Password {
+                password: SecureString::new("deploy-pass".to_owned()),
+            },
             notes: Some("Production web server".to_owned()),
         });
         vault.hosts.push(HostEntry {
@@ -152,13 +155,16 @@ mod tests {
             tags: vec!["staging".to_owned(), "db".to_owned()],
             group: None,
             color: None,
-            auth: AuthMethod::Password { password: SecureString::new("admin-pass".to_owned()) },
+            auth: AuthMethod::Password {
+                password: SecureString::new("admin-pass".to_owned()),
+            },
             notes: Some("Staging database".to_owned()),
         });
 
         // 2. 加密 (log_n=10 for fast test)
         let passphrase = SecretString::from("unlock-test-passphrase".to_owned());
-        let encrypted = crate::vault::encrypt_inner(&vault, passphrase.expose_secret(), 10).unwrap();
+        let encrypted =
+            crate::vault::encrypt_inner(&vault, passphrase.expose_secret(), 10).unwrap();
 
         // 3. 清空 keyring
         clear_cache().unwrap();
@@ -174,7 +180,11 @@ mod tests {
         );
 
         // 6. 断言数据完整
-        assert_eq!(decrypted.hosts.len(), 2, "both hosts should survive decrypt");
+        assert_eq!(
+            decrypted.hosts.len(),
+            2,
+            "both hosts should survive decrypt"
+        );
         assert_eq!(decrypted.hosts[0].name, "production-web");
         assert_eq!(decrypted.hosts[0].user, "deploy");
         assert_eq!(decrypted.hosts[1].name, "staging-db");
@@ -198,7 +208,10 @@ mod tests {
         // After directory exists
         let after = service_name().unwrap();
 
-        assert_eq!(before, after, "service_name must be identical before and after directory creation");
+        assert_eq!(
+            before, after,
+            "service_name must be identical before and after directory creation"
+        );
 
         // SAFETY: test cleanup
         unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };

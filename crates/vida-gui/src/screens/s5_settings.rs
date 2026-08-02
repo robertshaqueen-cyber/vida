@@ -105,12 +105,14 @@ pub struct State {
 
 impl State {
     pub fn from_json(val: &serde_json::Value, _i18n: &I18n) -> Self {
-        let sync_local_path = val.get("sync_local_path")
+        let sync_local_path = val
+            .get("sync_local_path")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let scrollback_lines = val.get("scrollback_lines")
+        let scrollback_lines = val
+            .get("scrollback_lines")
             .and_then(|v| v.as_u64())
             .unwrap_or(5000)
             .to_string();
@@ -168,14 +170,9 @@ impl State {
 
         let nav_list = column(nav_items).spacing(2);
 
-        let sidebar_content = column![title, nav_list]
-            .spacing(16)
-            .padding(16)
-            .width(200);
+        let sidebar_content = column![title, nav_list].spacing(16).padding(16).width(200);
 
-        container(sidebar_content)
-            .height(Length::Fill)
-            .into()
+        container(sidebar_content).height(Length::Fill).into()
     }
 
     fn view_content(&self, i18n: &I18n) -> Element<'_, AppMessage> {
@@ -187,27 +184,23 @@ impl State {
             SettingsSection::Backup => self.view_backup(i18n),
         };
 
-        let wrapper = column![content]
-            .spacing(16)
-            .padding(24)
-            .width(Length::Fill);
+        let wrapper = column![content].spacing(16).padding(24).width(Length::Fill);
 
-        container(wrapper)
-            .height(Length::Fill)
-            .into()
+        container(wrapper).height(Length::Fill).into()
     }
 
     fn view_application(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("settings_application")).size(20);
 
         let lang_label = text(i18n.tr("settings_language")).size(14);
-        let lang_options: Vec<LangChoice> = vec![
-            LangChoice::System,
-            LangChoice::ZhCn,
-            LangChoice::En,
-        ];
-        let lang_pick = pick_list(lang_options, Some(self.language.clone()), AppMessage::SettingsLanguageChanged)
-            .width(Length::Fill);
+        let lang_options: Vec<LangChoice> =
+            vec![LangChoice::System, LangChoice::ZhCn, LangChoice::En];
+        let lang_pick = pick_list(
+            lang_options,
+            Some(self.language.clone()),
+            AppMessage::SettingsLanguageChanged,
+        )
+        .width(Length::Fill);
 
         let can_save = !self.saving;
         let save_btn = if self.saving {
@@ -252,7 +245,8 @@ impl State {
         let mut items: Vec<Element<'_, AppMessage>> = Vec::new();
 
         // Group hosts by group
-        let mut grouped: std::collections::HashMap<String, Vec<&HostItem>> = std::collections::HashMap::new();
+        let mut grouped: std::collections::HashMap<String, Vec<&HostItem>> =
+            std::collections::HashMap::new();
         let mut ungrouped: Vec<&HostItem> = Vec::new();
 
         for host in &self.hosts {
@@ -266,12 +260,14 @@ impl State {
 
         // Ungrouped hosts
         if !ungrouped.is_empty() {
-            items.push(text(i18n.tr("settings_connections_ungrouped")).size(13).into());
+            items.push(
+                text(i18n.tr("settings_connections_ungrouped"))
+                    .size(13)
+                    .into(),
+            );
             for host in &ungrouped {
                 let label = text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(14);
-                items.push(
-                    button(label).style(button::text).width(Length::Fill).into()
-                );
+                items.push(button(label).style(button::text).width(Length::Fill).into());
             }
         }
 
@@ -283,10 +279,9 @@ impl State {
                 items.push(rule::horizontal(1).into());
                 items.push(text(group_name.clone()).size(13).into());
                 for host in hosts {
-                    let label = text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(14);
-                    items.push(
-                        button(label).style(button::text).width(Length::Fill).into()
-                    );
+                    let label =
+                        text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(14);
+                    items.push(button(label).style(button::text).width(Length::Fill).into());
                 }
             }
         }
@@ -301,14 +296,9 @@ impl State {
 
         let items_col = iced::widget::Column::from_vec(items).spacing(4);
 
-        column![
-            title,
-            rule::horizontal(1),
-            add_btn,
-            items_col,
-        ]
-        .spacing(12)
-        .into()
+        column![title, rule::horizontal(1), add_btn, items_col,]
+            .spacing(12)
+            .into()
     }
 
     fn view_sync(&self, i18n: &I18n) -> Element<'_, AppMessage> {
@@ -410,12 +400,8 @@ impl State {
             .on_press(AppMessage::OpenBackup)
             .width(Length::Shrink);
 
-        column![
-            title,
-            rule::horizontal(1),
-            export_btn,
-        ]
-        .spacing(12)
-        .into()
+        column![title, rule::horizontal(1), export_btn,]
+            .spacing(12)
+            .into()
     }
 }

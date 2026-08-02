@@ -111,15 +111,21 @@ impl DaemonState {
     }
 
     fn ensure_unlocked(&self) -> Result<&Vault> {
-        self.vault.as_ref().context(self.i18n.tr("daemon_vault_locked"))
+        self.vault
+            .as_ref()
+            .context(self.i18n.tr("daemon_vault_locked"))
     }
 
     fn ensure_unlocked_mut(&mut self) -> Result<&mut Vault> {
-        self.vault.as_mut().context(self.i18n.tr("daemon_vault_locked"))
+        self.vault
+            .as_mut()
+            .context(self.i18n.tr("daemon_vault_locked"))
     }
 
     fn ensure_passphrase(&self) -> Result<&str> {
-        self.passphrase.as_deref().context(self.i18n.tr("daemon_passphrase_not_cached"))
+        self.passphrase
+            .as_deref()
+            .context(self.i18n.tr("daemon_passphrase_not_cached"))
     }
 
     // Settings --------------------------------------------------------------
@@ -151,10 +157,16 @@ impl DaemonState {
 
     pub fn reveal_credential(&self, host_id: &str) -> Result<String> {
         let vault = self.ensure_unlocked()?;
-        let host = vault.hosts.iter().find(|h| h.id == host_id).context(self.i18n.tr("daemon_host_not_found"))?;
+        let host = vault
+            .hosts
+            .iter()
+            .find(|h| h.id == host_id)
+            .context(self.i18n.tr("daemon_host_not_found"))?;
         match &host.auth {
             AuthMethod::Password { password } => Ok(password.expose().to_string()),
-            AuthMethod::Key { private_key_path, .. } => Ok(format!("key:{}", private_key_path)),
+            AuthMethod::Key {
+                private_key_path, ..
+            } => Ok(format!("key:{}", private_key_path)),
             AuthMethod::KeyInline { private_key, .. } => Ok(private_key.expose().to_string()),
         }
     }
@@ -167,7 +179,11 @@ impl DaemonState {
         let now = chrono::Utc::now().timestamp();
 
         if let Some(ref id) = req.id {
-            let host = vault.hosts.iter_mut().find(|h| h.id == *id).context(i18n.tr("daemon_host_not_found"))?;
+            let host = vault
+                .hosts
+                .iter_mut()
+                .find(|h| h.id == *id)
+                .context(i18n.tr("daemon_host_not_found"))?;
             host.name = req.name;
             host.host = req.host;
             host.user = req.user;
@@ -177,17 +193,28 @@ impl DaemonState {
             host.color = req.color;
             host.notes = req.notes;
             if let Some(password) = req.password {
-                host.auth = AuthMethod::Password { password: vida_core::vault::SecureString::new(password) };
+                host.auth = AuthMethod::Password {
+                    password: vida_core::vault::SecureString::new(password),
+                };
             }
         } else {
             let auth = match req.password {
-                Some(p) => AuthMethod::Password { password: vida_core::vault::SecureString::new(p) },
+                Some(p) => AuthMethod::Password {
+                    password: vida_core::vault::SecureString::new(p),
+                },
                 None => anyhow::bail!("{}", i18n.tr("daemon_host_need_password")),
             };
             vault.hosts.push(vida_core::vault::HostEntry {
                 id: uuid::Uuid::new_v4().to_string(),
-                name: req.name, host: req.host, user: req.user, port: req.port,
-                tags: req.tags, group: req.group, color: req.color, auth, notes: req.notes,
+                name: req.name,
+                host: req.host,
+                user: req.user,
+                port: req.port,
+                tags: req.tags,
+                group: req.group,
+                color: req.color,
+                auth,
+                notes: req.notes,
             });
         }
         vault.modified_at = now;
@@ -222,57 +249,110 @@ impl DaemonState {
         let ct = vida_core::vault::encrypt(vault, &passphrase)?;
         let revision = vault.revision;
         let device_id = vault.device_id.clone();
-        let local = vida_core::sync::LocalVaultInfo { ciphertext: ct, revision, device_id };
+        let local = vida_core::sync::LocalVaultInfo {
+            ciphertext: ct,
+            revision,
+            device_id,
+        };
 
-        let sync = self.sync.as_mut().context(self.i18n.tr("daemon_sync_not_initialized"))?;
+        let sync = self
+            .sync
+            .as_mut()
+            .context(self.i18n.tr("daemon_sync_not_initialized"))?;
         let result = sync.sync(&local).await?;
 
         let mut hosts_updated = false;
         match &result {
-            SyncResult::Downloaded { ciphertext: dl_ct, meta } => {
+            SyncResult::Downloaded {
+                ciphertext: dl_ct,
+                meta,
+            } => {
                 info!("Downloaded remote vault ({} bytes)", dl_ct.len());
                 vida_core::persist::write_atomic(&self.vault_path, dl_ct)?;
                 let new_vault = vida_core::vault::decrypt(dl_ct, &passphrase)?;
                 let new_revision = new_vault.revision;
                 self.vault = Some(new_vault);
-                self.sync.as_mut().unwrap().update_state_after_download(meta, new_revision);
+                self.sync
+                    .as_mut()
+                    .unwrap()
+                    .update_state_after_download(meta, new_revision);
                 hosts_updated = true;
             }
-            SyncResult::Conflict { .. } => info!("Sync conflict detected, awaiting user resolution"),
-            SyncResult::ConflictFilesDetected { files } => info!("{} conflict files detected", files.len()),
+            SyncResult::Conflict { .. } => {
+                info!("Sync conflict detected, awaiting user resolution")
+            }
+            SyncResult::ConflictFilesDetected { files } => {
+                info!("{} conflict files detected", files.len())
+            }
             SyncResult::RemoteMissing => info!("Remote vault missing, awaiting user action"),
             SyncResult::Uploaded { .. } | SyncResult::NoChange => {}
         }
-        let hosts = if hosts_updated { Some(self.list_hosts()?) } else { None };
+        let hosts = if hosts_updated {
+            Some(self.list_hosts()?)
+        } else {
+            None
+        };
         Ok((result, hosts))
     }
 
-    pub async fn resolve_conflict(&mut self, choice: ConflictChoice) -> Result<(Vec<HostSummary>,)> {
+    pub async fn resolve_conflict(
+        &mut self,
+        choice: ConflictChoice,
+    ) -> Result<(Vec<HostSummary>,)> {
         let passphrase = self.ensure_passphrase()?.to_string();
         let vault = self.ensure_unlocked()?;
         let ct = vida_core::vault::encrypt(vault, &passphrase)?;
         let revision = vault.revision;
-        let local = vida_core::sync::LocalVaultInfo { ciphertext: ct.clone(), revision, device_id: vault.device_id.clone() };
+        let local = vida_core::sync::LocalVaultInfo {
+            ciphertext: ct.clone(),
+            revision,
+            device_id: vault.device_id.clone(),
+        };
 
-        let sync = self.sync.as_mut().context(self.i18n.tr("daemon_sync_not_initialized"))?;
+        let sync = self
+            .sync
+            .as_mut()
+            .context(self.i18n.tr("daemon_sync_not_initialized"))?;
         let result = sync.sync(&local).await?;
 
         match result {
-            SyncResult::Conflict { remote_meta, remote_ciphertext } => {
-                let remote_ct = remote_ciphertext.context(self.i18n.tr("daemon_conflict_no_remote"))?;
+            SyncResult::Conflict {
+                remote_meta,
+                remote_ciphertext,
+            } => {
+                let remote_ct =
+                    remote_ciphertext.context(self.i18n.tr("daemon_conflict_no_remote"))?;
                 match choice {
                     ConflictChoice::Remote => {
-                        let new_vault = self.sync.as_mut().unwrap()
-                            .resolve_conflict_remote(&remote_ct, &remote_meta, &ct, revision, 0, &passphrase).await?;
+                        let new_vault = self
+                            .sync
+                            .as_mut()
+                            .unwrap()
+                            .resolve_conflict_remote(
+                                &remote_ct,
+                                &remote_meta,
+                                &ct,
+                                revision,
+                                0,
+                                &passphrase,
+                            )
+                            .await?;
                         self.vault = Some(new_vault);
                     }
                     ConflictChoice::Local => {
-                        self.sync.as_mut().unwrap()
-                            .resolve_conflict_local(&ct, revision, &remote_ct, &remote_meta).await?;
+                        self.sync
+                            .as_mut()
+                            .unwrap()
+                            .resolve_conflict_local(&ct, revision, &remote_ct, &remote_meta)
+                            .await?;
                     }
                 }
             }
-            other => anyhow::bail!("{}", self.i18n.trf("daemon_conflict_none", &[&format!("{:?}", other)])),
+            other => anyhow::bail!(
+                "{}",
+                self.i18n
+                    .trf("daemon_conflict_none", &[&format!("{:?}", other)])
+            ),
         }
         Ok((self.list_hosts()?,))
     }
@@ -344,7 +424,10 @@ impl DaemonState {
         match action {
             "reupload" => info!("Will reupload on next sync"),
             "clear_state" => {
-                self.sync.as_mut().context(self.i18n.tr("daemon_sync_not_initialized"))?.clear_state()?;
+                self.sync
+                    .as_mut()
+                    .context(self.i18n.tr("daemon_sync_not_initialized"))?
+                    .clear_state()?;
                 info!("Sync state cleared due to missing remote");
             }
             _ => anyhow::bail!("{}", self.i18n.trf("daemon_unknown_action", &[action])),
@@ -355,8 +438,14 @@ impl DaemonState {
 
 fn host_to_summary(h: &vida_core::vault::HostEntry) -> HostSummary {
     HostSummary {
-        id: h.id.clone(), name: h.name.clone(), host: h.host.clone(), user: h.user.clone(),
-        port: h.port, tags: h.tags.clone(), group: h.group.clone(), color: h.color.clone(),
+        id: h.id.clone(),
+        name: h.name.clone(),
+        host: h.host.clone(),
+        user: h.user.clone(),
+        port: h.port,
+        tags: h.tags.clone(),
+        group: h.group.clone(),
+        color: h.color.clone(),
         auth_kind: match &h.auth {
             AuthMethod::Password { .. } => "password".to_string(),
             AuthMethod::Key { .. } => "key".to_string(),

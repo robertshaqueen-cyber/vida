@@ -32,21 +32,22 @@ impl State {
             .on_input(AppMessage::SetupPassphraseChanged)
             .secure(true);
 
-        let confirm_input = text_input(i18n.tr("setup_confirm_placeholder"), &self.confirm_passphrase)
-            .on_input(AppMessage::SetupConfirmPassphraseChanged)
-            .secure(true);
+        let confirm_input = text_input(
+            i18n.tr("setup_confirm_placeholder"),
+            &self.confirm_passphrase,
+        )
+        .on_input(AppMessage::SetupConfirmPassphraseChanged)
+        .secure(true);
 
-        let mismatch = if !self.confirm_passphrase.is_empty()
-            && self.passphrase != self.confirm_passphrase
-        {
-            text(i18n.tr("setup_passphrase_mismatch")).size(12)
-        } else {
-            text("")
-        };
+        let mismatch =
+            if !self.confirm_passphrase.is_empty() && self.passphrase != self.confirm_passphrase {
+                text(i18n.tr("setup_passphrase_mismatch")).size(12)
+            } else {
+                text("")
+            };
 
         // Risk warning text
-        let risk_warning = text(i18n.tr("setup_risk_warning"))
-            .size(13);
+        let risk_warning = text(i18n.tr("setup_risk_warning")).size(13);
 
         let risk_check = iced::widget::checkbox(self.risk_confirmed)
             .label(i18n.tr("setup_risk_checkbox"))

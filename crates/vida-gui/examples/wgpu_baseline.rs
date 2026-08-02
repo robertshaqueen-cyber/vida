@@ -43,7 +43,10 @@ impl ApplicationHandler for App {
 
         let attrs = Window::default_attributes()
             .with_title("winit+wgpu baseline")
-            .with_inner_size(winit::dpi::LogicalSize::new(self.width as f64, self.height as f64));
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.width as f64,
+                self.height as f64,
+            ));
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
@@ -56,9 +59,9 @@ impl ApplicationHandler for App {
                 if let RawWindowHandle::AppKit(awh) = wh.as_raw() {
                     unsafe {
                         use objc::msg_send;
+                        use objc::runtime::Object;
                         use objc::sel;
                         use objc::sel_impl;
-                        use objc::runtime::Object;
                         let ns_view = awh.ns_view.as_ptr() as *mut Object;
                         let ns_window: *mut Object = msg_send![ns_view, window];
                         if !ns_window.is_null() {
@@ -96,8 +99,10 @@ impl ApplicationHandler for App {
 
         let size = window.inner_size();
         let scale = window.scale_factor();
-        eprintln!("Window: {}x{} logical, {}x{} physical, scale={}",
-            self.width, self.height, size.width, size.height, scale);
+        eprintln!(
+            "Window: {}x{} logical, {}x{} physical, scale={}",
+            self.width, self.height, size.width, size.height, scale
+        );
 
         let cap = surface.get_capabilities(&adapter);
         let format = cap.formats[0];
@@ -138,11 +143,11 @@ impl ApplicationHandler for App {
                     let view = output
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
-                    let mut encoder = r
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("baseline encoder"),
-                        });
+                    let mut encoder =
+                        r.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("baseline encoder"),
+                            });
                     {
                         let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("baseline pass"),

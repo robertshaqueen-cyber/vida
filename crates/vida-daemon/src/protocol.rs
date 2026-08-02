@@ -84,10 +84,18 @@ pub struct Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResponsePayload {
-    Ok { result: serde_json::Value },
-    Error { code: i32, message: String },
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        code: i32,
+        message: String,
+    },
     /// Push events (no id correlation) — used for vault-changed notifications.
-    Event { event: String, data: serde_json::Value },
+    Event {
+        event: String,
+        data: serde_json::Value,
+    },
 }
 
 // ---------------------------------------------------------------------------

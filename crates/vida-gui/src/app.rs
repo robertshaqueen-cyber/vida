@@ -3,7 +3,10 @@ use vida_core::i18n::{self, I18n};
 
 // s6/s7/s8 (sync conflict screens) are kept for the future sync trigger entry
 #[allow(unused_imports)]
-use crate::screens::{s0_connection, s1_setup, s2_unlock, s3_main, s4_credential, s5_settings, s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup, Screen, Tab};
+use crate::screens::{
+    Screen, Tab, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential, s5_settings,
+    s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
+};
 use crate::ws_client::WsClient;
 
 pub fn run() -> Result<(), iced::Error> {
@@ -49,10 +52,10 @@ pub enum AppMessage {
     DaemonChecked { locked: bool, vault_exists: bool },
 
     // Tab management
-    SwitchTab(String),       // tab id
-    OpenAddHostTab,          // open host picker/add tab
-    OpenSettingsTab,         // open settings as tab
-    CloseTab(String),        // tab id
+    SwitchTab(String), // tab id
+    OpenAddHostTab,    // open host picker/add tab
+    OpenSettingsTab,   // open settings as tab
+    CloseTab(String),  // tab id
     // Quick connect panel
     ToggleConnectPanel,
     CloseConnectPanel,
@@ -169,8 +172,14 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     match client.vault_status().await {
                         Ok(s) => {
                             let locked = s.get("locked").and_then(|v| v.as_bool()).unwrap_or(true);
-                            let vault_exists = s.get("vault_exists").and_then(|v| v.as_bool()).unwrap_or(false);
-                            AppMessage::DaemonChecked { locked, vault_exists }
+                            let vault_exists = s
+                                .get("vault_exists")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            AppMessage::DaemonChecked {
+                                locked,
+                                vault_exists,
+                            }
                         }
                         Err(e) => AppMessage::WsError(e.to_string()),
                     }
@@ -182,18 +191,19 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.screen = Screen::ConnectionFailure(s0_connection::State::new(e));
             Task::none()
         }
-        AppMessage::RetryConnection => {
-            Task::perform(
-                async {
-                    match WsClient::connect().await {
-                        Ok(client) => AppMessage::WsConnected(client),
-                        Err(e) => AppMessage::WsError(e.to_string()),
-                    }
-                },
-                |r| r,
-            )
-        }
-        AppMessage::DaemonChecked { locked, vault_exists } => {
+        AppMessage::RetryConnection => Task::perform(
+            async {
+                match WsClient::connect().await {
+                    Ok(client) => AppMessage::WsConnected(client),
+                    Err(e) => AppMessage::WsError(e.to_string()),
+                }
+            },
+            |r| r,
+        ),
+        AppMessage::DaemonChecked {
+            locked,
+            vault_exists,
+        } => {
             if !vault_exists {
                 app.screen = Screen::Setup(s1_setup::State::new());
             } else if locked {
@@ -216,15 +226,21 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S1: Setup ----
         AppMessage::SetupPassphraseChanged(p) => {
-            if let Screen::Setup(s) = &mut app.screen { s.passphrase = p; }
+            if let Screen::Setup(s) = &mut app.screen {
+                s.passphrase = p;
+            }
             Task::none()
         }
         AppMessage::SetupConfirmPassphraseChanged(p) => {
-            if let Screen::Setup(s) = &mut app.screen { s.confirm_passphrase = p; }
+            if let Screen::Setup(s) = &mut app.screen {
+                s.confirm_passphrase = p;
+            }
             Task::none()
         }
         AppMessage::SetupRiskConfirmed(v) => {
-            if let Screen::Setup(s) = &mut app.screen { s.risk_confirmed = v; }
+            if let Screen::Setup(s) = &mut app.screen {
+                s.risk_confirmed = v;
+            }
             Task::none()
         }
         AppMessage::SetupCreateVault => {
@@ -242,7 +258,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     },
                     |r| r,
                 )
-            } else { Task::none() }
+            } else {
+                Task::none()
+            }
         }
         AppMessage::SetupVaultCreated => {
             let client = app.ws_client.as_ref().unwrap().clone();
@@ -259,11 +277,15 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S2: Unlock ----
         AppMessage::UnlockPassphraseChanged(p) => {
-            if let Screen::Unlock(s) = &mut app.screen { s.passphrase = p; }
+            if let Screen::Unlock(s) = &mut app.screen {
+                s.passphrase = p;
+            }
             Task::none()
         }
         AppMessage::UnlockRememberToggled(v) => {
-            if let Screen::Unlock(s) = &mut app.screen { s.remember = v; }
+            if let Screen::Unlock(s) = &mut app.screen {
+                s.remember = v;
+            }
             Task::none()
         }
         AppMessage::UnlockVault => {
@@ -282,7 +304,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     },
                     |r| r,
                 )
-            } else { Task::none() }
+            } else {
+                Task::none()
+            }
         }
         AppMessage::UnlockFailed(e) => {
             if let Screen::Unlock(s) = &mut app.screen {
@@ -313,7 +337,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             // Add a new "新增主机" tab if not already present
             let existing = app.tabs.iter().find(|t| t.id == "add_host");
             if existing.is_none() {
-                app.tabs.push(Tab::add_host(app.i18n.tr("main_add_host_tab").to_string()));
+                app.tabs
+                    .push(Tab::add_host(app.i18n.tr("main_add_host_tab").to_string()));
             }
             app.active_tab_id = "add_host".into();
             app.editor_state = Some(s4_credential::State::new_add());
@@ -323,7 +348,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             // Add settings tab if not already present, or switch to it
             let existing = app.tabs.iter().find(|t| t.id == "settings");
             if existing.is_none() {
-                app.tabs.push(Tab::settings(app.i18n.tr("main_tab_settings").to_string()));
+                app.tabs
+                    .push(Tab::settings(app.i18n.tr("main_tab_settings").to_string()));
             }
             app.active_tab_id = "settings".into();
             // Load settings if not already loaded
@@ -375,9 +401,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let existing = app.tabs.iter().find(|t| t.id == host_id);
             if existing.is_none()
                 && let Screen::Main(s) = &app.screen
-                    && let Some(h) = s.hosts.iter().find(|h| h.id == host_id) {
-                        app.tabs.push(Tab::host(host_id.clone(), h.name.clone()));
-                    }
+                && let Some(h) = s.hosts.iter().find(|h| h.id == host_id)
+            {
+                app.tabs.push(Tab::host(host_id.clone(), h.name.clone()));
+            }
             app.active_tab_id = host_id.clone();
             // Update recent hosts: move to front, dedup, limit to 10
             app.recent_host_ids.retain(|id| *id != host_id);
@@ -389,7 +416,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.show_connect_panel = false;
             let existing = app.tabs.iter().find(|t| t.id == "add_host");
             if existing.is_none() {
-                app.tabs.push(Tab::add_host(app.i18n.tr("main_add_host_tab").to_string()));
+                app.tabs
+                    .push(Tab::add_host(app.i18n.tr("main_add_host_tab").to_string()));
             }
             app.active_tab_id = "add_host".into();
             app.editor_state = Some(s4_credential::State::new_add());
@@ -405,12 +433,15 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 String::new()
             };
             // Preserve non-host tabs (settings, add host, edit host)
-            let non_host_tabs: Vec<Tab> = app.tabs.iter()
+            let non_host_tabs: Vec<Tab> = app
+                .tabs
+                .iter()
                 .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
                 .cloned()
                 .collect();
             // Create tabs for hosts
-            let host_tabs: Vec<Tab> = hosts.iter()
+            let host_tabs: Vec<Tab> = hosts
+                .iter()
                 .map(|h| Tab::host(h.id.clone(), h.name.clone()))
                 .collect();
             // Merge: host tabs first, then non-host tabs
@@ -432,25 +463,29 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::EditHost(host_id) => {
             // Find host data and open editor in a new tab
             if let Screen::Main(s) = &app.screen
-                && let Some(h) = s.hosts.iter().find(|h| h.id == host_id) {
-                    let tab_id = format!("edit_{}", host_id);
-                    let existing = app.tabs.iter().find(|t| t.id == tab_id);
-                    if existing.is_none() {
-                        app.tabs.push(Tab::edit_host(host_id.clone(), app.i18n.trf("main_edit_host_tab", &[&h.name])));
-                    }
-                    app.active_tab_id = tab_id;
-                    app.editor_state = Some(s4_credential::State::new_edit(
-                        h.id.clone(),
-                        h.name.clone(),
-                        h.host.clone(),
-                        h.user.clone(),
-                        h.port,
-                        h.tags.clone(),
-                        h.group.clone(),
-                        h.color.clone(),
-                        h.notes.clone(),
+                && let Some(h) = s.hosts.iter().find(|h| h.id == host_id)
+            {
+                let tab_id = format!("edit_{}", host_id);
+                let existing = app.tabs.iter().find(|t| t.id == tab_id);
+                if existing.is_none() {
+                    app.tabs.push(Tab::edit_host(
+                        host_id.clone(),
+                        app.i18n.trf("main_edit_host_tab", &[&h.name]),
                     ));
                 }
+                app.active_tab_id = tab_id;
+                app.editor_state = Some(s4_credential::State::new_edit(
+                    h.id.clone(),
+                    h.name.clone(),
+                    h.host.clone(),
+                    h.user.clone(),
+                    h.port,
+                    h.tags.clone(),
+                    h.group.clone(),
+                    h.color.clone(),
+                    h.notes.clone(),
+                ));
+            }
             Task::none()
         }
         AppMessage::DeleteHostConfirm(host_id) => {
@@ -458,7 +493,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
-                    match client.send("DeleteHost", serde_json::json!({"host_id": host_id})).await {
+                    match client
+                        .send("DeleteHost", serde_json::json!({"host_id": host_id}))
+                        .await
+                    {
                         Ok(_) => AppMessage::DeleteHost,
                         Err(e) => AppMessage::WsError(e.to_string()),
                     }
@@ -485,7 +523,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 async move {
                     match client.reveal_credential(&host_id).await {
                         Ok(val) => {
-                            let cred = val.get("credential")
+                            let cred = val
+                                .get("credential")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
@@ -513,25 +552,36 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S4: Host editor ----
         AppMessage::EditorNameChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.name = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.name = v;
+            }
             Task::none()
         }
         AppMessage::EditorHostChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.host = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.host = v;
+            }
             Task::none()
         }
         AppMessage::EditorUserChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.user = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.user = v;
+            }
             Task::none()
         }
         AppMessage::EditorPortChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.port = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.port = v;
+            }
             Task::none()
         }
         AppMessage::EditorPasswordChanged(v) => {
             if let Some(s) = &mut app.editor_state {
                 // Intercept: if user clears the field on an edit, warn them
-                if v.is_empty() && !s.password.is_empty() && matches!(s.mode, s4_credential::EditorMode::Edit { .. }) {
+                if v.is_empty()
+                    && !s.password.is_empty()
+                    && matches!(s.mode, s4_credential::EditorMode::Edit { .. })
+                {
                     s.password_cleared = true;
                 }
                 s.password = v;
@@ -540,15 +590,21 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::EditorTagsChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.tags = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.tags = v;
+            }
             Task::none()
         }
         AppMessage::EditorGroupChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.group = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.group = v;
+            }
             Task::none()
         }
         AppMessage::EditorNotesChanged(v) => {
-            if let Some(s) = &mut app.editor_state { s.notes = v; }
+            if let Some(s) = &mut app.editor_state {
+                s.notes = v;
+            }
             Task::none()
         }
         AppMessage::EditorSave => {
@@ -563,12 +619,22 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 let host = s.host.clone();
                 let user = s.user.clone();
                 let port: u16 = s.port.parse().unwrap_or(22);
-                let tags: Vec<String> = s.tags.split(',')
+                let tags: Vec<String> = s
+                    .tags
+                    .split(',')
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
                     .collect();
-                let group = if s.group.is_empty() { None } else { Some(s.group.clone()) };
-                let notes = if s.notes.is_empty() { None } else { Some(s.notes.clone()) };
+                let group = if s.group.is_empty() {
+                    None
+                } else {
+                    Some(s.group.clone())
+                };
+                let notes = if s.notes.is_empty() {
+                    None
+                } else {
+                    Some(s.notes.clone())
+                };
                 // Password: empty on edit → None (keep existing); non-empty → Some
                 let password = if s.password.is_empty() {
                     None // keep existing (edit) or validation catches (add)
@@ -599,12 +665,18 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     },
                     |r| r,
                 )
-            } else { Task::none() }
+            } else {
+                Task::none()
+            }
         }
         AppMessage::EditorSaved => {
             // Close the editor tab and reload hosts
             let active_id = app.active_tab_id.clone();
-            app.tabs.retain(|t| t.id != active_id && t.kind != crate::screens::TabKind::AddHost && !t.id.starts_with("edit_"));
+            app.tabs.retain(|t| {
+                t.id != active_id
+                    && t.kind != crate::screens::TabKind::AddHost
+                    && !t.id.starts_with("edit_")
+            });
             app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
             app.editor_state = None;
             // Reload hosts
@@ -622,7 +694,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::EditorCancel => {
             // Close the editor tab and reload hosts
             let active_id = app.active_tab_id.clone();
-            app.tabs.retain(|t| t.id != active_id && t.kind != crate::screens::TabKind::AddHost && !t.id.starts_with("edit_"));
+            app.tabs.retain(|t| {
+                t.id != active_id
+                    && t.kind != crate::screens::TabKind::AddHost
+                    && !t.id.starts_with("edit_")
+            });
             app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
             app.editor_state = None;
             // Reload hosts
@@ -637,7 +713,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 |r| r,
             )
         }
-
 
         AppMessage::LockVault => {
             let client = app.ws_client.as_ref().unwrap().clone();
@@ -709,11 +784,17 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::SettingsSyncPathChanged(p) => {
-            if let Some(s) = &mut app.settings_state { s.sync_local_path = p; s.saved = false; }
+            if let Some(s) = &mut app.settings_state {
+                s.sync_local_path = p;
+                s.saved = false;
+            }
             Task::none()
         }
         AppMessage::SettingsScrollbackChanged(v) => {
-            if let Some(s) = &mut app.settings_state { s.scrollback_lines = v; s.saved = false; }
+            if let Some(s) = &mut app.settings_state {
+                s.scrollback_lines = v;
+                s.saved = false;
+            }
             Task::none()
         }
         AppMessage::SettingsSave => {
@@ -721,7 +802,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 s.saving = true;
                 s.error = None;
                 let scrollback = s.scrollback_lines.parse::<usize>().unwrap_or(5000);
-                let sync_path = if s.sync_local_path.is_empty() { None } else { Some(s.sync_local_path.clone()) };
+                let sync_path = if s.sync_local_path.is_empty() {
+                    None
+                } else {
+                    Some(s.sync_local_path.clone())
+                };
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
                     async move {
@@ -736,7 +821,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     },
                     |r| r,
                 )
-            } else { Task::none() }
+            } else {
+                Task::none()
+            }
         }
         AppMessage::SettingsSaved => {
             if let Some(s) = &mut app.settings_state {
@@ -751,7 +838,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
-                    match client.send("ResolveConflict", serde_json::json!({"choice": "local"})).await {
+                    match client
+                        .send("ResolveConflict", serde_json::json!({"choice": "local"}))
+                        .await
+                    {
                         Ok(_) => AppMessage::ConflictResolved,
                         Err(e) => AppMessage::WsError(e.to_string()),
                     }
@@ -763,7 +853,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
-                    match client.send("ResolveConflict", serde_json::json!({"choice": "remote"})).await {
+                    match client
+                        .send("ResolveConflict", serde_json::json!({"choice": "remote"}))
+                        .await
+                    {
                         Ok(_) => AppMessage::ConflictResolved,
                         Err(e) => AppMessage::WsError(e.to_string()),
                     }
@@ -787,36 +880,44 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         // ---- S7: Conflict files ----
         AppMessage::ConflictFileAdopt => {
             if let Screen::ConflictFile(s) = &app.screen
-                && let Some(first) = s.files.first() {
-                    let path = first.path.clone();
-                    let client = app.ws_client.as_ref().unwrap().clone();
-                    return Task::perform(
-                        async move {
-                            match client.send("AdoptConflictFile", serde_json::json!({"path": path})).await {
-                                Ok(_) => AppMessage::ConflictFileHandled,
-                                Err(e) => AppMessage::WsError(e.to_string()),
-                            }
-                        },
-                        |r| r,
-                    );
-                }
+                && let Some(first) = s.files.first()
+            {
+                let path = first.path.clone();
+                let client = app.ws_client.as_ref().unwrap().clone();
+                return Task::perform(
+                    async move {
+                        match client
+                            .send("AdoptConflictFile", serde_json::json!({"path": path}))
+                            .await
+                        {
+                            Ok(_) => AppMessage::ConflictFileHandled,
+                            Err(e) => AppMessage::WsError(e.to_string()),
+                        }
+                    },
+                    |r| r,
+                );
+            }
             Task::none()
         }
         AppMessage::ConflictFileIgnore => {
             if let Screen::ConflictFile(s) = &app.screen
-                && let Some(first) = s.files.first() {
-                    let path = first.path.clone();
-                    let client = app.ws_client.as_ref().unwrap().clone();
-                    return Task::perform(
-                        async move {
-                            match client.send("IgnoreConflictFile", serde_json::json!({"path": path})).await {
-                                Ok(_) => AppMessage::ConflictFileHandled,
-                                Err(e) => AppMessage::WsError(e.to_string()),
-                            }
-                        },
-                        |r| r,
-                    );
-                }
+                && let Some(first) = s.files.first()
+            {
+                let path = first.path.clone();
+                let client = app.ws_client.as_ref().unwrap().clone();
+                return Task::perform(
+                    async move {
+                        match client
+                            .send("IgnoreConflictFile", serde_json::json!({"path": path}))
+                            .await
+                        {
+                            Ok(_) => AppMessage::ConflictFileHandled,
+                            Err(e) => AppMessage::WsError(e.to_string()),
+                        }
+                    },
+                    |r| r,
+                );
+            }
             Task::none()
         }
         AppMessage::ConflictFileHandled => {
@@ -837,7 +938,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
-                    match client.send("HandleRemoteMissing", serde_json::json!({"action": action})).await {
+                    match client
+                        .send("HandleRemoteMissing", serde_json::json!({"action": action}))
+                        .await
+                    {
                         Ok(_) => AppMessage::RemoteMissingHandled,
                         Err(e) => AppMessage::WsError(e.to_string()),
                     }
@@ -860,33 +964,51 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S9: Backup ----
         AppMessage::BackupUseCurrentToggled(v) => {
-            if let Screen::Backup(s) = &mut app.screen { s.use_current = v; }
+            if let Screen::Backup(s) = &mut app.screen {
+                s.use_current = v;
+            }
             Task::none()
         }
         AppMessage::BackupPassphraseChanged(p) => {
-            if let Screen::Backup(s) = &mut app.screen { s.export_passphrase = p; }
+            if let Screen::Backup(s) = &mut app.screen {
+                s.export_passphrase = p;
+            }
             Task::none()
         }
         AppMessage::BackupExport => {
             if let Screen::Backup(s) = &mut app.screen {
                 s.exporting = true;
                 s.error = None;
-                let passphrase = if s.use_current { None } else { Some(s.export_passphrase.clone()) };
+                let passphrase = if s.use_current {
+                    None
+                } else {
+                    Some(s.export_passphrase.clone())
+                };
                 let client = app.ws_client.as_ref().unwrap().clone();
                 let i18n = app.i18n.clone();
                 Task::perform(
                     async move {
-                        match client.send("ExportBackup", serde_json::json!({"passphrase": passphrase})).await {
+                        match client
+                            .send(
+                                "ExportBackup",
+                                serde_json::json!({"passphrase": passphrase}),
+                            )
+                            .await
+                        {
                             Ok(val) => {
                                 let bytes = val.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                                AppMessage::BackupExported(i18n.trf("backup_exported", &[&bytes.to_string()]))
+                                AppMessage::BackupExported(
+                                    i18n.trf("backup_exported", &[&bytes.to_string()]),
+                                )
                             }
                             Err(e) => AppMessage::WsError(e.to_string()),
                         }
                     },
                     |r| r,
                 )
-            } else { Task::none() }
+            } else {
+                Task::none()
+            }
         }
         AppMessage::BackupExported(msg) => {
             if let Screen::Backup(s) = &mut app.screen {
@@ -911,49 +1033,53 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 }
 
 fn view(app: &VidaApp) -> Element<'_, AppMessage> {
-    use iced::widget::{column, container, text};
-    use iced::Length;
     use crate::screens::TabKind;
+    use iced::Length;
+    use iced::widget::{column, container, text};
 
     match &app.screen {
         // Pre-main screens: full screen, no tab bar
-        Screen::ConnectionFailure(_)
-        | Screen::Setup(_)
-        | Screen::Unlock(_) => app.screen.view(&app.i18n),
+        Screen::ConnectionFailure(_) | Screen::Setup(_) | Screen::Unlock(_) => {
+            app.screen.view(&app.i18n)
+        }
 
         // Main interface: tab bar + content based on active tab kind
         Screen::Main(s) => {
-            let tab_bar = s3_main::State::view_tab_bar(&app.tabs, &app.active_tab_id, &app.i18n, app.show_connect_panel);
+            let tab_bar = s3_main::State::view_tab_bar(
+                &app.tabs,
+                &app.active_tab_id,
+                &app.i18n,
+                app.show_connect_panel,
+            );
 
-            let content = if let Some(active_tab) = app.tabs.iter().find(|t| t.id == app.active_tab_id) {
-                match &active_tab.kind {
-                    TabKind::Host { host_id } => {
-                        s.view_host_detail(host_id, &app.i18n)
-                    }
-                    TabKind::AddHost | TabKind::EditHost { .. } => {
-                        if let Some(editor) = &app.editor_state {
-                            editor.view(&app.i18n)
-                        } else {
-                            text(app.i18n.tr("main_editor_loading")).into()
+            let content =
+                if let Some(active_tab) = app.tabs.iter().find(|t| t.id == app.active_tab_id) {
+                    match &active_tab.kind {
+                        TabKind::Host { host_id } => s.view_host_detail(host_id, &app.i18n),
+                        TabKind::AddHost | TabKind::EditHost { .. } => {
+                            if let Some(editor) = &app.editor_state {
+                                editor.view(&app.i18n)
+                            } else {
+                                text(app.i18n.tr("main_editor_loading")).into()
+                            }
+                        }
+                        TabKind::Settings => {
+                            if let Some(settings) = &app.settings_state {
+                                settings.view(&app.i18n)
+                            } else {
+                                text(app.i18n.tr("main_settings_loading")).into()
+                            }
                         }
                     }
-                    TabKind::Settings => {
-                        if let Some(settings) = &app.settings_state {
-                            settings.view(&app.i18n)
-                        } else {
-                            text(app.i18n.tr("main_settings_loading")).into()
-                        }
-                    }
-                }
-            } else {
-                let placeholder = text(app.i18n.tr("main_no_hosts")).size(16);
-                container(placeholder)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .into()
-            };
+                } else {
+                    let placeholder = text(app.i18n.tr("main_no_hosts")).size(16);
+                    container(placeholder)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
+                        .into()
+                };
 
             let base = column![tab_bar, content]
                 .width(Length::Fill)
@@ -961,11 +1087,16 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
 
             if app.show_connect_panel {
                 // Floating overlay with dimmed background + panel
-                use iced::widget::stack;
-                use iced::widget::button;
                 use iced::Color;
+                use iced::widget::button;
+                use iced::widget::stack;
 
-                let panel = s3_main::State::view_connect_panel(&s.hosts, &app.recent_host_ids, &app.connect_panel_search, &app.i18n);
+                let panel = s3_main::State::view_connect_panel(
+                    &s.hosts,
+                    &app.recent_host_ids,
+                    &app.connect_panel_search,
+                    &app.i18n,
+                );
 
                 // Semi-transparent overlay that closes panel on click.
                 // Clip avoids edge artifacts when layered over the base content.
@@ -974,13 +1105,15 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                         .on_press(AppMessage::CloseConnectPanel)
                         .style(button::text)
                         .width(Length::Fill)
-                        .height(Length::Fill)
+                        .height(Length::Fill),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .clip(true)
                 .style(|_: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.4))),
+                    background: Some(iced::Background::Color(Color::from_rgba(
+                        0.0, 0.0, 0.0, 0.4,
+                    ))),
                     ..Default::default()
                 })
                 .into();
@@ -990,7 +1123,9 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     .padding(4)
                     .width(Length::Fixed(420.0))
                     .style(|_: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgba(0.12, 0.12, 0.15, 1.0))),
+                        background: Some(iced::Background::Color(Color::from_rgba(
+                            0.12, 0.12, 0.15, 1.0,
+                        ))),
                         border: iced::Border::default().rounded(8),
                         ..Default::default()
                     })
@@ -1005,7 +1140,9 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     .padding(iced::padding::Padding::new(0.0).top(50))
                     .center_x(Length::Fill)
                     .style(|_: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.4))),
+                        background: Some(iced::Background::Color(Color::from_rgba(
+                            0.0, 0.0, 0.0, 0.4,
+                        ))),
                         ..Default::default()
                     })
                     .into();
@@ -1023,7 +1160,8 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
 
         // Other screens (conflict, etc.): show with tab bar
         _ => {
-            let tab_bar = s3_main::State::view_tab_bar(&app.tabs, &app.active_tab_id, &app.i18n, false);
+            let tab_bar =
+                s3_main::State::view_tab_bar(&app.tabs, &app.active_tab_id, &app.i18n, false);
             let content = app.screen.view(&app.i18n);
             column![tab_bar, content]
                 .width(Length::Fill)
@@ -1047,8 +1185,14 @@ fn parse_hosts(val: &serde_json::Value) -> Vec<s3_main::HostItem> {
                 host: h.get("host")?.as_str()?.to_string(),
                 user: h.get("user")?.as_str()?.to_string(),
                 port: h.get("port")?.as_u64()? as u16,
-                tags: h.get("tags")?.as_array()
-                    .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                tags: h
+                    .get("tags")?
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 group: h.get("group").and_then(|v| v.as_str()).map(String::from),
                 color: h.get("color").and_then(|v| v.as_str()).map(String::from),

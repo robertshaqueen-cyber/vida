@@ -40,21 +40,17 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let temp_path = dir.join(&temp_name);
 
     {
-        let mut f = fs::File::create(&temp_path)
-            .context("Failed to create temp file for atomic write")?;
+        let mut f =
+            fs::File::create(&temp_path).context("Failed to create temp file for atomic write")?;
         f.write_all(data)
             .context("Failed to write data to temp file")?;
-        full_fsync(&f)
-            .context("Failed to full_fsync temp file")?;
+        full_fsync(&f).context("Failed to full_fsync temp file")?;
     }
 
-    fs::rename(&temp_path, path)
-        .context("Failed to rename temp file to final path")?;
+    fs::rename(&temp_path, path).context("Failed to rename temp file to final path")?;
 
-    let dir_file = fs::File::open(dir)
-        .context("Failed to open parent directory for fsync")?;
-    full_fsync(&dir_file)
-        .context("Failed to fsync parent directory")?;
+    let dir_file = fs::File::open(dir).context("Failed to open parent directory for fsync")?;
+    full_fsync(&dir_file).context("Failed to fsync parent directory")?;
 
     Ok(())
 }
@@ -91,32 +87,27 @@ fn save_vault_inner(
     let temp_path = dir.join(&temp_name);
 
     {
-        let mut f = fs::File::create(&temp_path)
-            .context("Failed to create temp vault file")?;
+        let mut f = fs::File::create(&temp_path).context("Failed to create temp vault file")?;
         f.write_all(&encrypted)
             .context("Failed to write vault data")?;
-        full_fsync(&f)
-            .context("Failed to F_FULLFSYNC vault file")?;
+        full_fsync(&f).context("Failed to F_FULLFSYNC vault file")?;
     }
 
     // Step 4: Atomic rename
-    fs::rename(&temp_path, path)
-        .context("Failed to rename temp vault to final path")?;
+    fs::rename(&temp_path, path).context("Failed to rename temp vault to final path")?;
 
     // Step 5: fsync parent directory to ensure rename is persistent
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dir_file = fs::File::open(parent)
-        .context("Failed to open parent directory for fsync")?;
-    full_fsync(&dir_file)
-        .context("Failed to fsync parent directory")?;
+    let dir_file = fs::File::open(parent).context("Failed to open parent directory for fsync")?;
+    full_fsync(&dir_file).context("Failed to fsync parent directory")?;
 
     Ok(())
 }
 
 /// Load and decrypt a vault from disk.
 pub fn load_vault(passphrase: &SecretString, path: &Path) -> Result<Vault> {
-    let data = fs::read(path)
-        .with_context(|| format!("Failed to read vault file: {}", path.display()))?;
+    let data =
+        fs::read(path).with_context(|| format!("Failed to read vault file: {}", path.display()))?;
 
     vault::decrypt(&data, passphrase.expose_secret())
         .context("Failed to decrypt vault (wrong passphrase?)")
@@ -134,24 +125,48 @@ fn rotate_backups(vault_path: &Path) -> Result<()> {
     let ext = vault_path.extension().unwrap_or_default();
 
     // Remove oldest backup if at limit
-    let oldest = dir.join(format!("{}.{}.{}", stem.to_string_lossy(), MAX_BACKUPS, ext.to_string_lossy()));
+    let oldest = dir.join(format!(
+        "{}.{}.{}",
+        stem.to_string_lossy(),
+        MAX_BACKUPS,
+        ext.to_string_lossy()
+    ));
     if oldest.exists() {
-        fs::remove_file(& oldest)
+        fs::remove_file(&oldest)
             .with_context(|| format!("Failed to remove oldest backup: {}", oldest.display()))?;
     }
 
     // Shift backups: N → N+1
     for i in (1..MAX_BACKUPS).rev() {
-        let src = dir.join(format!("{}.{}.{}", stem.to_string_lossy(), i, ext.to_string_lossy()));
-        let dst = dir.join(format!("{}.{}.{}", stem.to_string_lossy(), i + 1, ext.to_string_lossy()));
+        let src = dir.join(format!(
+            "{}.{}.{}",
+            stem.to_string_lossy(),
+            i,
+            ext.to_string_lossy()
+        ));
+        let dst = dir.join(format!(
+            "{}.{}.{}",
+            stem.to_string_lossy(),
+            i + 1,
+            ext.to_string_lossy()
+        ));
         if src.exists() {
-            fs::rename(&src, &dst)
-                .with_context(|| format!("Failed to shift backup {} → {}", src.display(), dst.display()))?;
+            fs::rename(&src, &dst).with_context(|| {
+                format!(
+                    "Failed to shift backup {} → {}",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
         }
     }
 
     // Create backup.1 from current vault
-    let backup1 = dir.join(format!("{}.1.{}", stem.to_string_lossy(), ext.to_string_lossy()));
+    let backup1 = dir.join(format!(
+        "{}.1.{}",
+        stem.to_string_lossy(),
+        ext.to_string_lossy()
+    ));
     fs::copy(vault_path, &backup1)
         .with_context(|| format!("Failed to create backup: {}", backup1.display()))?;
 
@@ -186,7 +201,7 @@ pub fn secure_delete(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{HostEntry, AuthMethod, SecureString};
+    use crate::vault::{AuthMethod, HostEntry, SecureString};
 
     /// Test log_n=10 for fast execution (~0.04s per encrypt).
     const TEST_LOG_N: u8 = 10;
@@ -206,7 +221,9 @@ mod tests {
                 tags: vec![],
                 group: None,
                 color: None,
-                auth: AuthMethod::Password { password: SecureString::new("test-pass".to_owned()) },
+                auth: AuthMethod::Password {
+                    password: SecureString::new("test-pass".to_owned()),
+                },
                 notes: None,
             }],
             ..Default::default()
@@ -265,9 +282,17 @@ mod tests {
         }
 
         // vault.10.age should exist (MAX_BACKUPS)
-        assert!(dir.path().join(format!("vault.{}.age", MAX_BACKUPS)).exists());
+        assert!(
+            dir.path()
+                .join(format!("vault.{}.age", MAX_BACKUPS))
+                .exists()
+        );
         // vault.11.age should NOT exist (oldest was rotated out)
-        assert!(!dir.path().join(format!("vault.{}.age", MAX_BACKUPS + 1)).exists());
+        assert!(
+            !dir.path()
+                .join(format!("vault.{}.age", MAX_BACKUPS + 1))
+                .exists()
+        );
     }
 
     #[test]
@@ -342,7 +367,8 @@ mod tests {
         save_vault_inner(&test_vault(), &passphrase, &path, TEST_LOG_N).unwrap();
 
         // Check no .vault-*.tmp files remain
-        let tmp_files: Vec<_> = fs::read_dir(dir.path()).unwrap()
+        let tmp_files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(".vault-"))
             .collect();

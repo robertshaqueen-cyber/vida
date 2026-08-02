@@ -27,7 +27,12 @@ pub struct State {
 
 impl State {
     /// Top tab bar: tabs on the left, spacer, then settings/lock on the right
-    pub fn view_tab_bar<'a>(tabs: &'a [Tab], active_tab_id: &'a str, i18n: &'a I18n, show_connect_panel: bool) -> Element<'a, AppMessage> {
+    pub fn view_tab_bar<'a>(
+        tabs: &'a [Tab],
+        active_tab_id: &'a str,
+        i18n: &'a I18n,
+        show_connect_panel: bool,
+    ) -> Element<'a, AppMessage> {
         // Tab buttons: text-only, active tab has bottom indicator, with X close button
         let tab_buttons: Vec<Element<'a, AppMessage>> = tabs
             .iter()
@@ -40,19 +45,18 @@ impl State {
                     i18n.tr("main_tab_close"),
                     tooltip::Position::Bottom,
                 );
-                let tab_content = row![label, close_btn].spacing(4).align_y(iced::Alignment::Center);
+                let tab_content = row![label, close_btn]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center);
                 let is_active = tab.id == active_tab_id;
                 let btn = button(tab_content)
                     .on_press(AppMessage::SwitchTab(tab.id.clone()))
                     .style(button::text)
                     .width(Length::Shrink);
                 if is_active {
-                    container(
-                        column![
-                            btn,
-                            rule::horizontal(2),
-                        ]
-                    ).width(Length::Shrink).into()
+                    container(column![btn, rule::horizontal(2),])
+                        .width(Length::Shrink)
+                        .into()
                 } else {
                     btn.into()
                 }
@@ -73,7 +77,11 @@ impl State {
         let connect_panel_btn = tooltip(
             button(text("⊞").size(14))
                 .on_press(AppMessage::ToggleConnectPanel)
-                .style(if show_connect_panel { button::secondary } else { button::text }),
+                .style(if show_connect_panel {
+                    button::secondary
+                } else {
+                    button::text
+                }),
             i18n.tr("main_tab_connect"),
             tooltip::Position::Bottom,
         );
@@ -156,7 +164,8 @@ impl State {
 
         // All hosts section (filtered by search)
         let search_lower = search.to_lowercase();
-        let filtered: Vec<&HostItem> = hosts.iter()
+        let filtered: Vec<&HostItem> = hosts
+            .iter()
             .filter(|h| {
                 search.is_empty()
                     || h.name.to_lowercase().contains(&search_lower)
@@ -167,9 +176,11 @@ impl State {
 
         if !filtered.is_empty() {
             items.push(text(i18n.tr("main_connect_all_hosts")).size(12).into());
-            let host_items: Vec<Element<'a, AppMessage>> = filtered.iter()
+            let host_items: Vec<Element<'a, AppMessage>> = filtered
+                .iter()
                 .map(|host| {
-                    let label = text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(13);
+                    let label =
+                        text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(13);
                     button(label)
                         .on_press(AppMessage::QuickConnectHost(host.id.clone()))
                         .style(button::text)
@@ -187,17 +198,12 @@ impl State {
                 .on_press(AppMessage::QuickAddHost)
                 .style(button::text)
                 .width(Length::Fill)
-                .into()
+                .into(),
         );
 
-        let panel = column(items)
-            .spacing(4)
-            .padding(8)
-            .width(Length::Fill);
+        let panel = column(items).spacing(4).padding(8).width(Length::Fill);
 
-        container(panel)
-            .padding(4)
-            .into()
+        container(panel).padding(4).into()
     }
 
     pub fn view_host_detail(&self, host_id: &str, i18n: &I18n) -> Element<'_, AppMessage> {
@@ -206,7 +212,8 @@ impl State {
             let conn = text(format!("{}@{}:{}", host.user, host.host, host.port)).size(14);
             let auth = text(i18n.trf("main_auth_kind", &[&host.auth_kind])).size(14);
 
-            let edit_btn = button(i18n.tr("main_edit")).on_press(AppMessage::EditHost(host.id.clone()));
+            let edit_btn =
+                button(i18n.tr("main_edit")).on_press(AppMessage::EditHost(host.id.clone()));
             let reveal_btn = button(i18n.tr("main_reveal_credential"))
                 .on_press(AppMessage::RevealCredential(host.id.clone()));
             let delete_btn = button(i18n.tr("main_delete"))
