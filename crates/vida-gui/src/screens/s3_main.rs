@@ -21,8 +21,6 @@ pub struct HostItem {
 
 #[derive(Debug, Clone)]
 pub struct State {
-    pub hosts: Vec<HostItem>,
-    pub search_query: String,
     /// Currently revealed credential `(host_id, plaintext)` for a host,
     /// auto-hides after 15s. Only shown when the host_id matches the
     /// currently viewed host.
@@ -227,8 +225,13 @@ impl State {
         container(panel).padding(4).into()
     }
 
-    pub fn view_host_detail(&self, host_id: &str, i18n: &I18n) -> Element<'_, AppMessage> {
-        if let Some(host) = self.hosts.iter().find(|h| h.id == host_id) {
+    pub fn view_host_detail<'a>(
+        &'a self,
+        hosts: &'a [HostItem],
+        host_id: &'a str,
+        i18n: &'a I18n,
+    ) -> Element<'a, AppMessage> {
+        if let Some(host) = hosts.iter().find(|h| h.id == host_id) {
             let name = text(&host.name).size(24);
             let conn = text(format!("{}@{}:{}", host.user, host.host, host.port)).size(14);
             let auth = text(i18n.trf("main_auth_kind", &[&host.auth_kind])).size(14);

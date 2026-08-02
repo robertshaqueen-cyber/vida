@@ -27,6 +27,9 @@ pub fn run() -> Result<(), iced::Error> {
 pub struct VidaApp {
     ws_client: Option<WsClient>,
     screen: Screen,
+    // Business data lives on VidaApp (not inside Screen), so any screen —
+    // e.g. conflict/backup screens — can read the host list.
+    hosts: Vec<s3_main::HostItem>,
     // Tab system (Tabby-style)
     tabs: Vec<Tab>,
     active_tab_id: String,
@@ -194,6 +197,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
     let app = VidaApp {
         ws_client: None,
         screen: Screen::ConnectionFailure(s0_connection::State::new(connecting.into())),
+        hosts: Vec::new(),
         tabs: Vec::new(),
         active_tab_id: String::new(),
         editor_state: None,
@@ -473,8 +477,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.show_connect_panel = false;
             let existing = app.tabs.iter().find(|t| t.id == host_id);
             if existing.is_none()
-                && let Screen::Main(s) = &app.screen
-                && let Some(h) = s.hosts.iter().find(|h| h.id == host_id)
+                && let Some(h) = app.hosts.iter().find(|h| h.id == host_id)
             {
                 app.tabs.push(Tab::host(host_id.clone(), h.name.clone()));
             }
@@ -500,11 +503,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         // ---- S3: Main ----
         AppMessage::HostsLoaded(hosts) => {
             use crate::screens::TabKind;
-            let search_query = if let Screen::Main(s) = &app.screen {
-                s.search_query.clone()
-            } else {
-                String::new()
-            };
+            // Business data lives on VidaApp so conflict/backup screens can
+            // read it regardless of the current screen.
+            app.hosts = hosts;
             // Preserve non-host tabs (settings, add host, edit host)
             let non_host_tabs: Vec<Tab> = app
                 .tabs
@@ -513,7 +514,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 .cloned()
                 .collect();
             // Create tabs for hosts
-            let host_tabs: Vec<Tab> = hosts
+            let host_tabs: Vec<Tab> = app
+                .hosts
                 .iter()
                 .map(|h| Tab::host(h.id.clone(), h.name.clone()))
                 .collect();
@@ -528,8 +530,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
             }
             app.screen = Screen::Main(s3_main::State {
-                hosts,
-                search_query,
                 revealed_credential: None,
                 credential_copied: false,
             });
@@ -537,9 +537,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::EditHost(host_id) => {
             // Find host data and open editor in a new tab
-            if let Screen::Main(s) = &app.screen
-                && let Some(h) = s.hosts.iter().find(|h| h.id == host_id)
-            {
+            if let Some(h) = app.hosts.iter().find(|h| h.id == host_id) {
                 let tab_id = format!("edit_{}", host_id);
                 let existing = app.tabs.iter().find(|t| t.id == tab_id);
                 if existing.is_none() {
@@ -891,11 +889,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let local_hosts: Vec<String> = if let Screen::Main(s) = &app.screen {
-                        s.hosts.iter().map(|h| h.name.clone()).collect()
-                    } else {
-                        Vec::new()
-                    };
+                    // Local list always comes from app.hosts (business data
+                    // lives on VidaApp), so the conflict screen shows real
+                    // data even when sync was triggered from another screen.
+                    let local_hosts: Vec<String> =
+                        app.hosts.iter().map(|h| h.name.clone()).collect();
                     app.screen =
                         Screen::Conflict(s6_conflict::State::new(local_hosts, remote_hosts));
                 }
@@ -956,19 +954,17 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 }
                 "downloaded" => {
                     app.sync_state = SyncState::Synced;
-                    let hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
-                    match &mut app.screen {
-                        Screen::Main(s) => {
-                            s.hosts = hosts;
-                        }
-                        _ => {
-                            app.screen = Screen::Main(s3_main::State {
-                                hosts,
-                                search_query: String::new(),
-                                revealed_credential: None,
-                                credential_copied: false,
-                            });
-                        }
+                    // Replace business data directly; no dependence on the
+                    // current screen (sync may have been triggered elsewhere).
+                    app.hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
+                    if let Screen::Main(s) = &mut app.screen {
+                        // keep the Main screen's view state as-is
+                        let _ = s;
+                    } else {
+                        app.screen = Screen::Main(s3_main::State {
+                            revealed_credential: None,
+                            credential_copied: false,
+                        });
                     }
                 }
                 _ => {
@@ -1004,10 +1000,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         // ---- S5: Settings ----
         AppMessage::SettingsLoaded(val) => {
             let mut settings = s5_settings::State::from_json(&val, &app.i18n);
-            // Pass hosts from main screen to settings
-            if let Screen::Main(s) = &app.screen {
-                settings.set_hosts(s.hosts.clone());
-            }
+            // Connections list comes from the business data on VidaApp
+            settings.set_hosts(app.hosts.clone());
             app.settings_state = Some(settings);
             Task::none()
         }
@@ -1328,34 +1322,35 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 app.sync_state.label(&app.i18n),
             );
 
-            let content =
-                if let Some(active_tab) = app.tabs.iter().find(|t| t.id == app.active_tab_id) {
-                    match &active_tab.kind {
-                        TabKind::Host { host_id } => s.view_host_detail(host_id, &app.i18n),
-                        TabKind::AddHost | TabKind::EditHost { .. } => {
-                            if let Some(editor) = &app.editor_state {
-                                editor.view(&app.i18n)
-                            } else {
-                                text(app.i18n.tr("main_editor_loading")).into()
-                            }
-                        }
-                        TabKind::Settings => {
-                            if let Some(settings) = &app.settings_state {
-                                settings.view(&app.i18n)
-                            } else {
-                                text(app.i18n.tr("main_settings_loading")).into()
-                            }
+            let content = if let Some(active_tab) =
+                app.tabs.iter().find(|t| t.id == app.active_tab_id)
+            {
+                match &active_tab.kind {
+                    TabKind::Host { host_id } => s.view_host_detail(&app.hosts, host_id, &app.i18n),
+                    TabKind::AddHost | TabKind::EditHost { .. } => {
+                        if let Some(editor) = &app.editor_state {
+                            editor.view(&app.i18n)
+                        } else {
+                            text(app.i18n.tr("main_editor_loading")).into()
                         }
                     }
-                } else {
-                    let placeholder = text(app.i18n.tr("main_no_hosts")).size(16);
-                    container(placeholder)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                        .into()
-                };
+                    TabKind::Settings => {
+                        if let Some(settings) = &app.settings_state {
+                            settings.view(&app.i18n)
+                        } else {
+                            text(app.i18n.tr("main_settings_loading")).into()
+                        }
+                    }
+                }
+            } else {
+                let placeholder = text(app.i18n.tr("main_no_hosts")).size(16);
+                container(placeholder)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+            };
 
             let base = column![tab_bar, content]
                 .width(Length::Fill)
@@ -1377,7 +1372,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 use iced::widget::stack;
 
                 let panel = s3_main::State::view_connect_panel(
-                    &s.hosts,
+                    &app.hosts,
                     &app.recent_host_ids,
                     &app.connect_panel_search,
                     &app.i18n,

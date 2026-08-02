@@ -33,6 +33,16 @@ vida/
 3. GUI 是 daemon 的客户端（WebSocket 通信，不直接调用）
 4. 金库格式必须可用标准 age CLI 解密
 
+## GUI 数据分层约定
+
+**业务数据存 VidaApp，Screen 只存该屏幕自己的 UI 状态。**
+
+- 主机列表（hosts）、tabs、同步状态等业务数据在 `VidaApp` 字段上，
+  任何屏幕（冲突、备份等）都可读取，不得从 `Screen::Main` 内部取数
+- 例如主机详情视图要展示的凭据显示状态（revealed_credential）属于
+  Main 屏幕的 UI 状态，留在 `s3_main::State`
+- 违反此约定会导致：非 Main 屏幕触发同步时冲突界面拿不到本地列表
+
 ## 内存测量规范
 
 - **唯一指标**：`vmmap --summary <pid>` 中的 `Physical footprint`
