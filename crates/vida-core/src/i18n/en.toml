@@ -1,0 +1,148 @@
+# vida UI language file — English
+# To add a new language: copy this file as <lang>.toml and translate the values. Keys stay the same.
+
+# ---- Common ----
+common_save = "Save"
+common_saving = "Saving..."
+common_saved = "Saved"
+common_cancel = "Cancel"
+common_back = "Back"
+common_loading = "Loading..."
+
+# ---- S0 Connection failure ----
+connection_title = "Cannot connect to daemon"
+connection_retry = "Retry connection"
+connection_connecting = "Connecting to daemon..."
+
+# ---- S1 Create vault ----
+setup_title = "Create Vault"
+setup_passphrase_placeholder = "Enter passphrase"
+setup_confirm_placeholder = "Confirm passphrase"
+setup_passphrase_mismatch = "Passphrases do not match"
+setup_risk_warning = "⚠ The master passphrase is the only way to access all host credentials. If lost, data cannot be recovered. Store it in a safe offline location."
+setup_risk_checkbox = "I understand that losing the passphrase means losing vault contents"
+setup_creating = "Creating..."
+setup_create = "Create Vault"
+
+# ---- S2 Unlock ----
+unlock_title = "Unlock Vault"
+unlock_passphrase_placeholder = "Enter passphrase"
+unlock_remember = "Remember passphrase (store in system keychain)"
+unlock_unlocking = "Unlocking..."
+unlock_unlock = "Unlock"
+
+# ---- S3 Main / Tab bar ----
+main_tab_close = "Close"
+main_tab_add = "Add host"
+main_tab_settings = "Settings"
+main_tab_lock = "Lock"
+main_settings_loading = "Loading settings..."
+main_no_hosts = "Click + to add a host"
+main_auth_kind = "Auth: {0}"
+main_edit = "Edit"
+main_reveal_credential = "Reveal password"
+main_delete = "Delete"
+main_host_not_found = "Host not found"
+main_editor_loading = "Loading editor..."
+main_add_host_tab = "New Host"
+main_edit_host_tab = "Edit: {0}"
+
+# ---- S4 Host editor ----
+editor_title_add = "New Host"
+editor_title_edit = "Edit Host"
+editor_name = "Host name"
+editor_host = "Host address (IP/domain)"
+editor_user = "Username"
+editor_port = "Port"
+editor_password = "Password"
+editor_password_edit_hint = "Password (leave empty to keep existing)"
+editor_tags = "Tags (comma separated)"
+editor_group = "Group"
+editor_notes = "Notes"
+editor_hint_keep_password = "Tip: leaving the password field empty keeps the existing password. Clearing it triggers confirmation."
+editor_hint_need_password = "Tip: a new host must have a password."
+
+# ---- S5 Settings ----
+settings_sync_path = "Sync folder path"
+settings_sync_path_hint = "Empty = no sync. Fill in a local folder path to enable LocalPath sync."
+settings_scrollback = "Scrollback lines"
+settings_language = "UI Language"
+settings_lang_system = "Follow system"
+settings_lang_zh = "中文"
+settings_lang_en = "English"
+
+# ---- S6 Conflict ----
+conflict_title = "Sync Conflict"
+conflict_subtitle = "Both local and remote vaults were modified. Choose which version to keep:"
+conflict_local = "Local version"
+conflict_remote = "Remote version"
+conflict_keep_local = "Keep local version"
+conflict_keep_remote = "Adopt remote version"
+
+# ---- S7 Conflict files ----
+conflict_file_title = "Conflict Files Detected"
+conflict_file_count = "Detected {0} cloud conflict file(s)"
+conflict_file_source = "Source: {0}"
+conflict_file_hosts = "Hosts in conflict files:"
+conflict_file_adopt = "Adopt conflict file (replace current vault)"
+conflict_file_ignore = "Ignore (mark as viewed)"
+conflict_file_adopt_short = "Adopt conflict file"
+conflict_file_ignore_short = "Ignore"
+
+# ---- S8 Remote missing ----
+remote_missing_title = "Remote Vault Missing"
+remote_missing_subtitle = "The synced remote file was deleted or moved."
+remote_missing_reupload = "Re-upload local version"
+remote_missing_clear = "Clear sync state"
+
+# ---- S9 Backup ----
+backup_title = "Export Backup"
+backup_subtitle = "Export an encrypted vault backup file."
+backup_use_current = "Use current passphrase"
+backup_new_passphrase = "New passphrase (leave empty to use current)"
+backup_exporting = "Exporting..."
+backup_exported = "Backup exported ({0} bytes)"
+
+# ---- app.rs internal ----
+app_conflict_dropbox_copy = "Dropbox conflicted copy"
+app_conflict_dropbox_version = "Dropbox version conflict"
+app_conflict_syncthing = "Syncthing conflict file"
+app_conflict_icloud = "iCloud placeholder file"
+app_conflict_generic = "Generic conflict file"
+
+# ---- daemon error messages ----
+daemon_vault_exists = "Vault already exists. Use unlock to unlock it"
+daemon_vault_missing = "Vault does not exist. Use create_vault first"
+daemon_vault_locked = "Vault is locked. Unlock first"
+daemon_passphrase_not_cached = "Passphrase not cached"
+daemon_host_not_found = "Host not found"
+daemon_host_not_found_id = "Host not found: {0}"
+daemon_host_need_password = "A new host must provide a password"
+daemon_sync_not_initialized = "Sync not initialized"
+daemon_conflict_no_remote = "No remote ciphertext, cannot resolve conflict"
+daemon_conflict_none = "No conflict state: {0}"
+daemon_unknown_action = "Unknown action: {0}. Supported: reupload / clear_state"
+daemon_ws_not_authed = "Not authenticated: first message must be auth"
+daemon_ws_auth_failed = "Authentication failed: token mismatch"
+daemon_ws_unknown_request = "Unknown request: {0}"
+
+# ---- Quick connect panel ----
+main_tab_connect = "Quick Connect"
+main_connect_search = "Search or enter address"
+main_connect_recent = "Recent"
+main_connect_all_hosts = "All Hosts"
+main_connect_add = "+ New Host"
+
+
+# ---- Settings navigation ----
+settings_nav_application = "Application"
+settings_nav_connections = "Config & Connections"
+settings_nav_sync = "Sync"
+settings_nav_terminal = "Terminal"
+settings_nav_backup = "Backup"
+settings_application = "Application Settings"
+settings_connections = "Config & Connections"
+settings_connections_ungrouped = "Ungrouped"
+settings_connections_empty = "No hosts configured"
+settings_sync = "Sync Settings"
+settings_terminal = "Terminal Settings"

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vida-core",
+    "crates/vida-daemon",
+    "crates/vida-gui",
+    "crates/vida-mcp-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/vida-terminal/vida"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+secrecy = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 3

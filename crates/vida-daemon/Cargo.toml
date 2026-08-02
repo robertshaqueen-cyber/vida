@@ -1,0 +1,30 @@
+[package]
+name = "vida-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vida-daemon"
+path = "src/main.rs"
+
+[dependencies]
+vida-core = { path = "../vida-core" }
+tokio.workspace = true
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+rand = "0.9"
+subtle = "2"
+scopeguard = "1"
+secrecy.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"

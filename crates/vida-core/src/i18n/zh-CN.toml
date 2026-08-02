@@ -1,0 +1,148 @@
+# vida 界面语言文件 — 简体中文
+# 新增语言：复制本文件为 <lang>.toml，翻译 value 即可，key 保持不动
+
+# ---- 通用 ----
+common_save = "保存"
+common_saving = "保存中..."
+common_saved = "已保存"
+common_cancel = "取消"
+common_back = "返回"
+common_loading = "加载中..."
+
+# ---- S0 连接失败 ----
+connection_title = "无法连接到守护进程"
+connection_retry = "重试连接"
+connection_connecting = "正在连接守护进程..."
+
+# ---- S1 创建金库 ----
+setup_title = "创建金库"
+setup_passphrase_placeholder = "输入口令"
+setup_confirm_placeholder = "确认口令"
+setup_passphrase_mismatch = "口令不匹配"
+setup_risk_warning = "⚠ 主口令是访问所有主机凭据的唯一方式。一旦丢失，数据无法恢复。请务必将口令记录在安全的线下位置。"
+setup_risk_checkbox = "我理解口令丢失将无法恢复金库内容"
+setup_creating = "创建中..."
+setup_create = "创建金库"
+
+# ---- S2 解锁 ----
+unlock_title = "解锁金库"
+unlock_passphrase_placeholder = "输入口令"
+unlock_remember = "记住口令（存储到系统钥匙串）"
+unlock_unlocking = "解锁中..."
+unlock_unlock = "解锁"
+
+# ---- S3 主界面 / Tab 栏 ----
+main_tab_close = "关闭"
+main_tab_add = "添加主机"
+main_tab_settings = "设置"
+main_tab_lock = "锁定"
+main_settings_loading = "设置加载中..."
+main_no_hosts = "点击 + 添加主机"
+main_auth_kind = "认证: {0}"
+main_edit = "编辑"
+main_reveal_credential = "显示口令"
+main_delete = "删除"
+main_host_not_found = "主机未找到"
+main_editor_loading = "加载编辑器中..."
+main_add_host_tab = "新增主机"
+main_edit_host_tab = "编辑: {0}"
+
+# ---- S4 主机编辑器 ----
+editor_title_add = "新增主机"
+editor_title_edit = "编辑主机"
+editor_name = "主机名称"
+editor_host = "主机地址 (IP/域名)"
+editor_user = "用户名"
+editor_port = "端口"
+editor_password = "口令"
+editor_password_edit_hint = "口令（留空保持原有口令不变）"
+editor_tags = "标签 (逗号分隔)"
+editor_group = "分组"
+editor_notes = "备注"
+editor_hint_keep_password = "提示：口令框留空则保持原有口令不变。清空口令框会触发确认。"
+editor_hint_need_password = "提示：新主机必须提供口令。"
+
+# ---- S5 设置 ----
+settings_sync_path = "同步文件夹路径"
+settings_sync_path_hint = "留空 = 不同步。填写本地文件夹路径启用 LocalPath 同步。"
+settings_scrollback = "回滚行数"
+settings_language = "界面语言"
+settings_lang_system = "跟随系统"
+settings_lang_zh = "中文"
+settings_lang_en = "English"
+
+# ---- S6 冲突 ----
+conflict_title = "同步冲突"
+conflict_subtitle = "本地和远端金库都有修改，请选择保留哪个版本："
+conflict_local = "本地版本"
+conflict_remote = "远端版本"
+conflict_keep_local = "保留本地版本"
+conflict_keep_remote = "采纳远端版本"
+
+# ---- S7 冲突文件 ----
+conflict_file_title = "发现冲突文件"
+conflict_file_count = "检测到 {0} 个云服务冲突文件"
+conflict_file_source = "来源: {0}"
+conflict_file_hosts = "冲突文件中的主机："
+conflict_file_adopt = "采纳冲突文件（替换当前金库）"
+conflict_file_ignore = "忽略（标记为已查看）"
+conflict_file_adopt_short = "采纳冲突文件"
+conflict_file_ignore_short = "忽略"
+
+# ---- S8 远端缺失 ----
+remote_missing_title = "远端金库缺失"
+remote_missing_subtitle = "同步的远端文件已被删除或移动。"
+remote_missing_reupload = "重新上传本地版本"
+remote_missing_clear = "清除同步状态"
+
+# ---- S9 备份 ----
+backup_title = "导出备份"
+backup_subtitle = "导出加密的金库备份文件。"
+backup_use_current = "使用当前口令"
+backup_new_passphrase = "新口令（留空使用当前口令）"
+backup_exporting = "导出中..."
+backup_exported = "备份已导出 ({0} 字节)"
+
+# ---- app.rs 内部 ----
+app_conflict_dropbox_copy = "Dropbox 冲突副本"
+app_conflict_dropbox_version = "Dropbox 版本冲突"
+app_conflict_syncthing = "Syncthing 冲突文件"
+app_conflict_icloud = "iCloud 占位文件"
+app_conflict_generic = "通用冲突文件"
+
+# ---- daemon 错误消息 ----
+daemon_vault_exists = "金库已存在，请使用 unlock 命令解锁"
+daemon_vault_missing = "金库不存在，请先使用 create_vault 创建"
+daemon_vault_locked = "金库已锁定，请先解锁"
+daemon_passphrase_not_cached = "口令未缓存"
+daemon_host_not_found = "主机不存在"
+daemon_host_not_found_id = "主机不存在: {0}"
+daemon_host_need_password = "新主机必须提供口令"
+daemon_sync_not_initialized = "同步未初始化"
+daemon_conflict_no_remote = "无远端密文，无法解决冲突"
+daemon_conflict_none = "当前无冲突状态: {0}"
+daemon_unknown_action = "未知操作: {0}，支持: reupload / clear_state"
+daemon_ws_not_authed = "未认证：首条消息必须是 auth"
+daemon_ws_auth_failed = "认证失败：token 不匹配"
+daemon_ws_unknown_request = "未知请求: {0}"
+
+# ---- 快速连接面板 ----
+main_tab_connect = "快速连接"
+main_connect_search = "搜索配置或输入地址"
+main_connect_recent = "最近"
+main_connect_all_hosts = "所有主机"
+main_connect_add = "+ 新增主机"
+
+
+# ---- 设置导航 ----
+settings_nav_application = "应用"
+settings_nav_connections = "配置和连接"
+settings_nav_sync = "同步"
+settings_nav_terminal = "终端"
+settings_nav_backup = "备份"
+settings_application = "应用设置"
+settings_connections = "配置和连接"
+settings_connections_ungrouped = "未分组"
+settings_connections_empty = "暂无配置的主机"
+settings_sync = "同步设置"
+settings_terminal = "终端设置"
