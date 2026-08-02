@@ -17,7 +17,6 @@ pub struct State {
 }
 
 impl State {
-    #[allow(dead_code)] // revived with sync trigger entry
     pub fn new(files: Vec<ConflictFileInfo>, remote_hosts: Vec<String>) -> Self {
         Self {
             files,

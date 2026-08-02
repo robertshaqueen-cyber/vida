@@ -406,6 +406,11 @@ mod tests {
 
     /// age CLI interop MUST use production work factor (log_n=18).
     /// This test is slow (~0.36s) but validates real-world compatibility.
+    ///
+    /// This is the only validation of design rule "vault must be decryptable
+    /// by the standard age CLI" — it decrypts with the REAL `age` binary.
+    /// It must NOT skip when age/expect is missing; it fails loudly instead,
+    /// because CI installs age via `brew install age`.
     #[test]
     fn age_cli_interop() {
         let mut vault = Vault::default();
@@ -432,11 +437,56 @@ mod tests {
         assert!(header.contains("scrypt"), "should be scrypt recipient");
         assert!(header.contains("18"), "should contain log_n=18");
 
-        // Decrypt back
+        // Decrypt back with our own implementation
         let decrypted = decrypt(&encrypted, passphrase).unwrap();
         assert_eq!(decrypted.hosts.len(), 1);
         assert_eq!(decrypted.hosts[0].name, "interop-test");
         assert_eq!(decrypted.hosts[0].user, "root");
+
+        // Now decrypt with the REAL standard age CLI. age requires a TTY for
+        // passphrase input, so we drive it with `expect` (present on macOS CI).
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+        std::fs::write(&vault_path, &encrypted).unwrap();
+
+        let script_path = tmp.path().join("decrypt.exp");
+        let script = format!(
+            "set timeout 60\n\
+             spawn age -d {path}\n\
+             expect \"Enter passphrase\"\n\
+             send \"{pass}\\r\"\n\
+             expect eof\n",
+            path = vault_path.display(),
+            pass = passphrase,
+        );
+        std::fs::write(&script_path, script).unwrap();
+
+        let output = std::process::Command::new("expect")
+            .arg(&script_path)
+            .output()
+            .expect("expect not found: standard age CLI interop requires `expect` (preinstalled on macOS)");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "age CLI decryption failed. stdout: {}\nstderr: {}",
+            stdout,
+            stderr
+        );
+
+        // The decrypted output must be the vault JSON that our own decrypt produces.
+        // expect echoes the spawn line and terminal control chars; extract the JSON
+        // between the first `{` and the last `}`.
+        let start = stdout.find('{').expect("no JSON in age CLI output");
+        let end = stdout.rfind('}').expect("no JSON in age CLI output");
+        let theirs_json: serde_json::Value =
+            serde_json::from_str(&stdout[start..=end]).expect("age CLI output is not valid JSON");
+        let ours_json = serde_json::to_value(decrypt(&encrypted, passphrase).unwrap()).unwrap();
+        assert_eq!(
+            theirs_json, ours_json,
+            "age CLI output differs from our decryption"
+        );
     }
 
     /// Verify Debug output never leaks secrets.

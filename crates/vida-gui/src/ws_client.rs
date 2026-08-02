@@ -43,11 +43,31 @@ impl std::fmt::Debug for WsClient {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Prefix marking an auth-rejection error, so `connect()` can retry with a
+/// freshly re-read token (S0 contract).
+const AUTH_FAILED_PREFIX: &str = "AUTH_FAILED:";
+
 impl WsClient {
     /// Connect to daemon WebSocket and authenticate.
+    ///
+    /// S0 contract: if auth is rejected (token rotated by a daemon restart),
+    /// re-read the token file and retry once. A plain connection failure is
+    /// returned as-is.
     pub async fn connect() -> Result<Self> {
         let token = read_token()?;
-        Self::connect_with_token(&token).await
+        match Self::connect_with_token(&token).await {
+            Ok(client) => Ok(client),
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                if msg.starts_with(AUTH_FAILED_PREFIX)
+                    && let Ok(new_token) = read_token()
+                    && new_token != token
+                {
+                    return Self::connect_with_token(&new_token).await;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Connect with an explicit token (for retry after re-read).
@@ -87,7 +107,7 @@ impl WsClient {
                     } else if let Ok(WsResponse::Error { message, .. }) =
                         serde_json::from_str::<WsResponse>(&text)
                     {
-                        anyhow::bail!("认证失败: {}", message);
+                        anyhow::bail!("{}{}", AUTH_FAILED_PREFIX, message);
                     }
                 }
                 Some(Ok(Message::Close(_))) => anyhow::bail!("连接被关闭"),
@@ -98,7 +118,7 @@ impl WsClient {
         };
 
         if auth_response.get("authenticated").and_then(|v| v.as_bool()) != Some(true) {
-            anyhow::bail!("认证失败：token 无效");
+            anyhow::bail!("{}token 无效", AUTH_FAILED_PREFIX);
         }
 
         // Auth succeeded — now create the mpsc channel and spawn the background R/W task
@@ -221,6 +241,10 @@ impl WsClient {
     pub async fn update_settings(&self, settings: serde_json::Value) -> Result<serde_json::Value> {
         self.send("UpdateSettings", serde_json::json!({"settings": settings}))
             .await
+    }
+
+    pub async fn sync(&self) -> Result<serde_json::Value> {
+        self.send_no_params("Sync").await
     }
 
     pub async fn reveal_credential(&self, host_id: &str) -> Result<serde_json::Value> {

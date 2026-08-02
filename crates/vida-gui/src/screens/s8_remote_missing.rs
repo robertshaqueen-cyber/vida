@@ -8,7 +8,6 @@ use crate::app::AppMessage;
 pub struct State;
 
 impl State {
-    #[allow(dead_code)] // revived with sync trigger entry
     pub fn new() -> Self {
         Self
     }

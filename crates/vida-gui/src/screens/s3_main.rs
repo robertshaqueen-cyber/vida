@@ -23,15 +23,21 @@ pub struct HostItem {
 pub struct State {
     pub hosts: Vec<HostItem>,
     pub search_query: String,
+    /// Currently revealed credential (plaintext) for a host, auto-hides after 15s.
+    pub revealed_credential: Option<String>,
+    /// True right after copy, shows "copied, auto-clears in 45s".
+    pub credential_copied: bool,
 }
 
 impl State {
-    /// Top tab bar: tabs on the left, spacer, then settings/lock on the right
+    /// Top tab bar: tabs on the left, spacer, then sync/settings/lock on the right
     pub fn view_tab_bar<'a>(
         tabs: &'a [Tab],
         active_tab_id: &'a str,
         i18n: &'a I18n,
         show_connect_panel: bool,
+        sync_symbol: &'static str,
+        sync_label: String,
     ) -> Element<'a, AppMessage> {
         // Tab buttons: text-only, active tab has bottom indicator, with X close button
         let tab_buttons: Vec<Element<'a, AppMessage>> = tabs
@@ -106,8 +112,21 @@ impl State {
             i18n.tr("main_tab_lock"),
             tooltip::Position::Bottom,
         );
+        // Sync indicator: shows state (synced / local changes / syncing / error),
+        // click to trigger sync
+        let sync_btn = tooltip(
+            button(text(sync_symbol).size(14))
+                .on_press(AppMessage::SyncTriggered)
+                .style(if sync_symbol == "⟳" {
+                    button::secondary
+                } else {
+                    button::text
+                }),
+            text(sync_label),
+            tooltip::Position::Bottom,
+        );
 
-        let right_buttons = row![settings_btn, lock_btn]
+        let right_buttons = row![sync_btn, settings_btn, lock_btn]
             .spacing(4)
             .align_y(iced::Alignment::Center);
 
@@ -224,10 +243,31 @@ impl State {
                 _ => text("").size(13),
             };
 
-            let buttons = row![edit_btn, reveal_btn, delete_btn].spacing(12);
-            let detail = column![name, conn, auth, buttons, notes]
-                .spacing(12)
-                .padding(20);
+            let mut detail_items: Vec<Element<'_, AppMessage>> =
+                vec![name.into(), conn.into(), auth.into()];
+
+            // Revealed credential block: plaintext + copy button, auto-hides in 15s
+            if let Some(cred) = &self.revealed_credential {
+                let cred_label = text(i18n.tr("main_credential_revealed")).size(12);
+                let cred_value = text(cred).size(14);
+                let copy_btn = button(i18n.tr("main_credential_copy"))
+                    .on_press(AppMessage::CopyCredential(cred.clone()))
+                    .width(Length::Shrink);
+                let mut cred_row = row![cred_value, copy_btn]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center);
+                if self.credential_copied {
+                    cred_row = cred_row.push(text(i18n.tr("main_credential_copied")).size(12));
+                }
+                detail_items.push(cred_label.into());
+                detail_items.push(cred_row.into());
+                detail_items.push(text(i18n.tr("main_credential_auto_hide")).size(11).into());
+            }
+
+            detail_items.push(column![row![edit_btn, reveal_btn, delete_btn].spacing(12)].into());
+            detail_items.push(notes.into());
+
+            let detail = column(detail_items).spacing(12).padding(20);
 
             container(detail)
                 .width(Length::Fill)

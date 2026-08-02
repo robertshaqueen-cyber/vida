@@ -1,8 +1,6 @@
 use iced::{Element, Task, Theme};
 use vida_core::i18n::{self, I18n};
 
-// s6/s7/s8 (sync conflict screens) are kept for the future sync trigger entry
-#[allow(unused_imports)]
 use crate::screens::{
     Screen, Tab, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential, s5_settings,
     s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
@@ -41,6 +39,43 @@ pub struct VidaApp {
     show_connect_panel: bool,
     connect_panel_search: String,
     recent_host_ids: Vec<String>,
+    // Sync status for the tab bar indicator
+    sync_state: SyncState,
+}
+
+/// Sync status shown by the tab bar sync button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncState {
+    /// Last sync completed successfully.
+    #[default]
+    Synced,
+    /// Hosts changed locally; sync not yet run.
+    LocalChanges,
+    /// Sync request in flight.
+    Syncing,
+    /// Last sync failed.
+    Error,
+}
+
+impl SyncState {
+    /// Symbol for the tab bar button.
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            SyncState::Synced => "✓",
+            SyncState::LocalChanges => "●",
+            SyncState::Syncing => "⟳",
+            SyncState::Error => "✗",
+        }
+    }
+
+    pub fn label(&self, i18n: &I18n) -> String {
+        match self {
+            SyncState::Synced => i18n.tr("sync_state_synced").to_string(),
+            SyncState::LocalChanges => i18n.tr("sync_state_local_changes").to_string(),
+            SyncState::Syncing => i18n.tr("sync_state_syncing").to_string(),
+            SyncState::Error => i18n.tr("sync_state_error").to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +118,12 @@ pub enum AppMessage {
     DeleteHostConfirm(String),
     DeleteHost,
     RevealCredential(String),
-    ShowCredential(String), // credential
+    ShowCredential(String), // credential (from RevealCredential)
+    HideCredential,
+    CopyCredential(String),
+    ClearClipboard,
+    SyncTriggered,
+    SyncCompleted(serde_json::Value),
     LockVault,
     VaultLocked,
     OpenBackup,
@@ -146,6 +186,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         show_connect_panel: false,
         connect_panel_search: String::new(),
         recent_host_ids: Vec::new(),
+        sync_state: SyncState::default(),
     };
 
     let connect = Task::perform(
@@ -188,7 +229,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::WsError(e) => {
-            app.screen = Screen::ConnectionFailure(s0_connection::State::new(e));
+            // If a sync was in flight, surface the failure via the sync indicator
+            if app.sync_state == SyncState::Syncing {
+                app.sync_state = SyncState::Error;
+            }
+            // Strip the internal AUTH_FAILED: marker used by the token-retry logic
+            let display = e.strip_prefix("AUTH_FAILED:").unwrap_or(&e).to_string();
+            app.screen = Screen::ConnectionFailure(s0_connection::State::new(display));
             Task::none()
         }
         AppMessage::RetryConnection => Task::perform(
@@ -457,6 +504,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.screen = Screen::Main(s3_main::State {
                 hosts,
                 search_query,
+                revealed_credential: None,
+                credential_copied: false,
             });
             Task::none()
         }
@@ -505,6 +554,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::DeleteHost => {
+            // Local change: hosts modified, needs sync
+            app.sync_state = SyncState::LocalChanges;
             // Reload hosts after deletion
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -536,18 +587,47 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 |r| r,
             )
         }
-        AppMessage::ShowCredential(_cred) => {
-            // Return to main screen (credential display removed from S4 scope)
-            let client = app.ws_client.as_ref().unwrap().clone();
+        AppMessage::ShowCredential(cred) => {
+            // Store plaintext for display, auto-hide after 15 seconds
+            if let Screen::Main(s) = &mut app.screen {
+                s.revealed_credential = Some(cred);
+                s.credential_copied = false;
+            }
             Task::perform(
-                async move {
-                    match client.list_hosts().await {
-                        Ok(hosts_val) => AppMessage::HostsLoaded(parse_hosts(&hosts_val)),
-                        Err(e) => AppMessage::WsError(e.to_string()),
-                    }
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    AppMessage::HideCredential
                 },
                 |r| r,
             )
+        }
+        AppMessage::HideCredential => {
+            if let Screen::Main(s) = &mut app.screen {
+                s.revealed_credential = None;
+                s.credential_copied = false;
+            }
+            Task::none()
+        }
+        AppMessage::CopyCredential(cred) => {
+            // Write to clipboard, auto-clear after 45 seconds
+            if let Screen::Main(s) = &mut app.screen {
+                s.credential_copied = true;
+            }
+            let copy = iced::clipboard::write::<AppMessage>(cred);
+            let clear_after = Task::perform(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+                    AppMessage::ClearClipboard
+                },
+                |r| r,
+            );
+            Task::batch([copy, clear_after])
+        }
+        AppMessage::ClearClipboard => {
+            if let Screen::Main(s) = &mut app.screen {
+                s.credential_copied = false;
+            }
+            iced::clipboard::write::<AppMessage>(String::new())
         }
 
         // ---- S4: Host editor ----
@@ -670,6 +750,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
         }
         AppMessage::EditorSaved => {
+            // Local change: hosts modified, needs sync
+            app.sync_state = SyncState::LocalChanges;
             // Close the editor tab and reload hosts
             let active_id = app.active_tab_id.clone();
             app.tabs.retain(|t| {
@@ -712,6 +794,108 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 },
                 |r| r,
             )
+        }
+
+        AppMessage::SyncTriggered => {
+            app.sync_state = SyncState::Syncing;
+            let client = app.ws_client.as_ref().unwrap().clone();
+            Task::perform(
+                async move {
+                    match client.sync().await {
+                        Ok(val) => AppMessage::SyncCompleted(val),
+                        Err(e) => AppMessage::WsError(e.to_string()),
+                    }
+                },
+                |r| r,
+            )
+        }
+        AppMessage::SyncCompleted(val) => {
+            let status = val
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            match status {
+                "conflict" => {
+                    app.sync_state = SyncState::Synced;
+                    // TODO: Extract local/remote hosts for conflict display
+                    app.screen = Screen::Conflict(s6_conflict::State::new(vec![], vec![]));
+                }
+                "conflict_files_detected" => {
+                    app.sync_state = SyncState::Synced;
+                    let files: Vec<s7_conflict_file::ConflictFileInfo> = val
+                        .get("files")
+                        .and_then(|f| f.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|f| {
+                                    let path = f.get("path")?.as_str()?.to_string();
+                                    let pattern = f.get("pattern")?.as_str()?.to_string();
+                                    let pattern_display = match pattern.as_str() {
+                                        "DropboxCopy" => {
+                                            app.i18n.tr("app_conflict_dropbox_copy").to_string()
+                                        }
+                                        "DropboxVersion" => {
+                                            app.i18n.tr("app_conflict_dropbox_version").to_string()
+                                        }
+                                        "Syncthing" => {
+                                            app.i18n.tr("app_conflict_syncthing").to_string()
+                                        }
+                                        "IcloudPlaceholder" => {
+                                            app.i18n.tr("app_conflict_icloud").to_string()
+                                        }
+                                        _ => app.i18n.tr("app_conflict_generic").to_string(),
+                                    };
+                                    Some(s7_conflict_file::ConflictFileInfo {
+                                        path,
+                                        pattern: pattern_display,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let remote_hosts: Vec<String> = val
+                        .get("remote_hosts")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|h| {
+                                    h.get("name").and_then(|n| n.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    app.screen =
+                        Screen::ConflictFile(s7_conflict_file::State::new(files, remote_hosts));
+                }
+                "remote_missing" => {
+                    app.sync_state = SyncState::Synced;
+                    app.screen = Screen::RemoteMissing(s8_remote_missing::State::new());
+                }
+                "downloaded" => {
+                    app.sync_state = SyncState::Synced;
+                    let hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
+                    match &mut app.screen {
+                        Screen::Main(s) => {
+                            s.hosts = hosts;
+                        }
+                        _ => {
+                            app.screen = Screen::Main(s3_main::State {
+                                hosts,
+                                search_query: String::new(),
+                                revealed_credential: None,
+                                credential_copied: false,
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    app.sync_state = SyncState::Synced;
+                    tracing::info!("Sync completed: {}", status);
+                }
+            }
+            Task::none()
         }
 
         AppMessage::LockVault => {
@@ -1050,6 +1234,8 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 &app.active_tab_id,
                 &app.i18n,
                 app.show_connect_panel,
+                app.sync_state.symbol(),
+                app.sync_state.label(&app.i18n),
             );
 
             let content =
@@ -1086,7 +1272,16 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 .height(Length::Fill);
 
             if app.show_connect_panel {
-                // Floating overlay with dimmed background + panel
+                // Floating quick-connect panel over a single dimmed overlay layer.
+                //
+                // Rendering note: the earlier leak (a vertical strip of the
+                // underlying text at the window's left edge) came from the base
+                // layer being transparent while two separate semi-transparent
+                // overlay layers (overlay + panel wrapper) were stacked on top;
+                // the alpha compositing of two 0.4 layers at the seams reached
+                // 0.64 and left edge artifacts where layers ended.
+                // Fix: exactly ONE dim overlay layer; the base gets an opaque
+                // background so nothing shows through around it.
                 use iced::Color;
                 use iced::widget::button;
                 use iced::widget::stack;
@@ -1098,8 +1293,19 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     &app.i18n,
                 );
 
-                // Semi-transparent overlay that closes panel on click.
-                // Clip avoids edge artifacts when layered over the base content.
+                // Opaque background on the base: nothing underneath can peek out.
+                let base_el: Element<'_, AppMessage> = container(base)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|theme: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(
+                            theme.extended_palette().background.base.color,
+                        )),
+                        ..Default::default()
+                    })
+                    .into();
+
+                // Single dim overlay layer; clicking anywhere closes the panel.
                 let overlay_bg: Element<'_, AppMessage> = container(
                     button(text(""))
                         .on_press(AppMessage::CloseConnectPanel)
@@ -1118,7 +1324,8 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 })
                 .into();
 
-                // Panel centered horizontally, near top with gap
+                // Panel centered horizontally, near top with gap. Transparent
+                // wrapper: clicks outside the panel fall through to the overlay.
                 let panel_inner: Element<'_, AppMessage> = container(panel)
                     .padding(4)
                     .width(Length::Fixed(420.0))
@@ -1131,23 +1338,13 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     })
                     .into();
 
-                // Full-screen layer with the same dim color as the overlay so no
-                // underlying pixels peek through layer seams; panel sits on top.
                 let panel_el: Element<'_, AppMessage> = container(panel_inner)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .clip(true)
                     .padding(iced::padding::Padding::new(0.0).top(50))
                     .center_x(Length::Fill)
-                    .style(|_: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgba(
-                            0.0, 0.0, 0.0, 0.4,
-                        ))),
-                        ..Default::default()
-                    })
                     .into();
-
-                let base_el: Element<'_, AppMessage> = base.into();
 
                 stack![base_el, overlay_bg, panel_el]
                     .width(Length::Fill)
@@ -1160,8 +1357,14 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
 
         // Other screens (conflict, etc.): show with tab bar
         _ => {
-            let tab_bar =
-                s3_main::State::view_tab_bar(&app.tabs, &app.active_tab_id, &app.i18n, false);
+            let tab_bar = s3_main::State::view_tab_bar(
+                &app.tabs,
+                &app.active_tab_id,
+                &app.i18n,
+                false,
+                app.sync_state.symbol(),
+                app.sync_state.label(&app.i18n),
+            );
             let content = app.screen.view(&app.i18n);
             column![tab_bar, content]
                 .width(Length::Fill)

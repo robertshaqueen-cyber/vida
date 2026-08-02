@@ -78,12 +78,8 @@ pub enum Screen {
     Setup(s1_setup::State),
     Unlock(s2_unlock::State),
     Main(s3_main::State),
-    // Sync conflict screens: revived when a sync trigger entry is added back
-    #[allow(dead_code)]
     Conflict(s6_conflict::State),
-    #[allow(dead_code)]
     ConflictFile(s7_conflict_file::State),
-    #[allow(dead_code)]
     RemoteMissing(s8_remote_missing::State),
     Backup(s9_backup::State),
 }
