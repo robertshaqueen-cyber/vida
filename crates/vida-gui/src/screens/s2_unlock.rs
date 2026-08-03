@@ -91,19 +91,7 @@ impl State {
             .spacing(10)
             .align_y(iced::Alignment::Center);
 
-        // Main centered content
-        let main_content = column![title, subtitle, input_row, remember_check]
-            .spacing(10)
-            .padding(40)
-            .max_width(400);
-
-        let centered_main = container(main_content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-        // Localized error message based on category
+        // Error message — localized by category
         let error_msg = match (&self.error, &self.error_category) {
             (Some(_), Some(cat)) => {
                 let key = format!("error_{}", cat);
@@ -118,49 +106,52 @@ impl State {
             _ => String::new(),
         };
 
-        // Always use stack layout to preserve widget tree structure (avoids
-        // losing focus when the toast disappears). When not visible, the toast
-        // is rendered empty with a transparent background.
-        let toast_widget = container(text(error_msg).color(iced::Color::WHITE).size(14))
-            .padding(iced::Padding::from([10, 20]))
-            .style(move |_theme: &Theme| container::Style {
-                background: if self.toast_visible {
-                    Some(iced::Background::Color(iced::Color::from_rgb(0.8, 0.2, 0.2)))
-                } else {
-                    None
-                },
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-
-        // Toast positioned below the input row. Use stack layout with
-        // height(Fill) to prevent bottom rendering leak. The padding
-        // vertical value approximates: center_y offset + input_row height +
-        // 8px gap.  This is a rough approximation; the centered_main
-        // container places content at window center, and the input_row is
-        // roughly 120px below the top of centered_main (title + subtitle +
-        // spacing).  We use ~140px to land just below the input.
-        //
-        // Left padding aligns with centered_main's max_width(400) + padding(40)
-        // which gives left edge at ~center - 200px.
-        iced::widget::stack![
-            centered_main,
-            container(toast_widget)
+        // Fixed-height error slot: 36px when error present, 0px when empty.
+        // This prevents layout jump and keeps the toast visually tied to the
+        // input field (same column → same left edge, column spacing → 8px gap).
+        let error_text = text(error_msg).size(12);
+        let error_slot: Element<'_, AppMessage> = if self.toast_visible {
+            container(error_text)
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(iced::Padding {
-                    top: 140.0,
-                    bottom: 0.0,
-                    left: 0.0,
-                    right: 0.0,
+                .padding(iced::Padding::from([8, 10]))
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.15, 0.08, 0.08, 1.0,
+                    ))),
+                    border: iced::Border {
+                        color: iced::Color::from_rgb(0.9, 0.2, 0.2),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
                 })
-                .center_x(Length::Fill)
+                .into()
+        } else {
+            // Invisible placeholder to preserve tree structure (avoids
+            // losing focus when the error disappears).
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fixed(0.0))
+                .into()
+        };
+
+        // Main centered content — error_slot sits between input and checkbox
+        let main_content = column![
+            title,
+            subtitle,
+            input_row,
+            error_slot,
+            remember_check,
         ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .spacing(10)
+        .padding(40)
+        .max_width(400);
+
+        container(main_content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
     }
 }
