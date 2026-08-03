@@ -162,36 +162,37 @@ impl DaemonState {
             && !p.is_empty()
         {
             let new_dir = std::path::PathBuf::from(p);
-            // 不能是金库自身目录
+
+            // 1. 路径必须存在
+            if !new_dir.exists() {
+                anyhow::bail!("同步文件夹不存在：{}", p);
+            }
+            // 2. 必须是目录
+            if !new_dir.is_dir() {
+                anyhow::bail!("路径不是文件夹：{}", p);
+            }
+            // 3. 必须可写（UUID 文件名避免 iCloud/Dropbox 同步痕迹）
+            let probe_name = format!(".vida-write-test-{}", uuid::Uuid::new_v4());
+            let probe = new_dir.join(&probe_name);
+            match std::fs::write(&probe, b"test") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => {
+                    anyhow::bail!("同步文件夹不可写：{} — {}", p, e);
+                }
+            }
+            // 4. 不能是金库自身目录（canonicalize 在存在性检查之后，必然成功）
             let vault_parent = vault_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
-                .canonicalize()
-                .unwrap_or_default();
-            let new_canonical = new_dir.canonicalize().unwrap_or_default();
+                .canonicalize()?;
+            let new_canonical = new_dir.canonicalize()?;
             if new_canonical == vault_parent {
                 anyhow::bail!(
                     "同步文件夹不能是金库所在目录（{}），请选择其他位置",
                     vault_parent.display()
                 );
-            }
-            // 路径必须存在
-            if !new_dir.exists() {
-                anyhow::bail!("同步文件夹不存在：{}", p);
-            }
-            // 必须是目录
-            if !new_dir.is_dir() {
-                anyhow::bail!("路径不是文件夹：{}", p);
-            }
-            // 必须可写
-            let test_file = new_dir.join(".vida_write_test");
-            match std::fs::write(&test_file, b"test") {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&test_file);
-                }
-                Err(e) => {
-                    anyhow::bail!("同步文件夹不可写：{} — {}", p, e);
-                }
             }
         }
 
@@ -667,7 +668,14 @@ mod tests {
         settings.sync_local_path = Some("/nonexistent/path/abc123".into());
 
         let err = state.update_settings(settings).unwrap_err();
-        assert!(format!("{}", err).contains("不存在"));
+        let msg = format!("{}", err);
+        assert!(msg.contains("不存在"), "Should say '不存在', got: {}", msg);
+        // 关键：不能误报为「不能是金库所在目录」
+        assert!(
+            !msg.contains("不能是金库所在目录"),
+            "Must NOT say '不能是金库所在目录' for nonexistent path, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -694,5 +702,39 @@ mod tests {
 
         let err = state.update_settings(settings).unwrap_err();
         assert!(format!("{}", err).contains("不是文件夹"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_vault_dir_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+
+        let mut state = DaemonState {
+            token: "test".into(),
+            vault: None,
+            passphrase: None,
+            vault_path,
+            sync: None,
+            i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+        };
+        state.create_vault("pass").unwrap();
+        state.lock();
+        state.unlock("pass", false).unwrap();
+
+        // Create a symlink pointing to the vault directory
+        let symlink_path = tmp.path().join("sync_link");
+        std::os::unix::fs::symlink(tmp.path(), &symlink_path).unwrap();
+
+        let mut settings = Settings::default();
+        settings.sync_local_path = Some(symlink_path.to_str().unwrap().to_string());
+
+        let err = state.update_settings(settings).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("不能是金库所在目录"),
+            "Symlink to vault dir should be rejected, got: {}",
+            msg
+        );
     }
 }
