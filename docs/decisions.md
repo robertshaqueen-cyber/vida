@@ -173,21 +173,24 @@ secure 字段的 `Disabled` 写入被 merge 忽略（Enabled 优先）。无条�
 写入会覆盖非 secure 字段的请求，导致同屏所有非 secure 字段无法输入
 中文（S4 主机名、备注等）。
 
-**最终方案：拦截 IME 事件 + Keyboard 事件禁用**
+**最终方案：拦截 IME + 检测焦点 + Keyboard 禁用**
+
+三层防御：
 
 1. **Ime::Preedit / Ime::Commit**：直接 return，不传递给 inner text_input。
-   阻止中文字符被提交到 secure 字段。同时写入 Disabled 防止后续 IME 事件。
-2. **Keyboard 事件**：传递给 inner text_input（处理 Backspace、Enter 等），
-   然后写入 Disabled。阻止 IME 在下次 RedrawRequested 时被重新激活。
-3. **RedrawRequested**：不写入 Disabled。非 secure 字段需要 Enabled 以支持
-   中文输入。secure 字段的 RedrawRequested 设置 Enabled，但 Keyboard 事件
-   会立即将其覆盖为 Disabled。
+   阻止中文字符被提交到 secure 字段。同时写入 Disabled。
 
-**副作用**：
-- secure 字段无法通过 IME 输入中文（设计目标：口令应为 ASCII）
-- 含非拉丁字符的口令需通过 Cmd+V 粘贴（已记录在 SECURITY.md）
-- secure 字段获得焦点后首次按键前 IME 短暂启用，但 Keyboard 事件
-  立即禁用 IME，且 Ime::Preedit/Commit 被拦截不会提交字符
+2. **RedrawRequested**：对比 inner update 前后的 shell.input_method 状态。
+   如果 inner text_input 调用了 request_input_method（仅 focused 时发生），
+   shell 状态会改变。检测到变化 → 写入 Disabled。未变化 → 不写入（不覆盖
+   兄弟 widget 的 IME 请求）。
+
+3. **Keyboard 事件**：无条件写入 Disabled。Keyboard 事件只到达 focused widget，
+   不影响兄弟。防止 IME 在下次 RedrawRequested 时被重新激活。
+
+**焦点检测原理**：text_input 仅在 focused + window focused 时调用
+request_input_method（line 1353）。对比 update 前后的 shell 状态，
+变化 = focused，未变化 = not focused。无需访问 inner widget 的私有状态。
 
 ### classify_error 过渡方案
 

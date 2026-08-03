@@ -4,6 +4,7 @@ use iced::widget::text_input::{self, Status, Style};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 use iced::advanced::InputMethod;
 use iced::advanced::layout::Layout;
+use iced::window;
 
 /// A wrapper around `text_input` that disables IME for secure fields.
 ///
@@ -163,15 +164,20 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // For IME events, block the inner widget from seeing them.
-        // When IME is enabled (e.g. during RedrawRequested), winit sends
+        // Block IME events entirely. When IME is enabled, winit sends
         // Ime::Preedit/Ime::Commit instead of Keyboard::KeyPressed.
-        // The inner text_input processes these and commits Chinese characters
-        // BEFORE our guard can disable IME. Blocking prevents the commit.
+        // The inner text_input commits Chinese characters via Ime::Commit
+        // BEFORE any post-update guard can run. Blocking prevents this.
         if let Event::InputMethod(_) = event {
             *shell.input_method_mut() = InputMethod::Disabled;
             return;
         }
+
+        // Snapshot shell state before inner update. If the inner text_input
+        // calls request_input_method (which only happens when it's focused),
+        // the shell state will change. This is how we detect focus without
+        // accessing the inner widget's private state.
+        let before = shell.input_method().clone();
 
         // Let inner widget handle non-IME events
         <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::update(
@@ -186,9 +192,21 @@ where
             viewport,
         );
 
-        // Disable IME for keyboard events (prevents IME from activating
-        // on the next RedrawRequested)
-        if let Event::Keyboard(_) = event {
+        let after = shell.input_method().clone();
+
+        // Determine if we should write Disabled:
+        // 1. Keyboard events: always write (only focused widget gets these;
+        //    prevents IME from being re-enabled on next RedrawRequested)
+        // 2. RedrawRequested: write only if the inner widget changed the
+        //    shell state (meaning it's focused and called request_input_method).
+        //    This avoids overriding sibling widgets' IME requests.
+        let should_disable = match event {
+            Event::Keyboard(_) => true,
+            Event::Window(window::Event::RedrawRequested(_)) => before != after,
+            _ => false,
+        };
+
+        if should_disable {
             *shell.input_method_mut() = InputMethod::Disabled;
         }
     }
