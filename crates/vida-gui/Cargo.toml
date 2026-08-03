@@ -21,7 +21,7 @@ anyhow.workspace = true
 
 [dependencies.iced]
 version = "0.14"
-features = ["tokio", "wgpu"]
+features = ["tokio", "wgpu", "advanced"]
 
 [dev-dependencies]
 winit = "0.30"

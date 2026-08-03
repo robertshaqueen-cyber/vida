@@ -90,6 +90,9 @@ pub enum ResponsePayload {
     Error {
         code: i32,
         message: String,
+        /// Error category for GUI to display localized message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
     },
     /// Push events (no id correlation) — used for vault-changed notifications.
     Event {

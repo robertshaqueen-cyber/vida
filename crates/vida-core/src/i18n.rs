@@ -65,6 +65,15 @@ impl I18n {
         table.get(key).map(|s| s.as_str()).unwrap_or(key)
     }
 
+    /// 取无参数文本，支持动态 key。key 不存在时返回 key 本身。
+    pub fn tr_dyn(&self, key: &str) -> String {
+        let table = match self.lang {
+            Lang::ZhCn => &*ZH_CN,
+            Lang::En => &*EN,
+        };
+        table.get(key).cloned().unwrap_or_else(|| key.to_string())
+    }
+
     /// 取带参数文本，用 `{0}` `{1}` 占位。key 不存在时原样返回 key。
     pub fn trf(&self, key: &'static str, args: &[&str]) -> String {
         let template = self.tr(key);

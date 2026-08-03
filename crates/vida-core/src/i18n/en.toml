@@ -126,6 +126,17 @@ daemon_ws_not_authed = "Not authenticated: first message must be auth"
 daemon_ws_auth_failed = "Authentication failed: token mismatch"
 daemon_ws_unknown_request = "Unknown request: {0}"
 
+# ---- Error categories (GUI display) ----
+error_wrong_passphrase = "Wrong passphrase, please try again"
+error_vault_corrupted = "Vault data corrupted, cannot parse"
+error_not_found = "Requested resource not found"
+error_vault_locked = "Vault is locked, please unlock first"
+error_vault_exists = "Vault already exists"
+error_invalid_json = "Invalid request format"
+error_not_authed = "Not authenticated"
+error_auth_failed = "Authentication failed"
+error_unknown_request = "Unknown request"
+
 # ---- Quick connect panel ----
 main_tab_connect = "Quick Connect"
 main_connect_search = "Search or enter address"

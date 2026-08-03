@@ -3,6 +3,7 @@ use iced::{Element, Length};
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
+use crate::secure_text_input::SecureTextInput;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorMode {
@@ -108,7 +109,7 @@ impl State {
         } else {
             text(i18n.tr("editor_password")).size(12)
         };
-        let password_input = text_input(i18n.tr("editor_password"), &self.password)
+        let password_input = SecureTextInput::new(i18n.tr("editor_password"), &self.password)
             .on_input(AppMessage::EditorPasswordChanged)
             .secure(true)
             .width(Length::Fill);
@@ -133,18 +134,24 @@ impl State {
             && (is_edit || !self.password.is_empty()); // new host requires password
 
         let save_btn = if self.saving {
-            button(i18n.tr("common_saving")).width(Length::Shrink)
+            button(i18n.tr("common_saving"))
+                .width(Length::Shrink)
+                .style(button::primary)
         } else {
-            button(i18n.tr("common_save")).width(Length::Shrink)
+            button(i18n.tr("common_save"))
+                .width(Length::Shrink)
+                .style(button::primary)
         };
 
         let save_btn = if can_save {
             save_btn.on_press(AppMessage::EditorSave)
         } else {
-            save_btn
+            save_btn.style(button::secondary)
         };
 
-        let cancel_btn = button(i18n.tr("common_cancel")).on_press(AppMessage::EditorCancel);
+        let cancel_btn = button(i18n.tr("common_cancel"))
+            .on_press(AppMessage::EditorCancel)
+            .style(button::text);
 
         let error_text = match &self.error {
             Some(e) => text(e).size(12),

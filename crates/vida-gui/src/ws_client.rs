@@ -25,14 +25,35 @@ enum WsResponse {
         #[allow(dead_code)] // error code reserved for protocol debugging
         code: i32,
         message: String,
+        /// Error category for GUI i18n display.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
     },
 }
 
-type PendingMap = HashMap<u64, oneshot::Sender<Result<serde_json::Value>>>;
+/// Custom error type that includes the error category for GUI display.
+#[derive(Debug)]
+pub struct DaemonError {
+    pub message: String,
+    pub category: Option<String>,
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+/// Type alias for results that include the error category.
+pub type DaemonResult<T> = std::result::Result<T, DaemonError>;
+
+type PendingMap = HashMap<u64, oneshot::Sender<DaemonResult<serde_json::Value>>>;
 
 #[derive(Clone)]
 pub struct WsClient {
-    tx: mpsc::UnboundedSender<(WsRequest, oneshot::Sender<Result<serde_json::Value>>)>,
+    tx: mpsc::UnboundedSender<(WsRequest, oneshot::Sender<DaemonResult<serde_json::Value>>)>,
 }
 
 impl std::fmt::Debug for WsClient {
@@ -123,7 +144,7 @@ impl WsClient {
 
         // Auth succeeded — now create the mpsc channel and spawn the background R/W task
         let (tx, mut rx) =
-            mpsc::unbounded_channel::<(WsRequest, oneshot::Sender<Result<serde_json::Value>>)>();
+            mpsc::unbounded_channel::<(WsRequest, oneshot::Sender<DaemonResult<serde_json::Value>>)>();
 
         tokio::spawn(async move {
             let mut pending: PendingMap = HashMap::new();
@@ -139,9 +160,9 @@ impl WsClient {
                                             let _ = sender.send(Ok(result));
                                         }
                                     }
-                                    Ok(WsResponse::Error { id, message, .. }) => {
+                                    Ok(WsResponse::Error { id, message, category, .. }) => {
                                         if let Some(sender) = pending.remove(&id) {
-                                            let _ = sender.send(Err(anyhow::anyhow!("{}", message)));
+                                            let _ = sender.send(Err(DaemonError { message, category }));
                                         }
                                     }
                                     Err(_) => {}
@@ -168,7 +189,7 @@ impl WsClient {
     }
 
     /// Send a request with params.
-    pub async fn send(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn send(&self, method: &str, params: serde_json::Value) -> DaemonResult<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -180,15 +201,15 @@ impl WsClient {
 
         self.tx
             .send((req, response_tx))
-            .context("Failed to send request to daemon")?;
+            .map_err(|_| DaemonError { message: "Failed to send request to daemon".to_string(), category: None })?;
 
         response_rx
             .await
-            .context("Daemon response channel closed")?
+            .map_err(|_| DaemonError { message: "Daemon response channel closed".to_string(), category: None })?
     }
 
     /// Send a request with no params (unit variant).
-    pub async fn send_no_params(&self, method: &str) -> Result<serde_json::Value> {
+    pub async fn send_no_params(&self, method: &str) -> DaemonResult<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -200,25 +221,25 @@ impl WsClient {
 
         self.tx
             .send((req, response_tx))
-            .context("Failed to send request to daemon")?;
+            .map_err(|_| DaemonError { message: "Failed to send request to daemon".to_string(), category: None })?;
 
         response_rx
             .await
-            .context("Daemon response channel closed")?
+            .map_err(|_| DaemonError { message: "Daemon response channel closed".to_string(), category: None })?
     }
 
     // Convenience methods --------------------------------------------------
 
-    pub async fn vault_status(&self) -> Result<serde_json::Value> {
+    pub async fn vault_status(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("VaultStatus").await
     }
 
-    pub async fn create_vault(&self, passphrase: &str) -> Result<serde_json::Value> {
+    pub async fn create_vault(&self, passphrase: &str) -> DaemonResult<serde_json::Value> {
         self.send("CreateVault", serde_json::json!({"passphrase": passphrase}))
             .await
     }
 
-    pub async fn unlock(&self, passphrase: &str, remember: bool) -> Result<serde_json::Value> {
+    pub async fn unlock(&self, passphrase: &str, remember: bool) -> DaemonResult<serde_json::Value> {
         self.send(
             "Unlock",
             serde_json::json!({"passphrase": passphrase, "remember": remember}),
@@ -226,28 +247,28 @@ impl WsClient {
         .await
     }
 
-    pub async fn lock(&self) -> Result<serde_json::Value> {
+    pub async fn lock(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("Lock").await
     }
 
-    pub async fn list_hosts(&self) -> Result<serde_json::Value> {
+    pub async fn list_hosts(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("ListHosts").await
     }
 
-    pub async fn get_settings(&self) -> Result<serde_json::Value> {
+    pub async fn get_settings(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("GetSettings").await
     }
 
-    pub async fn update_settings(&self, settings: serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn update_settings(&self, settings: serde_json::Value) -> DaemonResult<serde_json::Value> {
         self.send("UpdateSettings", serde_json::json!({"settings": settings}))
             .await
     }
 
-    pub async fn sync(&self) -> Result<serde_json::Value> {
+    pub async fn sync(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("Sync").await
     }
 
-    pub async fn reveal_credential(&self, host_id: &str) -> Result<serde_json::Value> {
+    pub async fn reveal_credential(&self, host_id: &str) -> DaemonResult<serde_json::Value> {
         self.send("RevealCredential", serde_json::json!({"host_id": host_id}))
             .await
     }

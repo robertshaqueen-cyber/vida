@@ -129,7 +129,8 @@ pub enum AppMessage {
     UnlockRememberToggled(bool),
     UnlockVault,
     UnlockSuccess,
-    UnlockFailed(String),
+    UnlockFailed(String, Option<String>), // (message, category)
+    UnlockToastHide,
 
     // S3: Main
     HostsLoaded(Vec<s3_main::HostItem>),
@@ -349,6 +350,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::UnlockPassphraseChanged(p) => {
             if let Screen::Unlock(s) = &mut app.screen {
                 s.passphrase = p;
+                // Clear error and hide toast when user starts typing
+                s.error = None;
+                s.error_category = None;
+                s.toast_visible = false;
             }
             Task::none()
         }
@@ -369,7 +374,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     async move {
                         match client.unlock(&passphrase, remember).await {
                             Ok(_) => AppMessage::UnlockSuccess,
-                            Err(e) => AppMessage::UnlockFailed(e.to_string()),
+                            Err(e) => AppMessage::UnlockFailed(e.message, e.category),
                         }
                     },
                     |r| r,
@@ -378,10 +383,31 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 Task::none()
             }
         }
-        AppMessage::UnlockFailed(e) => {
+        AppMessage::UnlockFailed(msg, category) => {
             if let Screen::Unlock(s) = &mut app.screen {
                 s.unlocking = false;
-                s.error = Some(e);
+                s.error = Some(msg);
+                s.error_category = category;
+                s.toast_visible = true;
+            }
+            // Focus password input and select all text for easy re-input
+            use iced::widget::Id;
+            let id = Id::from(crate::screens::s2_unlock::UNLOCK_PASSPHRASE_ID);
+            let focus = iced::widget::operation::focus::<AppMessage>(id.clone()).map(|_| unreachable!());
+            let select = iced::widget::operation::select_all::<AppMessage>(id).map(|_| unreachable!());
+            // Auto-hide toast after 3 seconds
+            let toast_hide = Task::perform(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    AppMessage::UnlockToastHide
+                },
+                |r| r,
+            );
+            Task::batch([focus, select, toast_hide])
+        }
+        AppMessage::UnlockToastHide => {
+            if let Screen::Unlock(s) = &mut app.screen {
+                s.toast_visible = false;
             }
             Task::none()
         }

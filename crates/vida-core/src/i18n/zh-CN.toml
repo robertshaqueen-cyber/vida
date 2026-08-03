@@ -126,6 +126,17 @@ daemon_ws_not_authed = "未认证：首条消息必须是 auth"
 daemon_ws_auth_failed = "认证失败：token 不匹配"
 daemon_ws_unknown_request = "未知请求: {0}"
 
+# ---- 错误分类 (GUI 显示) ----
+error_wrong_passphrase = "口令错误，请重试"
+error_vault_corrupted = "金库数据损坏，无法解析"
+error_not_found = "请求的资源不存在"
+error_vault_locked = "金库已锁定，请先解锁"
+error_vault_exists = "金库已存在"
+error_invalid_json = "请求格式错误"
+error_not_authed = "未认证"
+error_auth_failed = "认证失败"
+error_unknown_request = "未知请求"
+
 # ---- 快速连接面板 ----
 main_tab_connect = "快速连接"
 main_connect_search = "搜索配置或输入地址"

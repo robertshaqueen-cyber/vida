@@ -1,8 +1,9 @@
-use iced::widget::{button, column, container, text, text_input};
+use iced::widget::{button, column, container, text};
 use iced::{Element, Length};
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
+use crate::secure_text_input::SecureTextInput;
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -32,7 +33,7 @@ impl State {
             .label(i18n.tr("backup_use_current"))
             .on_toggle(AppMessage::BackupUseCurrentToggled);
 
-        let pass_input = text_input(i18n.tr("backup_new_passphrase"), &self.export_passphrase)
+        let pass_input = SecureTextInput::new(i18n.tr("backup_new_passphrase"), &self.export_passphrase)
             .on_input(AppMessage::BackupPassphraseChanged)
             .secure(true)
             .width(Length::Fill);
