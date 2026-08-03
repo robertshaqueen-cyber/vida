@@ -165,14 +165,20 @@ if self.is_secure {
 因此 `input_method_mut()`（直接赋值）是唯一能为 secure 字段强制关闭
 IME 的方式。`request_input_method()` 无法覆盖已启用的状态。
 
-**风险**: 直接赋值绕过了 merge 仲裁，谁最后写谁赢。
+**为什么必须无条件写入**：
 
-**缓解措施**: 仅在 `Event::Keyboard` 和 `Event::InputMethod` 事件时写入
-`Disabled`。非键盘事件（鼠标、窗口、触摸）不涉及 IME，写入可能影响
-兄弟 widget。限制为键盘事件后，只有 focused widget 处理这些事件。
+text_input 仅在 `RedrawRequested`（Window 事件）时调用
+`request_input_method(Enabled { purpose: Secure })`。如果用事件类型
+守卫（仅 Keyboard/IME），会遗漏 RedrawRequested，导致 IME 保持启用。
+后果：Enter 键被 IME 消费（用于 commit preedit），而非传递给 text_input
+的 on_submit。
 
-**待验证**: S4 页面同屏有 secure 和非 secure 输入框时，中文输入法在
-「备注」等普通字段正常工作，「口令」字段无候选框。
+**Sibling 影响分析**：
+
+每个事件创建独立 Shell（user_interface.rs line 318）。写入 Disabled
+仅影响当前 widget 的 Shell。Keyboard/RedrawRequested 事件只到达
+focused widget，非 focused 的兄弟 widget 不受影响。实测 S4 页面
+同屏 secure + 非 secure 输入框，中文输入法在普通字段正常工作。
 
 ### classify_error 过渡方案
 

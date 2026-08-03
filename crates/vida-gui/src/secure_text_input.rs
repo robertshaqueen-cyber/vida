@@ -176,26 +176,26 @@ where
             viewport,
         );
 
-        // Override IME to Disabled for keyboard/IME events only.
+        // Override IME to Disabled unconditionally.
         //
         // Why input_method_mut() instead of request_input_method():
         // Shell::merge() gives Enabled priority over Disabled — once any
-        // sibling widget requests Enabled, Disabled via merge() is ignored.
-        // input_method_mut() is the only way to force Disabled for secure
-        // fields where IME must be off.
+        // widget requests Enabled, Disabled via merge() is ignored.
+        // input_method_mut() is the only way to force Disabled.
         //
-        // Why only keyboard/IME events:
-        // Non-keyboard events (mouse, window, touch) don't involve IME.
-        // Writing Disabled on every event could affect sibling widgets
-        // during event propagation (Shell is shared across the tree).
-        // Restricting to keyboard/IME events limits the blast radius:
-        // only the focused widget processes these events.
-        match event {
-            Event::Keyboard(_) | Event::InputMethod(_) => {
-                *shell.input_method_mut() = InputMethod::Disabled;
-            }
-            _ => {}
-        }
+        // Why unconditional (not just keyboard/IME events):
+        // text_input calls request_input_method(Enabled) during
+        // RedrawRequested — a Window event, not a Keyboard event.
+        // An event-type guard would miss this and leave IME enabled,
+        // causing the Enter key to be consumed by IME instead of
+        // triggering on_submit.
+        //
+        // Sibling impact: each event creates a new Shell (user_interface.rs
+        // line 318). Writing Disabled here only affects this widget's
+        // Shell. The merge at line 336 reads this Shell's final state.
+        // Keyboard/RedrawRequested events only reach the focused widget,
+        // so non-focused siblings are unaffected.
+        *shell.input_method_mut() = InputMethod::Disabled;
     }
 
     fn mouse_interaction(
