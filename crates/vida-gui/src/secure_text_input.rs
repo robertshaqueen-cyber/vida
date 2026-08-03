@@ -176,9 +176,26 @@ where
             viewport,
         );
 
-        // Override: force IME to be disabled for secure fields
-        // This prevents Chinese IME from intercepting keystrokes
-        *shell.input_method_mut() = InputMethod::Disabled;
+        // Override IME to Disabled for keyboard/IME events only.
+        //
+        // Why input_method_mut() instead of request_input_method():
+        // Shell::merge() gives Enabled priority over Disabled — once any
+        // sibling widget requests Enabled, Disabled via merge() is ignored.
+        // input_method_mut() is the only way to force Disabled for secure
+        // fields where IME must be off.
+        //
+        // Why only keyboard/IME events:
+        // Non-keyboard events (mouse, window, touch) don't involve IME.
+        // Writing Disabled on every event could affect sibling widgets
+        // during event propagation (Shell is shared across the tree).
+        // Restricting to keyboard/IME events limits the blast radius:
+        // only the focused widget processes these events.
+        match event {
+            Event::Keyboard(_) | Event::InputMethod(_) => {
+                *shell.input_method_mut() = InputMethod::Disabled;
+            }
+            _ => {}
+        }
     }
 
     fn mouse_interaction(

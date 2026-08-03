@@ -385,12 +385,18 @@ fn extract_remote_meta(result: &SyncResult) -> Option<serde_json::Value> {
 }
 
 /// Classify error based on message content for GUI i18n display.
+///
+/// This is a transitional approach. Goal: carry category from the error source
+/// (VidaError { category, detail }) so downstream doesn't match on text.
 fn classify_error(msg: &str) -> Option<String> {
     let lower = msg.to_lowercase();
     
     if lower.contains("wrong passphrase") || lower.contains("auth failed") || lower.contains("hmac mismatch") {
         Some("wrong_passphrase".to_string())
-    } else if lower.contains("corrupted") || lower.contains("corrupt") || lower.contains("invalid") || lower.contains("parse") {
+    } else if lower.contains("corrupted data") || lower.contains("failed to parse vault json") {
+        // Narrowed: only match vault-specific corruption messages from core.
+        // Removed "invalid" (too broad: port invalid, path invalid, etc.)
+        // and "parse" (too broad: JSON field invalid, config parse, etc.)
         Some("vault_corrupted".to_string())
     } else if lower.contains("not found") || lower.contains("missing") {
         Some("not_found".to_string())
