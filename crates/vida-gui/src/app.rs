@@ -167,7 +167,9 @@ pub enum AppMessage {
 
     // S5: Settings
     SettingsLoaded(serde_json::Value),
+    SettingsSyncModeChanged(crate::screens::s5_settings::SyncMode),
     SettingsSyncPathChanged(String),
+    SettingsSyncPickFolder,
     SettingsScrollbackChanged(String),
     SettingsLanguageChanged(crate::screens::s5_settings::LangChoice),
     SettingsSectionChanged(crate::screens::s5_settings::SettingsSection),
@@ -1071,6 +1073,32 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 s.active_section = section;
                 s.saved = false;
                 s.error = None;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsSyncModeChanged(mode) => {
+            if let Some(s) = &mut app.settings_state {
+                use crate::screens::s5_settings::SyncMode;
+                s.sync_mode = mode;
+                match mode {
+                    SyncMode::None => {
+                        s.sync_local_path.clear();
+                    }
+                    SyncMode::Local => {
+                        // Keep existing path if any
+                    }
+                }
+                s.saved = false;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsSyncPickFolder => {
+            if let Some(s) = &mut app.settings_state
+                && let Some(handle) = rfd::FileDialog::new().pick_folder()
+                && let Some(path) = handle.to_str()
+            {
+                s.sync_local_path = path.to_string();
+                s.saved = false;
             }
             Task::none()
         }

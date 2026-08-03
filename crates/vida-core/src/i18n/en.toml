@@ -63,8 +63,13 @@ editor_hint_keep_password = "Tip: leaving the password field empty keeps the exi
 editor_hint_need_password = "Tip: a new host must have a password."
 
 # ---- S5 Settings ----
+settings_sync_mode = "Sync mode"
+settings_sync_mode_none = "Disabled"
+settings_sync_mode_local = "Local folder"
+settings_sync_explain = "Sync writes an encrypted copy of your vault to a local folder. Share that folder (e.g. iCloud, Syncthing) across machines."
+settings_sync_pick_folder = "Choose folder"
 settings_sync_path = "Sync folder path"
-settings_sync_path_hint = "Empty = no sync. Fill in a local folder path to enable LocalPath sync."
+settings_sync_path_hint = "Enter a local folder path"
 settings_scrollback = "Scrollback lines"
 settings_language = "UI Language"
 settings_lang_system = "Follow system"

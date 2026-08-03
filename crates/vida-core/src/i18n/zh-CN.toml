@@ -63,8 +63,13 @@ editor_hint_keep_password = "提示：口令框留空则保持原有口令不变
 editor_hint_need_password = "提示：新主机必须提供口令。"
 
 # ---- S5 设置 ----
+settings_sync_mode = "同步模式"
+settings_sync_mode_none = "不同步"
+settings_sync_mode_local = "本地文件夹"
+settings_sync_explain = "同步会将金库的加密副本写入指定文件夹。多台电脑通过共享文件夹（如 iCloud、Syncthing）实现同步。"
+settings_sync_pick_folder = "选择文件夹"
 settings_sync_path = "同步文件夹路径"
-settings_sync_path_hint = "留空 = 不同步。填写本地文件夹路径启用 LocalPath 同步。"
+settings_sync_path_hint = "填写本地文件夹路径"
 settings_scrollback = "回滚行数"
 settings_language = "界面语言"
 settings_lang_system = "跟随系统"

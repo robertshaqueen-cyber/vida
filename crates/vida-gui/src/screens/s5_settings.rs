@@ -6,6 +6,35 @@ use crate::app::AppMessage;
 use crate::screens::s3_main::HostItem;
 
 // ---------------------------------------------------------------------------
+// Sync mode
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    None,
+    Local,
+}
+
+impl SyncMode {
+    pub fn from_path(path: &str) -> Self {
+        if path.is_empty() {
+            SyncMode::None
+        } else {
+            SyncMode::Local
+        }
+    }
+}
+
+impl std::fmt::Display for SyncMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncMode::None => write!(f, "Disabled"),
+            SyncMode::Local => write!(f, "Local folder"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings section navigation
 // ---------------------------------------------------------------------------
 
@@ -94,6 +123,7 @@ pub struct State {
     // Connections
     pub hosts: Vec<HostItem>,
     // Sync
+    pub sync_mode: SyncMode,
     pub sync_local_path: String,
     // Terminal
     pub scrollback_lines: String,
@@ -110,6 +140,7 @@ impl State {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let sync_mode = SyncMode::from_path(&sync_local_path);
 
         let scrollback_lines = val
             .get("scrollback_lines")
@@ -127,6 +158,7 @@ impl State {
             active_section: SettingsSection::Application,
             language,
             hosts: Vec::new(),
+            sync_mode,
             sync_local_path,
             scrollback_lines,
             saving: false,
@@ -304,19 +336,43 @@ impl State {
     fn view_sync(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("settings_sync")).size(20);
 
-        let sync_label = text(i18n.tr("settings_sync_path")).size(14);
-        let sync_input = text_input(i18n.tr("settings_sync_path_hint"), &self.sync_local_path)
-            .on_input(AppMessage::SettingsSyncPathChanged)
-            .width(Length::Fill);
-        let sync_hint = text(i18n.tr("settings_sync_path_hint")).size(11);
+        // Explanation
+        let explain = text(i18n.tr("settings_sync_explain")).size(12);
 
+        // Sync mode dropdown
+        let mode_label = text(i18n.tr("settings_sync_mode")).size(14);
+        let mode_options: Vec<SyncMode> = vec![SyncMode::None, SyncMode::Local];
+        let mode_pick = pick_list(
+            mode_options,
+            Some(self.sync_mode),
+            AppMessage::SettingsSyncModeChanged,
+        )
+        .width(Length::Fill);
+
+        // Path input + folder button (only when Local mode)
+        let path_section: Element<'_, AppMessage> = match self.sync_mode {
+            SyncMode::Local => {
+                let path_label = text(i18n.tr("settings_sync_path")).size(14);
+                let path_input =
+                    text_input(i18n.tr("settings_sync_path_hint"), &self.sync_local_path)
+                        .on_input(AppMessage::SettingsSyncPathChanged)
+                        .width(Length::Fill);
+                let pick_btn = button(text(i18n.tr("settings_sync_pick_folder")).size(13))
+                    .on_press(AppMessage::SettingsSyncPickFolder)
+                    .width(Length::Shrink);
+                let path_row = row![path_input, pick_btn].spacing(8).width(Length::Fill);
+                column![path_label, path_row].spacing(4).into()
+            }
+            SyncMode::None => text("").into(),
+        };
+
+        // Save button
         let can_save = !self.saving;
         let save_btn = if self.saving {
             button(i18n.tr("common_saving")).width(Length::Shrink)
         } else {
             button(i18n.tr("common_save")).width(Length::Shrink)
         };
-
         let save_btn = if can_save {
             save_btn.on_press(AppMessage::SettingsSave)
         } else {
@@ -337,9 +393,10 @@ impl State {
         column![
             title,
             rule::horizontal(1),
-            sync_label,
-            sync_input,
-            sync_hint,
+            explain,
+            mode_label,
+            mode_pick,
+            path_section,
             save_btn,
             status_text,
             error_text,
