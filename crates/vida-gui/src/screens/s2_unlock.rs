@@ -107,25 +107,33 @@ impl State {
         };
 
         // Fixed-height error slot: 36px when error present, 0px when empty.
-        // This prevents layout jump and keeps the toast visually tied to the
-        // input field (same column → same left edge, column spacing → 8px gap).
+        // Width matches the input field (not the full column). Achieved by
+        // placing the error text in a row with a trailing spacer whose width
+        // mirrors the unlock button — same structure as input_row, so the
+        // text portion naturally aligns with the input.
         let error_text = text(error_msg).size(12);
         let error_slot: Element<'_, AppMessage> = if self.toast_visible {
-            container(error_text)
-                .width(Length::Fill)
-                .padding(iced::Padding::from([8, 10]))
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.15, 0.08, 0.08, 1.0,
-                    ))),
-                    border: iced::Border {
-                        color: iced::Color::from_rgb(0.9, 0.2, 0.2),
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .into()
+            row![
+                container(error_text)
+                    .width(Length::Fill)
+                    .padding(iced::Padding::from([8, 10]))
+                    .style(|_theme: &Theme| container::Style {
+                        background: Some(iced::Background::Color(iced::Color::from_rgba(
+                            0.15, 0.08, 0.08, 1.0,
+                        ))),
+                        border: iced::Border {
+                            color: iced::Color::from_rgb(0.9, 0.2, 0.2),
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                // Spacer matching unlock button width + spacing, so the
+                // error container stops at the input's right edge.
+                text("").width(Length::Fixed(80.0)),
+            ]
+            .spacing(10)
+            .into()
         } else {
             // Invisible placeholder to preserve tree structure (avoids
             // losing focus when the error disappears).
