@@ -136,12 +136,28 @@ impl State {
                 ..Default::default()
             });
 
+        // Toast positioned below the input row. Use stack layout with
+        // height(Fill) to prevent bottom rendering leak. The padding
+        // vertical value approximates: center_y offset + input_row height +
+        // 8px gap.  This is a rough approximation; the centered_main
+        // container places content at window center, and the input_row is
+        // roughly 120px below the top of centered_main (title + subtitle +
+        // spacing).  We use ~140px to land just below the input.
+        //
+        // Left padding aligns with centered_main's max_width(400) + padding(40)
+        // which gives left edge at ~center - 200px.
         iced::widget::stack![
             centered_main,
             container(toast_widget)
                 .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(iced::Padding {
+                    top: 140.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                    right: 0.0,
+                })
                 .center_x(Length::Fill)
-                .padding(iced::Padding::from([10.0, 0.0]))
         ]
         .width(Length::Fill)
         .height(Length::Fill)

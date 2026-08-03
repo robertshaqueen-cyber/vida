@@ -84,3 +84,28 @@ enum variant 形态变更，**必须在同一个提交内完成以下三件事**
 | RemoteMissing | 提示远端文件缺失，提供「重新上传 / 清除同步状态」两个选项 | ✅ S8RemoteMissingScreen 两个按钮：handle_reupload / handle_clear_state |
 
 **本节已全部清空。M1 不再被跨层契约阻塞。**
+
+## iced 版本锁定（强制）
+
+`vida-gui/Cargo.toml` 中 iced 版本锁定为精确版本（`= 0.14.0`）。
+
+**原因**：`SecureTextInput` 依赖 iced 三条未在文档中承诺的内部行为：
+1. IME 启用时事件为 `Event::InputMethod` 而非 `Event::Keyboard`
+2. 键盘事件仅到达 focused widget
+3. `shell.input_method()` 前后差分可推断内部 widget 是否 focused
+
+**升级 iced 前必须**：
+1. 阅读 iced changelog，检查上述三条是否有变动
+2. 执行 IME 手动验证清单（见下）
+3. 验证通过后才可提升版本
+
+**IME 手动验证清单**（中文输入法下执行）：
+- [ ] S2 密码框：无候选窗，直接输入 ASCII
+- [ ] S1 口令框：同上
+- [ ] S4 口令框：同上
+- [ ] S4 主机名称框：中文输入正常，候选窗出现
+- [ ] S4 备注框：同上
+- [ ] S9 备份口令框：同上
+- [ ] S4 同屏：口令框无候选窗 + 主机名称框中文正常（同时成立）
+- [ ] Cmd+V 粘贴含中文字符串到六个 secure 框：成功
+- [ ] 空闲 CPU ≈ 0%（无常驻订阅）

@@ -10,6 +10,30 @@ use iced::window;
 ///
 /// This solves the security issue where Chinese IME would intercept
 /// keystrokes in password fields, potentially leaking to cloud IME services.
+///
+/// # iced 依赖声明 (升级前必读)
+///
+/// 本实现依赖 iced 0.14 的三条**未在文档中承诺**的内部行为：
+///
+/// 1. **IME 事件类型**：当 IME 启用时，winit 发送 `Event::InputMethod`
+///    而非 `Event::Keyboard`。如果 iced 升级后改变了事件映射逻辑，
+///    IME 会静默重新启用。
+///
+/// 2. **键盘事件仅到达 focused widget**：`Event::Keyboard` 事件只被
+///    focused 的 text_input 处理。如果 iced 改变了事件分发逻辑（如
+///    广播到所有 widget），非 focused 的 SecureTextInput 可能干扰兄弟。
+///
+/// 3. **Shell::input_method 差分检测焦点**：`text_input` 仅在
+///    focused + window focused 时调用 `request_input_method`（line 1353）。
+///    对比 update 前后 `shell.input_method()` 状态可推断内部 widget
+///    是否 focused。如果 iced 改变了 `request_input_method` 的调用时机，
+///    焦点检测会失效。
+///
+/// **升级检查清单**：若 iced 升级后中文输入法在口令框出现候选窗：
+/// - 先检查 `Event::InputMethod` 是否仍被 winit 正确映射
+/// - 再检查 `text_input` 的 `request_input_method` 调用条件
+/// - 最后验证 `shell.input_method()` 差分逻辑
+/// - 详见 `docs/decisions.md` IME 安全缺陷分析
 pub struct SecureTextInput<'a, Message: Clone> {
     inner: text_input::TextInput<'a, Message>,
     width: Length,
