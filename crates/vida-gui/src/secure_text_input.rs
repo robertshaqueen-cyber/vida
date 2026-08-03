@@ -176,26 +176,32 @@ where
             viewport,
         );
 
-        // Override IME to Disabled unconditionally.
+        // Override IME to Disabled for keyboard/IME events only.
         //
         // Why input_method_mut() instead of request_input_method():
         // Shell::merge() gives Enabled priority over Disabled — once any
         // widget requests Enabled, Disabled via merge() is ignored.
         // input_method_mut() is the only way to force Disabled.
         //
-        // Why unconditional (not just keyboard/IME events):
-        // text_input calls request_input_method(Enabled) during
-        // RedrawRequested — a Window event, not a Keyboard event.
-        // An event-type guard would miss this and leave IME enabled,
-        // causing the Enter key to be consumed by IME instead of
-        // triggering on_submit.
+        // Why NOT RedrawRequested:
+        // During RedrawRequested, ALL visible text inputs process the event.
+        // If a non-secure input calls request_input_method(Enabled), the
+        // merge makes input_method = Enabled. Our Disabled write is then
+        // ignored by merge (Enabled wins). Writing Disabled here would
+        // override the non-secure input's request, breaking Chinese IME
+        // for all non-secure fields on the same screen.
         //
-        // Sibling impact: each event creates a new Shell (user_interface.rs
-        // line 318). Writing Disabled here only affects this widget's
-        // Shell. The merge at line 336 reads this Shell's final state.
-        // Keyboard/RedrawRequested events only reach the focused widget,
-        // so non-focused siblings are unaffected.
-        *shell.input_method_mut() = InputMethod::Disabled;
+        // Why keyboard/IME events are safe:
+        // Keyboard events only reach the focused widget. IME commit
+        // (InputMethod::Commit) happens AFTER the corresponding keyboard
+        // event in winit's event ordering. So disabling IME during the
+        // keyboard event prevents the IME from committing Chinese characters.
+        match event {
+            Event::Keyboard(_) | Event::InputMethod(_) => {
+                *shell.input_method_mut() = InputMethod::Disabled;
+            }
+            _ => {}
+        }
     }
 
     fn mouse_interaction(

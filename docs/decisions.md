@@ -165,20 +165,23 @@ if self.is_secure {
 因此 `input_method_mut()`（直接赋值）是唯一能为 secure 字段强制关闭
 IME 的方式。`request_input_method()` 无法覆盖已启用的状态。
 
-**为什么必须无条件写入**：
+**为什么不能无条件写入**：
 
-text_input 仅在 `RedrawRequested`（Window 事件）时调用
-`request_input_method(Enabled { purpose: Secure })`。如果用事件类型
-守卫（仅 Keyboard/IME），会遗漏 RedrawRequested，导致 IME 保持启用。
-后果：Enter 键被 IME 消费（用于 commit preedit），而非传递给 text_input
-的 on_submit。
+RedrawRequested 事件到达所有可见 text_input。若非 secure 字段调用
+`request_input_method(Enabled)`，merge 使 `input_method = Enabled`。
+secure 字段的 `Disabled` 写入被 merge 忽略（Enabled 优先）。无条件
+写入会覆盖非 secure 字段的请求，导致同屏所有非 secure 字段无法输入
+中文（S4 主机名、备注等）。
 
-**Sibling 影响分析**：
+**最终方案：仅 Keyboard/IME 事件时写入 Disabled**
 
-每个事件创建独立 Shell（user_interface.rs line 318）。写入 Disabled
-仅影响当前 widget 的 Shell。Keyboard/RedrawRequested 事件只到达
-focused widget，非 focused 的兄弟 widget 不受影响。实测 S4 页面
-同屏 secure + 非 secure 输入框，中文输入法在普通字段正常工作。
+- Keyboard 事件只到达 focused widget，不影响兄弟
+- winit 事件顺序：KeyboardEvent → Ime::Commit。在 Keyboard 事件时
+  禁用 IME，可阻止后续 Ime::Commit 提交中文字符到 secure 字段
+- RedrawRequested 不写入：让 text_input 正常设置 IME（非 secure 字段
+  需要 Enabled 以支持中文输入）
+- 副作用：secure 字段获得焦点后、首次按键前，IME 短暂启用。但此窗口
+  极短（用户需先点击字段再打字），且 Keyboard 事件立即禁用 IME
 
 ### classify_error 过渡方案
 
