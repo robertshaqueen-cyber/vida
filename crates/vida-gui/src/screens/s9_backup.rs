@@ -33,10 +33,11 @@ impl State {
             .label(i18n.tr("backup_use_current"))
             .on_toggle(AppMessage::BackupUseCurrentToggled);
 
-        let pass_input = SecureTextInput::new(i18n.tr("backup_new_passphrase"), &self.export_passphrase)
-            .on_input(AppMessage::BackupPassphraseChanged)
-            .secure(true)
-            .width(Length::Fill);
+        let pass_input =
+            SecureTextInput::new(i18n.tr("backup_new_passphrase"), &self.export_passphrase)
+                .on_input(AppMessage::BackupPassphraseChanged)
+                .secure(true)
+                .width(Length::Fill);
 
         let can_export =
             !self.exporting && (self.use_current || !self.export_passphrase.is_empty());

@@ -225,10 +225,10 @@ async fn handle_message(
         Err(e) => {
             let msg = format!("{:#}", e);
             warn!("Request {} failed: {}", method, msg);
-            
+
             // Classify error based on message content
             let category = classify_error(&msg);
-            
+
             serde_json::to_string(&Response {
                 id,
                 payload: ResponsePayload::Error {
@@ -391,8 +391,11 @@ fn extract_remote_meta(result: &SyncResult) -> Option<serde_json::Value> {
 /// (VidaError { category, detail }) so downstream doesn't match on text.
 fn classify_error(msg: &str) -> Option<String> {
     let lower = msg.to_lowercase();
-    
-    if lower.contains("wrong passphrase") || lower.contains("auth failed") || lower.contains("hmac mismatch") {
+
+    if lower.contains("wrong passphrase")
+        || lower.contains("auth failed")
+        || lower.contains("hmac mismatch")
+    {
         Some("wrong_passphrase".to_string())
     } else if lower.contains("corrupted data") || lower.contains("failed to parse vault json") {
         // Narrowed: only match vault-specific corruption messages from core.

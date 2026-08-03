@@ -114,7 +114,8 @@ impl State {
         );
         // Sync indicator: shows state (synced / local changes / syncing / error),
         // click to trigger sync; greyed out + tooltip when not configured
-        let sync_btn = if sync_symbol == "—" && sync_label == i18n.tr("sync_state_not_configured") {
+        let sync_btn = if sync_symbol == "—" && sync_label == i18n.tr("sync_state_not_configured")
+        {
             tooltip(
                 button(text(sync_symbol).size(14))
                     .on_press(AppMessage::OpenSettingsTab)

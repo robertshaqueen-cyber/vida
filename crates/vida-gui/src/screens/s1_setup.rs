@@ -29,9 +29,10 @@ impl State {
         let title = text("vida").size(32);
         let subtitle = text(i18n.tr("setup_title")).size(18);
 
-        let pass_input = SecureTextInput::new(i18n.tr("setup_passphrase_placeholder"), &self.passphrase)
-            .on_input(AppMessage::SetupPassphraseChanged)
-            .secure(true);
+        let pass_input =
+            SecureTextInput::new(i18n.tr("setup_passphrase_placeholder"), &self.passphrase)
+                .on_input(AppMessage::SetupPassphraseChanged)
+                .secure(true);
 
         let confirm_input = SecureTextInput::new(
             i18n.tr("setup_confirm_placeholder"),

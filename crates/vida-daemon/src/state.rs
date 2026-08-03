@@ -151,12 +151,66 @@ impl DaemonState {
         let passphrase = self.ensure_passphrase()?.to_string();
         let vault_path = self.vault_path.clone();
         let vault = self.ensure_unlocked_mut()?;
+
+        // --- 必改1: 检测 sync_local_path 是否变化，变化时清除旧 SyncState ---
+        let old_path = vault.settings.sync_local_path.clone();
+        let new_path = settings.sync_local_path.clone();
+        let path_changed = old_path != new_path;
+
+        // --- 必改2: 校验新路径 ---
+        if let Some(ref p) = new_path
+            && !p.is_empty()
+        {
+            let new_dir = std::path::PathBuf::from(p);
+            // 不能是金库自身目录
+            let vault_parent = vault_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .canonicalize()
+                .unwrap_or_default();
+            let new_canonical = new_dir.canonicalize().unwrap_or_default();
+            if new_canonical == vault_parent {
+                anyhow::bail!(
+                    "同步文件夹不能是金库所在目录（{}），请选择其他位置",
+                    vault_parent.display()
+                );
+            }
+            // 路径必须存在
+            if !new_dir.exists() {
+                anyhow::bail!("同步文件夹不存在：{}", p);
+            }
+            // 必须是目录
+            if !new_dir.is_dir() {
+                anyhow::bail!("路径不是文件夹：{}", p);
+            }
+            // 必须可写
+            let test_file = new_dir.join(".vida_write_test");
+            match std::fs::write(&test_file, b"test") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&test_file);
+                }
+                Err(e) => {
+                    anyhow::bail!("同步文件夹不可写：{} — {}", p, e);
+                }
+            }
+        }
+
         vault.settings = settings;
         vault.modified_at = chrono::Utc::now().timestamp();
         vault.revision += 1;
         let ct = vida_core::vault::encrypt(vault, &passphrase)?;
         vida_core::persist::write_atomic(&vault_path, &ct)?;
         info!("Settings updated");
+
+        // --- 必改1: 路径变化时清除旧 SyncState，防止静默覆盖 ---
+        if path_changed {
+            let state_path = vida_core::config::config_dir()?.join("sync_state.json");
+            if state_path.exists() {
+                std::fs::remove_file(&state_path).context("Failed to remove old sync state")?;
+                info!("Cleared old SyncState (sync path changed)");
+            }
+        }
+
         // Re-initialize sync based on new settings
         self.init_sync()?;
         Ok(())
@@ -301,7 +355,11 @@ impl DaemonState {
             }
             SyncResult::RemoteMissing => info!("Remote vault missing, awaiting user action"),
             SyncResult::Uploaded { .. } | SyncResult::NoChange => {}
-            SyncResult::SyncNotConfigured => unreachable!("handled at top of sync()"),
+            SyncResult::SyncNotConfigured => {
+                tracing::warn!(
+                    "SyncNotConfigured reached post-sync match (should have been caught earlier)"
+                );
+            }
         }
         let hosts = if hosts_updated {
             Some(self.list_hosts()?)
@@ -485,28 +543,156 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let vault_path = tmp.path().join("vault.age");
 
-        // Create and unlock a vault so passphrase + vault are available
         let mut state = DaemonState {
             token: "test".into(),
             vault: None,
             passphrase: None,
             vault_path,
-            sync: None, // explicitly no sync
+            sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
         };
 
-        // Create vault + unlock so state has passphrase and vault
         let passphrase = "test-passphrase";
         state.create_vault(passphrase).unwrap();
         state.lock();
         state.unlock(passphrase, false).unwrap();
 
-        // sync should be None because sync_local_path defaults to None
         assert!(state.sync.is_none());
 
-        // sync() must return SyncNotConfigured without any file I/O
         let (result, hosts) = state.sync().await.unwrap();
         assert!(matches!(result, SyncResult::SyncNotConfigured));
         assert!(hosts.is_none());
+    }
+
+    #[tokio::test]
+    async fn path_change_clears_sync_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+
+        // Create sync_state.json to simulate an established sync
+        let config_dir = vida_core::config::config_dir().unwrap();
+        let sync_state_file = config_dir.join("sync_state.json");
+        let fake_state = vida_core::sync::SyncState {
+            last_synced_revision: 5,
+            last_synced_hash: "old-hash".into(),
+            last_sync_time: 0,
+        };
+        std::fs::write(&sync_state_file, serde_json::to_vec(&fake_state).unwrap()).unwrap();
+        assert!(sync_state_file.exists());
+
+        let mut state = DaemonState {
+            token: "test".into(),
+            vault: None,
+            passphrase: None,
+            vault_path,
+            sync: None,
+            i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+        };
+        state.create_vault("pass").unwrap();
+        state.lock();
+        state.unlock("pass", false).unwrap();
+
+        // Set initial sync path
+        let path_a = tmp.path().join("path_a");
+        std::fs::create_dir_all(&path_a).unwrap();
+        let mut settings = Settings::default();
+        settings.sync_local_path = Some(path_a.to_str().unwrap().to_string());
+        state.update_settings(settings.clone()).unwrap();
+
+        // Verify sync_state.json was cleared when switching paths
+        assert!(
+            !sync_state_file.exists(),
+            "sync_state.json should be deleted after path change"
+        );
+
+        // Switch to a new path — should also clear state
+        let path_b = tmp.path().join("path_b");
+        std::fs::create_dir_all(&path_b).unwrap();
+        settings.sync_local_path = Some(path_b.to_str().unwrap().to_string());
+        state.update_settings(settings).unwrap();
+        assert!(
+            !sync_state_file.exists(),
+            "sync_state.json should still not exist after second path change"
+        );
+    }
+
+    #[test]
+    fn path_change_to_vault_dir_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+
+        let mut state = DaemonState {
+            token: "test".into(),
+            vault: None,
+            passphrase: None,
+            vault_path,
+            sync: None,
+            i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+        };
+        state.create_vault("pass").unwrap();
+        state.lock();
+        state.unlock("pass", false).unwrap();
+
+        // Set sync_local_path to the vault directory itself
+        let mut settings = Settings::default();
+        settings.sync_local_path = Some(tmp.path().to_str().unwrap().to_string());
+
+        let err = state.update_settings(settings).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("不能是金库所在目录"),
+            "Should reject vault directory, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn nonexistent_sync_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+
+        let mut state = DaemonState {
+            token: "test".into(),
+            vault: None,
+            passphrase: None,
+            vault_path,
+            sync: None,
+            i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+        };
+        state.create_vault("pass").unwrap();
+        state.lock();
+        state.unlock("pass", false).unwrap();
+
+        let mut settings = Settings::default();
+        settings.sync_local_path = Some("/nonexistent/path/abc123".into());
+
+        let err = state.update_settings(settings).unwrap_err();
+        assert!(format!("{}", err).contains("不存在"));
+    }
+
+    #[test]
+    fn file_as_sync_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+        let file_path = tmp.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let mut state = DaemonState {
+            token: "test".into(),
+            vault: None,
+            passphrase: None,
+            vault_path,
+            sync: None,
+            i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+        };
+        state.create_vault("pass").unwrap();
+        state.lock();
+        state.unlock("pass", false).unwrap();
+
+        let mut settings = Settings::default();
+        settings.sync_local_path = Some(file_path.to_str().unwrap().to_string());
+
+        let err = state.update_settings(settings).unwrap_err();
+        assert!(format!("{}", err).contains("不是文件夹"));
     }
 }

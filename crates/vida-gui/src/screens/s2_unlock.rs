@@ -46,23 +46,25 @@ impl State {
 
         // Error styling: red border for input when error exists
         let can_unlock = !self.passphrase.is_empty() && !self.unlocking;
-        
+
         let pass_input = if self.error.is_some() {
-            let input = SecureTextInput::new(i18n.tr("unlock_passphrase_placeholder"), &self.passphrase)
-                .on_input(AppMessage::UnlockPassphraseChanged)
-                .secure(true)
-                .style(error_text_input_style)
-                .id(UNLOCK_PASSPHRASE_ID);
+            let input =
+                SecureTextInput::new(i18n.tr("unlock_passphrase_placeholder"), &self.passphrase)
+                    .on_input(AppMessage::UnlockPassphraseChanged)
+                    .secure(true)
+                    .style(error_text_input_style)
+                    .id(UNLOCK_PASSPHRASE_ID);
             if can_unlock {
                 input.on_submit(AppMessage::UnlockVault)
             } else {
                 input
             }
         } else {
-            let input = SecureTextInput::new(i18n.tr("unlock_passphrase_placeholder"), &self.passphrase)
-                .on_input(AppMessage::UnlockPassphraseChanged)
-                .secure(true)
-                .id(UNLOCK_PASSPHRASE_ID);
+            let input =
+                SecureTextInput::new(i18n.tr("unlock_passphrase_placeholder"), &self.passphrase)
+                    .on_input(AppMessage::UnlockPassphraseChanged)
+                    .secure(true)
+                    .id(UNLOCK_PASSPHRASE_ID);
             if can_unlock {
                 input.on_submit(AppMessage::UnlockVault)
             } else {
@@ -144,16 +146,10 @@ impl State {
         };
 
         // Main centered content — error_slot sits between input and checkbox
-        let main_content = column![
-            title,
-            subtitle,
-            input_row,
-            error_slot,
-            remember_check,
-        ]
-        .spacing(10)
-        .padding(40)
-        .max_width(400);
+        let main_content = column![title, subtitle, input_row, error_slot, remember_check,]
+            .spacing(10)
+            .padding(40)
+            .max_width(400);
 
         container(main_content)
             .width(Length::Fill)

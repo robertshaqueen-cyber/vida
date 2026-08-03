@@ -143,8 +143,10 @@ impl WsClient {
         }
 
         // Auth succeeded — now create the mpsc channel and spawn the background R/W task
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<(WsRequest, oneshot::Sender<DaemonResult<serde_json::Value>>)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(
+            WsRequest,
+            oneshot::Sender<DaemonResult<serde_json::Value>>,
+        )>();
 
         tokio::spawn(async move {
             let mut pending: PendingMap = HashMap::new();
@@ -189,7 +191,11 @@ impl WsClient {
     }
 
     /// Send a request with params.
-    pub async fn send(&self, method: &str, params: serde_json::Value) -> DaemonResult<serde_json::Value> {
+    pub async fn send(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> DaemonResult<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -199,13 +205,15 @@ impl WsClient {
             id,
         };
 
-        self.tx
-            .send((req, response_tx))
-            .map_err(|_| DaemonError { message: "Failed to send request to daemon".to_string(), category: None })?;
+        self.tx.send((req, response_tx)).map_err(|_| DaemonError {
+            message: "Failed to send request to daemon".to_string(),
+            category: None,
+        })?;
 
-        response_rx
-            .await
-            .map_err(|_| DaemonError { message: "Daemon response channel closed".to_string(), category: None })?
+        response_rx.await.map_err(|_| DaemonError {
+            message: "Daemon response channel closed".to_string(),
+            category: None,
+        })?
     }
 
     /// Send a request with no params (unit variant).
@@ -219,13 +227,15 @@ impl WsClient {
             id,
         };
 
-        self.tx
-            .send((req, response_tx))
-            .map_err(|_| DaemonError { message: "Failed to send request to daemon".to_string(), category: None })?;
+        self.tx.send((req, response_tx)).map_err(|_| DaemonError {
+            message: "Failed to send request to daemon".to_string(),
+            category: None,
+        })?;
 
-        response_rx
-            .await
-            .map_err(|_| DaemonError { message: "Daemon response channel closed".to_string(), category: None })?
+        response_rx.await.map_err(|_| DaemonError {
+            message: "Daemon response channel closed".to_string(),
+            category: None,
+        })?
     }
 
     // Convenience methods --------------------------------------------------
@@ -239,7 +249,11 @@ impl WsClient {
             .await
     }
 
-    pub async fn unlock(&self, passphrase: &str, remember: bool) -> DaemonResult<serde_json::Value> {
+    pub async fn unlock(
+        &self,
+        passphrase: &str,
+        remember: bool,
+    ) -> DaemonResult<serde_json::Value> {
         self.send(
             "Unlock",
             serde_json::json!({"passphrase": passphrase, "remember": remember}),
@@ -259,7 +273,10 @@ impl WsClient {
         self.send_no_params("GetSettings").await
     }
 
-    pub async fn update_settings(&self, settings: serde_json::Value) -> DaemonResult<serde_json::Value> {
+    pub async fn update_settings(
+        &self,
+        settings: serde_json::Value,
+    ) -> DaemonResult<serde_json::Value> {
         self.send("UpdateSettings", serde_json::json!({"settings": settings}))
             .await
     }

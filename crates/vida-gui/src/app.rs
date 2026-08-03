@@ -397,8 +397,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             // Focus password input and select all text for easy re-input
             use iced::widget::Id;
             let id = Id::from(crate::screens::s2_unlock::UNLOCK_PASSPHRASE_ID);
-            let focus = iced::widget::operation::focus::<AppMessage>(id.clone()).map(|_| unreachable!());
-            let select = iced::widget::operation::select_all::<AppMessage>(id).map(|_| unreachable!());
+            let focus =
+                iced::widget::operation::focus::<AppMessage>(id.clone()).map(|_| unreachable!());
+            let select =
+                iced::widget::operation::select_all::<AppMessage>(id).map(|_| unreachable!());
             // Auto-hide toast after 3 seconds
             let toast_hide = Task::perform(
                 async {

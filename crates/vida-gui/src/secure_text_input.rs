@@ -1,10 +1,10 @@
-use iced::advanced::widget::Tree;
-use iced::advanced::{layout, mouse, overlay, renderer, Clipboard, Shell, Widget};
-use iced::widget::text_input::{self, Status, Style};
-use iced::{Element, Event, Length, Rectangle, Size, Vector};
 use iced::advanced::InputMethod;
 use iced::advanced::layout::Layout;
+use iced::advanced::widget::Tree;
+use iced::advanced::{Clipboard, Shell, Widget, layout, mouse, overlay, renderer};
+use iced::widget::text_input::{self, Status, Style};
 use iced::window;
+use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
 /// A wrapper around `text_input` that disables IME for secure fields.
 ///
@@ -146,11 +146,15 @@ where
     }
 
     fn tag(&self) -> iced::advanced::widget::tree::Tag {
-        <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::tag(&self.inner)
+        <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::tag(
+            &self.inner,
+        )
     }
 
     fn state(&self) -> iced::advanced::widget::tree::State {
-        <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::state(&self.inner)
+        <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::state(
+            &self.inner,
+        )
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -158,7 +162,10 @@ where
     }
 
     fn diff(&self, tree: &mut Tree) {
-        <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::diff(&self.inner, tree)
+        <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::diff(
+            &self.inner,
+            tree,
+        )
     }
 
     fn operate(
