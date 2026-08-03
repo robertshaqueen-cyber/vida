@@ -225,6 +225,14 @@ pub enum SyncResult {
     /// 2. 提供「查看文件」按钮（调用系统文件管理器打开目录）
     /// 3. 提供「忽略」按钮（清除 SyncState，下次同步重新检测）
     ConflictFilesDetected { files: Vec<ConflictFile> },
+
+    /// Sync not configured — `Settings.sync_local_path` is `None`.
+    ///
+    /// # 调用方契约
+    ///
+    /// 向 UI 返回未配置状态，不执行任何文件操作。
+    /// GUI 应将同步按钮置为灰色，点击后跳转到设置的同步页。
+    SyncNotConfigured,
 }
 
 // ---------------------------------------------------------------------------

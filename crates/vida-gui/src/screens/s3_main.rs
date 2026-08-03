@@ -113,18 +113,28 @@ impl State {
             tooltip::Position::Bottom,
         );
         // Sync indicator: shows state (synced / local changes / syncing / error),
-        // click to trigger sync
-        let sync_btn = tooltip(
-            button(text(sync_symbol).size(14))
-                .on_press(AppMessage::SyncTriggered)
-                .style(if sync_symbol == "⟳" || sync_symbol == "▲" {
-                    button::secondary
-                } else {
-                    button::text
-                }),
-            text(sync_label),
-            tooltip::Position::Bottom,
-        );
+        // click to trigger sync; greyed out + tooltip when not configured
+        let sync_btn = if sync_symbol == "—" && sync_label == i18n.tr("sync_state_not_configured") {
+            tooltip(
+                button(text(sync_symbol).size(14))
+                    .on_press(AppMessage::OpenSettingsTab)
+                    .style(button::text),
+                text(sync_label),
+                tooltip::Position::Bottom,
+            )
+        } else {
+            tooltip(
+                button(text(sync_symbol).size(14))
+                    .on_press(AppMessage::SyncTriggered)
+                    .style(if sync_symbol == "⟳" || sync_symbol == "▲" {
+                        button::secondary
+                    } else {
+                        button::text
+                    }),
+                text(sync_label),
+                tooltip::Position::Bottom,
+            )
+        };
 
         let right_buttons = row![sync_btn, settings_btn, lock_btn]
             .spacing(4)

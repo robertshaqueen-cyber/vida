@@ -70,6 +70,8 @@ pub enum SyncState {
     /// Sync completed but requires user attention (conflict / conflict files /
     /// remote missing).
     NeedsAttention,
+    /// Sync not configured — sync_local_path is empty.
+    NotConfigured,
 }
 
 impl SyncState {
@@ -82,6 +84,7 @@ impl SyncState {
             SyncState::Syncing => "⟳",
             SyncState::Error => "✗",
             SyncState::NeedsAttention => "▲",
+            SyncState::NotConfigured => "—",
         }
     }
 
@@ -93,6 +96,7 @@ impl SyncState {
             SyncState::Syncing => i18n.tr("sync_state_syncing").to_string(),
             SyncState::Error => i18n.tr("sync_state_error").to_string(),
             SyncState::NeedsAttention => i18n.tr("sync_state_needs_attention").to_string(),
+            SyncState::NotConfigured => i18n.tr("sync_state_not_configured").to_string(),
         }
     }
 }
@@ -989,6 +993,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                             credential_copied: false,
                         });
                     }
+                }
+                "sync_not_configured" => {
+                    app.sync_state = SyncState::NotConfigured;
                 }
                 _ => {
                     app.sync_state = SyncState::Synced;

@@ -173,6 +173,7 @@ main_credential_auto_hide = "15 秒后自动隐藏"
 # ---- 同步状态 ----
 sync_state_unknown = "尚未同步，点击开始"
 sync_state_needs_attention = "需要处理，点击查看"
+sync_state_not_configured = "未配置同步，点击前往设置"
 
 # ---- S6 冲突差异 ----
 conflict_side_count = "主机数: {0}"

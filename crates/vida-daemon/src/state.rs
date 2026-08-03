@@ -103,10 +103,22 @@ impl DaemonState {
     }
 
     fn init_sync(&mut self) -> Result<()> {
-        let backend = Box::new(LocalPathBackend::new(
-            self.vault_path.parent().unwrap().to_path_buf(),
-        ));
-        self.sync = Some(SyncCoordinator::new(backend, self.vault_path.clone())?);
+        let sync_path = self
+            .vault
+            .as_ref()
+            .and_then(|v| v.settings.sync_local_path.as_deref());
+        match sync_path {
+            Some(path) if !path.is_empty() => {
+                let base = std::path::PathBuf::from(path);
+                let backend = Box::new(LocalPathBackend::new(base));
+                self.sync = Some(SyncCoordinator::new(backend, self.vault_path.clone())?);
+                info!("Sync initialized with path: {}", path);
+            }
+            _ => {
+                self.sync = None;
+                info!("Sync not configured (sync_local_path is empty)");
+            }
+        }
         Ok(())
     }
 
@@ -145,6 +157,8 @@ impl DaemonState {
         let ct = vida_core::vault::encrypt(vault, &passphrase)?;
         vida_core::persist::write_atomic(&vault_path, &ct)?;
         info!("Settings updated");
+        // Re-initialize sync based on new settings
+        self.init_sync()?;
         Ok(())
     }
 
@@ -244,6 +258,11 @@ impl DaemonState {
     // Sync ------------------------------------------------------------------
 
     pub async fn sync(&mut self) -> Result<(SyncResult, Option<Vec<HostSummary>>)> {
+        // Check if sync is configured before borrowing self.sync mutably
+        if self.sync.is_none() {
+            return Ok((SyncResult::SyncNotConfigured, None));
+        }
+
         let passphrase = self.ensure_passphrase()?.to_string();
         let vault = self.ensure_unlocked()?;
         let ct = vida_core::vault::encrypt(vault, &passphrase)?;
@@ -255,11 +274,7 @@ impl DaemonState {
             device_id,
         };
 
-        let sync = self
-            .sync
-            .as_mut()
-            .context(self.i18n.tr("daemon_sync_not_initialized"))?;
-        let result = sync.sync(&local).await?;
+        let result = self.sync.as_mut().unwrap().sync(&local).await?;
 
         let mut hosts_updated = false;
         match &result {
@@ -286,6 +301,7 @@ impl DaemonState {
             }
             SyncResult::RemoteMissing => info!("Remote vault missing, awaiting user action"),
             SyncResult::Uploaded { .. } | SyncResult::NoChange => {}
+            SyncResult::SyncNotConfigured => unreachable!("handled at top of sync()"),
         }
         let hosts = if hosts_updated {
             Some(self.list_hosts()?)
@@ -457,5 +473,40 @@ fn host_to_summary(h: &vida_core::vault::HostEntry) -> HostSummary {
             AuthMethod::KeyInline { .. } => "key_inline".to_string(),
         },
         notes: h.notes.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sync_not_configured_returns_sync_not_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_path = tmp.path().join("vault.age");
+
+        // Create and unlock a vault so passphrase + vault are available
+        let mut state = DaemonState {
+            token: "test".into(),
+            vault: None,
+            passphrase: None,
+            vault_path,
+            sync: None, // explicitly no sync
+            i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+        };
+
+        // Create vault + unlock so state has passphrase and vault
+        let passphrase = "test-passphrase";
+        state.create_vault(passphrase).unwrap();
+        state.lock();
+        state.unlock(passphrase, false).unwrap();
+
+        // sync should be None because sync_local_path defaults to None
+        assert!(state.sync.is_none());
+
+        // sync() must return SyncNotConfigured without any file I/O
+        let (result, hosts) = state.sync().await.unwrap();
+        assert!(matches!(result, SyncResult::SyncNotConfigured));
+        assert!(hosts.is_none());
     }
 }

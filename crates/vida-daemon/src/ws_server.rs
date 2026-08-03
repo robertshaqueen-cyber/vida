@@ -372,6 +372,7 @@ fn sync_status_string(result: &SyncResult) -> String {
         SyncResult::NoChange => "no_change".to_string(),
         SyncResult::RemoteMissing => "remote_missing".to_string(),
         SyncResult::ConflictFilesDetected { .. } => "conflict_files_detected".to_string(),
+        SyncResult::SyncNotConfigured => "sync_not_configured".to_string(),
     }
 }
 
