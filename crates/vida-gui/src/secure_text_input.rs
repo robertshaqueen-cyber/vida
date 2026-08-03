@@ -163,7 +163,17 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // Let inner widget handle the event (it will call shell.request_input_method())
+        // For IME events, block the inner widget from seeing them.
+        // When IME is enabled (e.g. during RedrawRequested), winit sends
+        // Ime::Preedit/Ime::Commit instead of Keyboard::KeyPressed.
+        // The inner text_input processes these and commits Chinese characters
+        // BEFORE our guard can disable IME. Blocking prevents the commit.
+        if let Event::InputMethod(_) = event {
+            *shell.input_method_mut() = InputMethod::Disabled;
+            return;
+        }
+
+        // Let inner widget handle non-IME events
         <text_input::TextInput<'a, Message> as Widget<Message, iced::Theme, iced::Renderer>>::update(
             &mut self.inner,
             tree,
@@ -176,31 +186,10 @@ where
             viewport,
         );
 
-        // Override IME to Disabled for keyboard/IME events only.
-        //
-        // Why input_method_mut() instead of request_input_method():
-        // Shell::merge() gives Enabled priority over Disabled — once any
-        // widget requests Enabled, Disabled via merge() is ignored.
-        // input_method_mut() is the only way to force Disabled.
-        //
-        // Why NOT RedrawRequested:
-        // During RedrawRequested, ALL visible text inputs process the event.
-        // If a non-secure input calls request_input_method(Enabled), the
-        // merge makes input_method = Enabled. Our Disabled write is then
-        // ignored by merge (Enabled wins). Writing Disabled here would
-        // override the non-secure input's request, breaking Chinese IME
-        // for all non-secure fields on the same screen.
-        //
-        // Why keyboard/IME events are safe:
-        // Keyboard events only reach the focused widget. IME commit
-        // (InputMethod::Commit) happens AFTER the corresponding keyboard
-        // event in winit's event ordering. So disabling IME during the
-        // keyboard event prevents the IME from committing Chinese characters.
-        match event {
-            Event::Keyboard(_) | Event::InputMethod(_) => {
-                *shell.input_method_mut() = InputMethod::Disabled;
-            }
-            _ => {}
+        // Disable IME for keyboard events (prevents IME from activating
+        // on the next RedrawRequested)
+        if let Event::Keyboard(_) = event {
+            *shell.input_method_mut() = InputMethod::Disabled;
         }
     }
 

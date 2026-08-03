@@ -173,15 +173,21 @@ secure 字段的 `Disabled` 写入被 merge 忽略（Enabled 优先）。无条�
 写入会覆盖非 secure 字段的请求，导致同屏所有非 secure 字段无法输入
 中文（S4 主机名、备注等）。
 
-**最终方案：仅 Keyboard/IME 事件时写入 Disabled**
+**最终方案：拦截 IME 事件 + Keyboard 事件禁用**
 
-- Keyboard 事件只到达 focused widget，不影响兄弟
-- winit 事件顺序：KeyboardEvent → Ime::Commit。在 Keyboard 事件时
-  禁用 IME，可阻止后续 Ime::Commit 提交中文字符到 secure 字段
-- RedrawRequested 不写入：让 text_input 正常设置 IME（非 secure 字段
-  需要 Enabled 以支持中文输入）
-- 副作用：secure 字段获得焦点后、首次按键前，IME 短暂启用。但此窗口
-  极短（用户需先点击字段再打字），且 Keyboard 事件立即禁用 IME
+1. **Ime::Preedit / Ime::Commit**：直接 return，不传递给 inner text_input。
+   阻止中文字符被提交到 secure 字段。同时写入 Disabled 防止后续 IME 事件。
+2. **Keyboard 事件**：传递给 inner text_input（处理 Backspace、Enter 等），
+   然后写入 Disabled。阻止 IME 在下次 RedrawRequested 时被重新激活。
+3. **RedrawRequested**：不写入 Disabled。非 secure 字段需要 Enabled 以支持
+   中文输入。secure 字段的 RedrawRequested 设置 Enabled，但 Keyboard 事件
+   会立即将其覆盖为 Disabled。
+
+**副作用**：
+- secure 字段无法通过 IME 输入中文（设计目标：口令应为 ASCII）
+- 含非拉丁字符的口令需通过 Cmd+V 粘贴（已记录在 SECURITY.md）
+- secure 字段获得焦点后首次按键前 IME 短暂启用，但 Keyboard 事件
+  立即禁用 IME，且 Ime::Preedit/Commit 被拦截不会提交字符
 
 ### classify_error 过渡方案
 
