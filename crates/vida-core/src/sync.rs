@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Regex patterns for conflict file detection (compiled once)
@@ -311,6 +311,8 @@ impl SyncBackend for LocalPathBackend {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
 
+        info!("Sync upload OK: {} ({} bytes)", target.display(), size);
+
         Ok(RemoteMeta {
             bytes_hash: hash,
             size,
@@ -350,6 +352,8 @@ impl SyncBackend for LocalPathBackend {
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
+
+        info!("Sync download OK: {} ({} bytes)", target.display(), size);
 
         Ok((
             data,
@@ -489,6 +493,10 @@ impl SyncCoordinator {
         };
 
         // Decision table
+        debug!(
+            "Sync decision: remote_exists={} remote_changed={} local_changed={}",
+            remote_exists, remote_changed, local_changed
+        );
         match (remote_exists, remote_changed, local_changed) {
             // Remote doesn't exist + local changed → upload
             (false, _, true) => {

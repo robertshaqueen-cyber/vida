@@ -163,3 +163,21 @@ export VIDA_CONFIG_DIR=/tmp/vida-sync
 3. **不要重启**，直接编辑任意一台主机并保存
 4. 再次同步 → 远端仍是远端版本 + 那一处编辑
 5. **关键断言**：本地旧数据（host-B）没有被写回——否则说明内存未替换
+
+### 场景 7：同步设置页 + 同步按钮
+
+```bash
+export VIDA_CONFIG_DIR=/tmp/vida-sync
+cargo run --release --bin vida-daemon &
+cargo run --release --bin vida
+#   → 解锁 → 打开设置 → 同步分区
+```
+
+验收点：
+1. 点击同步模式下拉 → 选择「本地文件夹」→ 预期看到路径输入框 + 选择文件夹按钮出现
+2. 点击「选择文件夹」→ 预期弹出系统文件夹对话框，选择后路径填入输入框
+3. 点击「常用位置：iCloud Drive」→ 预期路径变为 `~/Library/Mobile Documents/com~apple~CloudDocs/vida/`（不存在则创建）；未启用 iCloud 时显示错误提示
+4. 点击「常用位置：~」→ 预期路径变为用户主目录
+5. 切换回「不同步」→ 预期路径清空，保存后同步按钮显示「未配置同步」
+6. **关键断言（回归）**：点击同步按钮 → 无论当前显示什么状态，请求都会发出 —— daemon 日志出现 `Sync upload/download/decision` 记录；未配置同步时按钮点击也发出请求，由 daemon 返回 `sync_not_configured`，界面显示「未配置同步」而非跳转设置
+7. 保存路径后点同步 → daemon 日志出现 `Sync upload OK: <路径> (<字节> bytes)`，远端 `vault.age` 存在

@@ -217,3 +217,62 @@ iced 0.14 没有 CSS-like 的 keyframe 动画机制。实现抖动需要：
 充分传达，抖动是锦上添花。若未来 iced 支持声明式动画，可重新考虑。
 
 **硬性要求**: 若实现，驱动订阅只能在动画期间存在，做完报告空闲 CPU ≈ 0%。
+
+---
+
+## 同步假成功案 — GUI 本地推测状态构成死锁 (2026-08-05)
+
+**症状**: 76 个测试全部通过，但「点击同步按钮」这个最基本的路径是坏的。
+A 设备显示 ✓（假成功），B 设备点击跳转设置（假跳转），daemon 日志中
+Sync 请求从未到达。
+
+### 三个叠加的 bug
+
+1. **按钮依据本地状态决定是否发请求**（死锁）：
+   `view_tab_bar` 检测 `sync_state == NotConfigured`（本地推断）后，
+   把按钮的 `on_press` 替换成 `OpenSettingsTab`。sync_state 初始为
+   Unknown/NotConfigured，GUI 不请求 → 状态永远不更新 → 按钮永远
+   不发请求。A 与 B 显示不一致是因为 sync_state 到达该状态的本地
+   路径不同，而非配置差异。
+
+2. **本地写入假成功**：`DeleteHost` / `EditorSaved` 直接把 sync_state
+   设为 `LocalChanges`；而 `SyncCompleted` 的 fallback 分支（`_`）把
+   任何未识别状态设为 `Synced`。任何一条路径都能让界面显示 ✓ 而
+   daemon 一无所知。
+
+3. **测试绕过 GUI 消息层**：所有测试直接调用 `state.sync()`，
+   「按钮是否真的发出了请求」从未被验证。
+
+### 修正原则（已写入 AGENTS.md）
+
+- 同步按钮永远发送 Sync 请求，由 daemon 返回真实状态
+- `sync_state` 只能由服务端响应（SyncCompleted / WsError）更新，
+  删除本地推测写入（`LocalChanges` 变体整个移除）
+- 新增端到端测试 `sync_end_to_end_config_to_upload`：
+  update_settings 配置路径 → 添加主机 → state.sync() → 断言远端
+  文件存在且解密后包含该主机
+
+### 可复用的教训
+
+- **GUI 依据本地推测状态决定是否发送请求 = 死锁**。
+  状态类 UI 只能由服务端响应更新，不得本地推测。
+- **报告成功但什么都没做**（假 ✓）与「报告已实测但无人验证」同源：
+  都需要一个从用户操作到真实结果的完整路径测试。
+
+---
+
+## 同步远端文件时间线疑案 (2026-08-05)
+
+**症状**: `/tmp/vida-sync/vault.age` 的创建时间（18:58）晚于两台
+daemon 的最后一条日志（18:57），而 `init_sync()` 与
+`update_settings()` 均被确认只读、不会写入远端文件。文件来源无法
+从日志中定位——因为当时的同步路径完全没有日志。
+
+**处置**: 同步功能现已正常，不再追查。补上日志使同类情况可定位：
+- `LocalPathBackend::upload` 成功后 `info!`，记录目标路径与字节数
+- `LocalPathBackend::download` 成功后 `info!`，记录字节数
+- `SyncCoordinator::sync` 进入判定分支前 `debug!`，记录
+  `remote_exists / remote_changed / local_changed` 三个布尔值
+
+**教训**: 任何会改动远端文件的操作都必须有日志。没有日志的
+文件变动 = 无法归因的谜团，调试成本远高于补日志的成本。
