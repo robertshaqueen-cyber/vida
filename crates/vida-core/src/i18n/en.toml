@@ -70,6 +70,9 @@ settings_sync_explain = "Sync writes an encrypted copy of your vault to a local 
 settings_sync_pick_folder = "Choose folder"
 settings_sync_path = "Sync folder path"
 settings_sync_path_hint = "Enter a local folder path"
+settings_sync_quick_locations = "Quick:"
+settings_sync_icloud_not_found = "iCloud Drive not found. Enable it in System Settings."
+settings_sync_create_dir_failed = "Failed to create directory"
 settings_scrollback = "Scrollback lines"
 settings_language = "UI Language"
 settings_lang_system = "Follow system"
@@ -178,7 +181,7 @@ main_credential_auto_hide = "Auto-hides in 15 seconds"
 # ---- Sync state ----
 sync_state_unknown = "Not synced yet, click to start"
 sync_state_needs_attention = "Needs attention, click to review"
-sync_state_not_configured = "Sync not configured, click to set up"
+sync_state_not_configured = "Sync not configured"
 
 # ---- S6 conflict diff ----
 conflict_side_count = "Hosts: {0}"

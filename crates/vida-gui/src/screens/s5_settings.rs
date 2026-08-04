@@ -25,13 +25,49 @@ impl SyncMode {
     }
 }
 
-impl std::fmt::Display for SyncMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncMode::None => write!(f, "Disabled"),
-            SyncMode::Local => write!(f, "Local folder"),
+/// Wrapper that carries the i18n-translated label for pick_list display.
+#[derive(Debug, Clone)]
+pub struct SyncModeItem {
+    pub mode: SyncMode,
+    label: String,
+}
+
+impl SyncModeItem {
+    pub fn none(i18n: &I18n) -> Self {
+        Self {
+            mode: SyncMode::None,
+            label: i18n.tr("settings_sync_mode_none").to_string(),
         }
     }
+
+    pub fn local(i18n: &I18n) -> Self {
+        Self {
+            mode: SyncMode::Local,
+            label: i18n.tr("settings_sync_mode_local").to_string(),
+        }
+    }
+}
+
+impl PartialEq for SyncModeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl std::fmt::Display for SyncModeItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quick location shortcuts
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickLocation {
+    ICloud,
+    Home,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,12 +375,17 @@ impl State {
         // Explanation
         let explain = text(i18n.tr("settings_sync_explain")).size(12);
 
-        // Sync mode dropdown
+        // Sync mode dropdown (with i18n labels via SyncModeItem wrapper)
         let mode_label = text(i18n.tr("settings_sync_mode")).size(14);
-        let mode_options: Vec<SyncMode> = vec![SyncMode::None, SyncMode::Local];
+        let mode_options: Vec<SyncModeItem> =
+            vec![SyncModeItem::none(i18n), SyncModeItem::local(i18n)];
+        let selected_item = match self.sync_mode {
+            SyncMode::None => Some(SyncModeItem::none(i18n)),
+            SyncMode::Local => Some(SyncModeItem::local(i18n)),
+        };
         let mode_pick = pick_list(
             mode_options,
-            Some(self.sync_mode),
+            selected_item,
             AppMessage::SettingsSyncModeChanged,
         )
         .width(Length::Fill);
@@ -361,7 +402,26 @@ impl State {
                     .on_press(AppMessage::SettingsSyncPickFolder)
                     .width(Length::Shrink);
                 let path_row = row![path_input, pick_btn].spacing(8).width(Length::Fill);
-                column![path_label, path_row].spacing(4).into()
+
+                // Quick location shortcuts
+                let icloud_label = text("iCloud Drive").size(12);
+                let icloud_btn = button(icloud_label)
+                    .on_press(AppMessage::SettingsSyncQuickLocation(QuickLocation::ICloud))
+                    .style(button::text)
+                    .padding([2, 6]);
+                let home_label = text("~").size(12);
+                let home_btn = button(home_label)
+                    .on_press(AppMessage::SettingsSyncQuickLocation(QuickLocation::Home))
+                    .style(button::text)
+                    .padding([2, 6]);
+                let shortcuts_hint = text(i18n.tr("settings_sync_quick_locations")).size(11);
+                let shortcuts_row = row![shortcuts_hint, icloud_btn, home_btn]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center);
+
+                column![path_label, path_row, shortcuts_row]
+                    .spacing(4)
+                    .into()
             }
             SyncMode::None => text("").into(),
         };

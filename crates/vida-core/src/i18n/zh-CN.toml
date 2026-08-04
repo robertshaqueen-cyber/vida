@@ -70,6 +70,9 @@ settings_sync_explain = "同步会将金库的加密副本写入指定文件夹�
 settings_sync_pick_folder = "选择文件夹"
 settings_sync_path = "同步文件夹路径"
 settings_sync_path_hint = "填写本地文件夹路径"
+settings_sync_quick_locations = "常用位置："
+settings_sync_icloud_not_found = "未检测到 iCloud Drive，请在系统设置中启用"
+settings_sync_create_dir_failed = "创建文件夹失败"
 settings_scrollback = "回滚行数"
 settings_language = "界面语言"
 settings_lang_system = "跟随系统"
@@ -178,7 +181,7 @@ main_credential_auto_hide = "15 秒后自动隐藏"
 # ---- 同步状态 ----
 sync_state_unknown = "尚未同步，点击开始"
 sync_state_needs_attention = "需要处理，点击查看"
-sync_state_not_configured = "未配置同步，点击前往设置"
+sync_state_not_configured = "未配置同步"
 
 # ---- S6 冲突差异 ----
 conflict_side_count = "主机数: {0}"

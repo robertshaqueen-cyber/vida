@@ -167,9 +167,10 @@ pub enum AppMessage {
 
     // S5: Settings
     SettingsLoaded(serde_json::Value),
-    SettingsSyncModeChanged(crate::screens::s5_settings::SyncMode),
+    SettingsSyncModeChanged(crate::screens::s5_settings::SyncModeItem),
     SettingsSyncPathChanged(String),
     SettingsSyncPickFolder,
+    SettingsSyncQuickLocation(crate::screens::s5_settings::QuickLocation),
     SettingsScrollbackChanged(String),
     SettingsLanguageChanged(crate::screens::s5_settings::LangChoice),
     SettingsSectionChanged(crate::screens::s5_settings::SettingsSection),
@@ -1076,11 +1077,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
-        AppMessage::SettingsSyncModeChanged(mode) => {
+        AppMessage::SettingsSyncModeChanged(item) => {
             if let Some(s) = &mut app.settings_state {
                 use crate::screens::s5_settings::SyncMode;
-                s.sync_mode = mode;
-                match mode {
+                s.sync_mode = item.mode;
+                match item.mode {
                     SyncMode::None => {
                         s.sync_local_path.clear();
                     }
@@ -1098,6 +1099,37 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 && let Some(path) = handle.to_str()
             {
                 s.sync_local_path = path.to_string();
+                s.saved = false;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsSyncQuickLocation(loc) => {
+            if let Some(s) = &mut app.settings_state {
+                use crate::screens::s5_settings::QuickLocation;
+                let path = match loc {
+                    QuickLocation::ICloud => {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        let icloud_base = std::path::PathBuf::from(&home)
+                            .join("Library/Mobile Documents/com~apple~CloudDocs");
+                        if !icloud_base.exists() {
+                            s.error =
+                                Some(app.i18n.tr("settings_sync_icloud_not_found").to_string());
+                            return Task::none();
+                        }
+                        let vida_dir = icloud_base.join("vida");
+                        if let Err(e) = std::fs::create_dir_all(&vida_dir) {
+                            s.error = Some(format!(
+                                "{}: {}",
+                                app.i18n.tr("settings_sync_create_dir_failed"),
+                                e
+                            ));
+                            return Task::none();
+                        }
+                        vida_dir.to_str().unwrap_or_default().to_string()
+                    }
+                    QuickLocation::Home => std::env::var("HOME").unwrap_or_default(),
+                };
+                s.sync_local_path = path;
                 s.saved = false;
             }
             Task::none()
