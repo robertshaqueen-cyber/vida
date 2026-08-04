@@ -168,7 +168,6 @@ settings_terminal = "Terminal Settings"
 
 # ---- Sync state ----
 sync_state_synced = "Synced"
-sync_state_local_changes = "Local changes, click to sync"
 sync_state_syncing = "Syncing..."
 sync_state_error = "Sync failed, click to retry"
 

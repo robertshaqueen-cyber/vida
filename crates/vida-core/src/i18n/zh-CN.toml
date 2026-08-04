@@ -168,7 +168,6 @@ settings_terminal = "终端设置"
 
 # ---- 同步状态 ----
 sync_state_synced = "已同步"
-sync_state_local_changes = "有本地变更，点击同步"
 sync_state_syncing = "同步中..."
 sync_state_error = "同步出错，点击重试"
 

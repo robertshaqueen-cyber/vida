@@ -61,8 +61,6 @@ pub enum SyncState {
     Unknown,
     /// Last sync completed successfully.
     Synced,
-    /// Hosts changed locally; sync not yet run.
-    LocalChanges,
     /// Sync request in flight.
     Syncing,
     /// Last sync failed.
@@ -80,7 +78,6 @@ impl SyncState {
         match self {
             SyncState::Unknown => "—",
             SyncState::Synced => "✓",
-            SyncState::LocalChanges => "●",
             SyncState::Syncing => "⟳",
             SyncState::Error => "✗",
             SyncState::NeedsAttention => "▲",
@@ -92,7 +89,6 @@ impl SyncState {
         match self {
             SyncState::Unknown => i18n.tr("sync_state_unknown").to_string(),
             SyncState::Synced => i18n.tr("sync_state_synced").to_string(),
-            SyncState::LocalChanges => i18n.tr("sync_state_local_changes").to_string(),
             SyncState::Syncing => i18n.tr("sync_state_syncing").to_string(),
             SyncState::Error => i18n.tr("sync_state_error").to_string(),
             SyncState::NeedsAttention => i18n.tr("sync_state_needs_attention").to_string(),
@@ -613,8 +609,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::DeleteHost => {
-            // Local change: hosts modified, needs sync
-            app.sync_state = SyncState::LocalChanges;
             // Reload hosts after deletion
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -844,8 +838,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
         }
         AppMessage::EditorSaved => {
-            // Local change: hosts modified, needs sync
-            app.sync_state = SyncState::LocalChanges;
             // Close the editor tab and reload hosts
             let active_id = app.active_tab_id.clone();
             app.tabs.retain(|t| {
@@ -1034,9 +1026,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S5: Settings ----
         AppMessage::SettingsLoaded(val) => {
-            let mut settings = s5_settings::State::from_json(&val, &app.i18n);
-            // Connections list comes from the business data on VidaApp
-            settings.set_hosts(app.hosts.clone());
+            let settings = s5_settings::State::from_json(&val, &app.i18n);
             app.settings_state = Some(settings);
             Task::none()
         }
@@ -1428,7 +1418,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     }
                     TabKind::Settings => {
                         if let Some(settings) = &app.settings_state {
-                            settings.view(&app.i18n)
+                            settings.view(&app.i18n, &app.hosts)
                         } else {
                             text(app.i18n.tr("main_settings_loading")).into()
                         }
