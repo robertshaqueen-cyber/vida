@@ -980,10 +980,27 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     app.screen = Screen::RemoteMissing(s8_remote_missing::State::new());
                 }
                 "downloaded" => {
+                    use crate::screens::TabKind;
                     app.sync_state = SyncState::Synced;
-                    // Replace business data directly; no dependence on the
-                    // current screen (sync may have been triggered elsewhere).
                     app.hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
+                    // Rebuild host tabs so titles reflect renamed/deleted hosts
+                    let non_host_tabs: Vec<Tab> = app
+                        .tabs
+                        .iter()
+                        .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
+                        .cloned()
+                        .collect();
+                    let host_tabs: Vec<Tab> = app
+                        .hosts
+                        .iter()
+                        .map(|h| Tab::host(h.id.clone(), h.name.clone()))
+                        .collect();
+                    app.tabs = host_tabs;
+                    app.tabs.extend(non_host_tabs);
+                    if !app.tabs.iter().any(|t| t.id == app.active_tab_id) {
+                        app.active_tab_id =
+                            app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
+                    }
                     if !matches!(app.screen, Screen::Main(_)) {
                         app.screen = Screen::Main(s3_main::State {
                             revealed_credential: None,
