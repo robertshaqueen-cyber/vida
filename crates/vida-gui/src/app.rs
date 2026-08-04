@@ -229,6 +229,39 @@ fn new() -> (VidaApp, Task<AppMessage>) {
     (app, connect)
 }
 
+impl VidaApp {
+    /// Replace the host list AND rebuild host tabs from it.
+    ///
+    /// This is the ONLY entry point for modifying `app.hosts` — all other
+    /// callers (HostsLoaded, SyncCompleted downloaded) must route through
+    /// it so tab titles never drift from the host list.
+    fn set_hosts(&mut self, hosts: Vec<s3_main::HostItem>) {
+        use crate::screens::TabKind;
+        self.hosts = hosts;
+        // Preserve non-host tabs (settings, add host, edit host)
+        let non_host_tabs: Vec<Tab> = self
+            .tabs
+            .iter()
+            .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
+            .cloned()
+            .collect();
+        // Rebuild host tabs from the new list (names may have changed)
+        let host_tabs: Vec<Tab> = self
+            .hosts
+            .iter()
+            .map(|h| Tab::host(h.id.clone(), h.name.clone()))
+            .collect();
+        self.tabs = host_tabs;
+        self.tabs.extend(non_host_tabs);
+        // Preserve active tab if it still exists, else fall back to first
+        if !self.active_tab_id.is_empty() && self.tabs.iter().any(|t| t.id == self.active_tab_id) {
+            // Keep current active tab
+        } else {
+            self.active_tab_id = self.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
+        }
+    }
+}
+
 fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
     match message {
         // ---- Connection ----
@@ -533,33 +566,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S3: Main ----
         AppMessage::HostsLoaded(hosts) => {
-            use crate::screens::TabKind;
             // Business data lives on VidaApp so conflict/backup screens can
             // read it regardless of the current screen.
-            app.hosts = hosts;
-            // Preserve non-host tabs (settings, add host, edit host)
-            let non_host_tabs: Vec<Tab> = app
-                .tabs
-                .iter()
-                .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
-                .cloned()
-                .collect();
-            // Create tabs for hosts
-            let host_tabs: Vec<Tab> = app
-                .hosts
-                .iter()
-                .map(|h| Tab::host(h.id.clone(), h.name.clone()))
-                .collect();
-            // Merge: host tabs first, then non-host tabs
-            app.tabs = host_tabs;
-            app.tabs.extend(non_host_tabs);
-            // Preserve active tab if it still exists (e.g., Settings tab after re-entry)
-            if !app.active_tab_id.is_empty() && app.tabs.iter().any(|t| t.id == app.active_tab_id) {
-                // Keep current active tab
-            } else {
-                // Set active tab to first host, or first tab if no hosts
-                app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
-            }
+            app.set_hosts(hosts);
             app.screen = Screen::Main(s3_main::State {
                 revealed_credential: None,
                 credential_copied: false,
@@ -980,27 +989,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     app.screen = Screen::RemoteMissing(s8_remote_missing::State::new());
                 }
                 "downloaded" => {
-                    use crate::screens::TabKind;
                     app.sync_state = SyncState::Synced;
-                    app.hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
-                    // Rebuild host tabs so titles reflect renamed/deleted hosts
-                    let non_host_tabs: Vec<Tab> = app
-                        .tabs
-                        .iter()
-                        .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
-                        .cloned()
-                        .collect();
-                    let host_tabs: Vec<Tab> = app
-                        .hosts
-                        .iter()
-                        .map(|h| Tab::host(h.id.clone(), h.name.clone()))
-                        .collect();
-                    app.tabs = host_tabs;
-                    app.tabs.extend(non_host_tabs);
-                    if !app.tabs.iter().any(|t| t.id == app.active_tab_id) {
-                        app.active_tab_id =
-                            app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
-                    }
+                    // Replace business data + rebuild host tabs (names may
+                    // have changed on the remote side).
+                    app.set_hosts(val.get("hosts").map(parse_hosts).unwrap_or_default());
                     if !matches!(app.screen, Screen::Main(_)) {
                         app.screen = Screen::Main(s3_main::State {
                             revealed_credential: None,

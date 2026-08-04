@@ -276,3 +276,20 @@ daemon 的最后一条日志（18:57），而 `init_sync()` 与
 
 **教训**: 任何会改动远端文件的操作都必须有日志。没有日志的
 文件变动 = 无法归因的谜团，调试成本远高于补日志的成本。
+
+---
+
+## M1 跨层契约闭环 (2026-08-05)
+
+M1 跨层契约于 2026-08-05 全部闭环，实测通过场景 5/6：
+- daemon 层 4 条：Downloaded 写入+替换内存+更新 SyncState、
+  Conflict + resolve 替换内存、ConflictFilesDetected 返回列表、
+  RemoteMissing + 两个处置方向 —— 均已有实现+测试
+- GUI 层 3 条：Downloaded/Conflict resolve 后刷新列表、S7 冲突文件
+  采纳/忽略、S8 远端缺失两个处置按钮 —— 均已在界面实现
+- 场景 5 实测：双设备模拟，Downloaded 分支刷新 + 持久化 + 无重复下载
+- 场景 6 实测：冲突界面两侧列表正确；resolve_conflict_remote 后编辑
+  保存，本地旧数据未被写回（内存替换真实生效）
+
+AGENTS.md 中「跨层未完成契约」一节已删除（不再有未完成项）。
+M1 关闭。

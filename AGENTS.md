@@ -42,6 +42,9 @@ vida/
 - 例如主机详情视图要展示的凭据显示状态（revealed_credential）属于
   Main 屏幕的 UI 状态，留在 `s3_main::State`
 - 违反此约定会导致：非 Main 屏幕触发同步时冲突界面拿不到本地列表
+- **`app.hosts` 只能通过 `set_hosts()` 修改**（app.rs 中 VidaApp 的方法）。
+  `set_hosts` 会同时重建主机标签页标题；绕过它直接写 `app.hosts`
+  会导致 tab 标题与内容漂移（已发生：同步下载后 tab 名不更新）
 
 ## GUI 交互路径的验证
 
@@ -77,25 +80,6 @@ enum variant 形态变更，**必须在同一个提交内完成以下三件事**
 
 **版本快照测试** `version_snapshot`：序列化完整填充的 Vault，
 与当前版本号断言比对。结构一改此测试即失败，强制执行上述三步。
-
-## 跨层未完成契约
-
-### daemon 层（已完成）
-| 契约 | 状态 |
-|---|---|
-| Downloaded 写入+替换内存+更新 SyncState | ✅ 已实现+测试 |
-| Conflict + resolve 替换内存 | ✅ 已实现+测试 |
-| ConflictFilesDetected 返回文件列表 | ✅ 已实现+测试 |
-| RemoteMissing + 两个处置方向 | ✅ 已实现+测试 |
-
-### GUI 层（已完成）
-| 契约 | GUI 必须执行的动作 | 状态 |
-|---|---|---|
-| Downloaded / Conflict resolve | 收到 SyncResponse 后用其中的 hosts 刷新列表 | ✅ app.rs Downloaded handler 读取 val.get("hosts") 并更新列表 |
-| ConflictFilesDetected | 提示发现冲突文件，允许查看内容并选择采纳/忽略 | ✅ S7ConflictFileScreen 展示文件列表+pattern |
-| RemoteMissing | 提示远端文件缺失，提供「重新上传 / 清除同步状态」两个选项 | ✅ S8RemoteMissingScreen 两个按钮：handle_reupload / handle_clear_state |
-
-**本节已全部清空。M1 不再被跨层契约阻塞。**
 
 ## iced 版本锁定（强制）
 
