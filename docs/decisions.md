@@ -293,3 +293,218 @@ M1 跨层契约于 2026-08-05 全部闭环，实测通过场景 5/6：
 
 AGENTS.md 中「跨层未完成契约」一节已删除（不再有未完成项）。
 M1 关闭。
+
+---
+
+## M2a-0 alacritty_terminal 0.26 API 实测 (2026-08-05)
+
+> 通过 `crates/vida-daemon/examples/term_probe.rs` 编译运行实测，
+> 不是读文档的推断。运行：`cargo run -p vida-daemon --example term_probe`。
+
+### 依赖
+
+```toml
+alacritty_terminal = "0.26.0"
+```
+`alacritty_terminal::vte` 是 re-export（lib.rs: `pub use vte;`），
+无需单独引入 vte crate。vte 0.15.0 随 0.26.0 一起锁定。
+
+### Term 构造
+
+```rust
+// 实际签名（term/mod.rs:410）
+pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T>
+
+// 用法
+use alacritty_terminal::event::VoidListener;
+let mut term: Term<VoidListener> = Term::new(config, &size, VoidListener);
+```
+
+- `Config`：`term::Config`，公开字段 `scrolling_history: usize`
+  （**默认 10000**，注意与金库默认 5000 不同，接入时须显式设置）。
+  其他字段：default_cursor_style / vi_mode_cursor_style /
+  semantic_escape_chars / kitty_keyboard / osc52，均取默认即可。
+- `Dimensions` trait（grid/mod.rs:486）：需实现 `total_lines()` /
+  `screen_lines()` / `columns()`，其余有默认实现。探针自定义了
+  `ProbeSize { cols, rows }` 结构体实现。
+- listener：`event::VoidListener`（event.rs:108），空实现。
+
+### Processor
+
+```rust
+// vte 0.15.0 / ansi.rs:271
+pub struct Processor<T: Timeout = StdSyncHandler> { ... }
+
+// 用法（注意：有默认类型参数但仍需显式标注，否则 E0283）
+use alacritty_terminal::vte::ansi::Processor;
+let mut processor: Processor<alacritty_terminal::vte::ansi::StdSyncHandler> =
+    Processor::new();
+processor.advance(&mut term, bytes);  // vte 0.15 lib.rs:109
+```
+
+`advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8])`。
+`Term<T>` 实现了 `Handler`（term/mod.rs:1059），`Handler: Perform`，
+所以 `processor.advance(&mut term, bytes)` 直接可用。
+
+### grid 遍历与 Cell
+
+```rust
+use alacritty_terminal::grid::Dimensions;  // 提供 last_column() 等
+
+// 视口遍历（grid/mod.rs:422）—— 从历史顶部到屏幕底部，跳过滚动回看
+for indexed in term.grid().display_iter() {
+    let point = indexed.point;   // Point<Line, Column>
+    let cell: &Cell = indexed.cell;
+    print!("{}", cell.c);
+}
+
+// Cell（term/cell.rs:134）
+pub struct Cell {
+    pub c: char,          // 主字符（默认 ' '）
+    pub fg: Color,        // 默认 Named(Foreground)
+    pub bg: Color,        // 默认 Named(Background)
+    pub flags: Flags,     // bitflags，见下
+    pub extra: Option<Arc<CellExtra>>,  // zerowidth 字符、hyperlink
+}
+```
+
+- `Flags`（term/cell.rs:15）：BOLD / ITALIC / UNDERLINE / WRAPLINE /
+  WIDE_CHAR / WIDE_CHAR_SPACER / DIM / HIDDEN / STRIKEOUT /
+  LEADING_WIDE_CHAR_SPACER / DOUBLE_UNDERLINE / UNDERCURL / DOTTED /
+  DASHED。**宽字符用 `Flags::WIDE_CHAR` 标记，第二个 cell 是
+  `WIDE_CHAR_SPACER`** —— 推送协议须带上 wide 标志（M2a 陷阱 #8）。
+- `Color`（vte 0.15 ansi.rs:1128）：
+
+```rust
+pub enum Color {
+    Named(NamedColor),   // 16 色语义名（Foreground/Background/Red/...）
+    Spec(Rgb),           // 24 位真彩色
+    Indexed(u8),         // 256 色索引
+}
+```
+
+- **实测 size**：`size_of::<Cell>() = 24`，`size_of::<Color>() = 4`，
+  `size_of::<Colors>() = 1076`（Colors 是 16 色表，推送无需带）。
+
+### 光标
+
+```rust
+let cursor = term.grid().cursor.point;   // grid/mod.rs:113 pub cursor
+// Point { line: Line(i32), column: Column(usize) }
+// 行号从 0 开始，line.0 可能为负（显示偏移时）
+```
+
+### 增量脏行接口：存在（damage）
+
+**结论：alacritty_terminal 自带 damage 接口，M2a-2 优先使用，不做全量 diff。**
+
+```rust
+// term/mod.rs:458
+#[must_use]
+pub fn damage(&mut self) -> TermDamage<'_>;
+pub fn reset_damage(&mut self);   // 读完后必须调用
+
+pub enum TermDamage<'a> {
+    Full,                                  // 整个终端损坏（初始状态/resize/插入模式）
+    Partial(TermDamageIterator<'a>),       // 脏行迭代器
+}
+// TermDamageIterator 的 Item = LineDamageBounds { line: usize, left: usize, right: usize }
+```
+
+**实测行为**：
+- 构造后第一次 `damage()` 返回 `Full`（初始即全损坏）
+- `reset_damage()` 后再 `damage()` 且无写入 → `Partial([])`（实际输出 `Partial([(3,19,19)])`，是旧光标点）
+- 写入 "write on row 0\r\n" 后 → `Partial([(3, 0, 33), (4, 0, 0)])`：
+  行 3 的 0..=33 列 + 新光标所在行 4 被精确标记。**行列范围就是
+  增量推送的输入，无需自己做 diff。**
+
+注意：`damage()` 是 `&mut self`，且 `TermDamage` 借用 term，
+必须在一个作用域内迭代完（或 collect 后释放）再调用 `reset_damage()`。
+
+### resize
+
+```rust
+// term/mod.rs:655
+pub fn resize<S: Dimensions>(&mut self, size: S);
+```
+实测：80×24 → 40×12 正常收缩，无 panic。resize 同时作用于
+grid、inactive_grid、damage 状态。dimensions 不变时提前返回。
+M2a-2 中 PTY 侧 ioctl 与 Term::resize 必须成对调用（陷阱 #5）。
+
+### 换行行为（探针意外发现）
+
+`Term` 的 `linefeed`（term/mod.rs:1423）**只下移不回车**——
+探针输入 `line three\nline four` 后 "line four" 落在第 3 行第 10 列
+（继承 `line three` 的光标列）。这是 VT 标准语义（LF 与 CR 分离），
+真实 shell 输出都是 `\r\n`，不会触发此问题。daemon 侧无需处理，
+但推送协议按 cell 位置发送，天然不受影响。
+
+### 滚动回看容量
+
+`Config.scrolling_history`（默认 10000）。M2a-2 接入时须从金库
+`Settings.scrollback_lines`（默认 3000，见结论 2）读取并显式设置。
+`Term::resize` 不改变历史容量；`Term::new` 时由
+`config.scrolling_history` 决定（term/mod.rs:414）。
+
+### 对 M2a-2 推送协议的影响
+
+1. **damage 直接提供脏行区间**：每帧
+   `term.damage()` → 遍历 `LineDamageBounds` → 对每个脏行的
+   left..=right 列做 RLE → 推送。不需要行哈希 diff。
+2. `TermDamage::Full` 出现时（resize/初始/插入模式）推送整屏。
+3. 光标从 `term.grid().cursor.point` 读取，每帧必推。
+4. wide 标志直接来自 `Cell.flags`（WIDE_CHAR），协议 flags 字段
+   已预留 wide 位（规格 5.4 的 flags: u8）。
+
+### 结论 1：damage 提供「行 + 列范围」，推送协议按列区间发送
+
+检查点 A 实测：`Partial([(5, 0, 25), (6, 0, 0)])` = (行号, 起始列, 结束列)。
+
+推送协议据此调整——**不必发送整行，只发送 damage 报告的列区间**。
+M2a-2 的帧格式改为：
+
+```
+[seq: u64 BE]                        // 单调递增，检测丢帧
+[cursor_row: u16][cursor_col: u16][cursor_visible: u8]
+[line_count: u16]
+  每行：
+    [row: u16][start_col: u16][end_col: u16][run_count: u16]
+      每个 run：
+        [run_len: u16]
+        [flags: u8]                  // bold/italic/underline/reverse/... + wide
+        [fg_tag: u8][fg payload]     // 0x00 默认(0字节) / 0x01 索引(1字节) / 0x02 RGB(3字节)
+        [bg_tag: u8][bg payload]
+        [char_len: u8][char bytes]   // UTF-8，run 内所有 cell 同字符时才合并
+```
+
+RLE 只覆盖 `start_col..=end_col` 区间。相比整行发送，yes/htop 这类
+高频局部刷新场景的带宽显著降低。
+
+**reset 时机**：每次推送完成后必须调用 `term.reset_damage()`，否则脏区
+累积，下次推送会重复发送旧行。`damage()` 与 `reset_damage()` 是成对操作。
+
+**要求测试**（M2a-2 实现时）：连续两次写入之间调用 `reset_damage()`，
+断言第二次 `damage()` 不包含第一次写入的行。
+
+### 结论 2：scrollback 默认值 5000 → 3000
+
+`size_of::<Cell>() = 24` 实测。5000 行 × 200 列 × 24 字节 = 24 MB，
+超出「每标签增量 < 20 MB」目标。Cell 内部布局已紧凑
+（char 4 + fg 4 + bg 4 + flags 4 + Option<Arc> 8），无压缩空间。
+
+**决定**：`Settings.scrollback_lines` 默认值从 5000 改为 **3000**。
+3000 × 200 × 24 = 14.4 MB，留出余量给 Grid 的行索引开销。
+
+- 属于 Settings 默认值变更，不改变结构，**不需要升 vault version**
+- 设置页「回滚行数」默认显示同步更新，字段下方加说明：
+  「每 1000 行约占用 5 MB 内存」
+- docs/development.md 内存指标一节写明换算关系
+
+### 结论 3：Config::scrolling_history 必须显式设置
+
+`Config::scrolling_history` 默认 10000（alacritty 的默认值），
+与金库默认 3000 不同。M2a-2 接入时**不得使用 `Config::default()`**，
+必须显式设置为 `Settings.scrollback_lines`。
+
+**要求测试**（M2a-2 实现时）：断言 Term 构造时使用的
+`scrolling_history` 等于金库设置值。

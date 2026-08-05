@@ -113,6 +113,8 @@ pub struct Settings {
     /// Local folder path for LocalPath sync backend.
     /// `None` = sync disabled. `Some(path)` = sync via this folder.
     pub sync_local_path: Option<String>,
+    /// 回滚行数。默认 3000：3000×200列×24字节(Cell) ≈ 14.4MB。
+    /// 用户可调高，每 1000 行约 5MB 内存。
     pub scrollback_lines: usize,
 }
 
@@ -124,7 +126,7 @@ impl Default for Settings {
             s3_access_key: None,
             s3_secret_key: None,
             sync_local_path: None,
-            scrollback_lines: 5000,
+            scrollback_lines: 3000,
         }
     }
 }

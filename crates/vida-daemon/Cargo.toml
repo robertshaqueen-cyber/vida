@@ -24,6 +24,7 @@ scopeguard = "1"
 secrecy.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+alacritty_terminal = "0.26.0"
 
 [dev-dependencies]
 tempfile = "3"
