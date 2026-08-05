@@ -117,22 +117,23 @@ fn count_style_cells(term: &Term<VoidListener>) -> usize {
         .count()
 }
 
-/// 原地重绘：清屏 → 逐行 grid → 光标定位。
+/// 原地重绘：光标归位 → 逐行 grid（每行 \x1b[K 清到行尾，不残留
+/// 上一帧字符，省掉整屏 2J）→ 光标定位。行数 = grid 行数，不多不少。
 fn redraw(term: &Term<VoidListener>) {
     let mut out = String::with_capacity(4 * 1024);
-    out.push_str("\x1b[H\x1b[2J");
+    out.push_str("\x1b[H");
     let mut current_row: i32 = i32::MIN;
     for indexed in term.grid().display_iter() {
         let point = indexed.point;
         if point.line.0 != current_row {
             if current_row != i32::MIN {
-                out.push_str("\r\n");
+                out.push_str("\x1b[K\r\n");
             }
             current_row = point.line.0;
         }
         out.push(indexed.cell.c);
     }
-    out.push_str("\r\n");
+    out.push_str("\x1b[K"); // 最后一行清到行尾（不换行）
     // 光标定位（ANSI 1-based，grid 内 0-based）
     let cursor = term.grid().cursor.point;
     out.push_str(&format!(
@@ -247,16 +248,22 @@ fn main() -> Result<()> {
     // PTY 输出直到 OutputClosed（shell 真正退出），避免子进程
     // 因 stdout 缓冲阻塞而永远不退出。
     let mut exit_requested = false;
-    // 待喂给 Processor 的积压字节（16ms 限频合并）
-    let mut pending: Vec<u8> = Vec::new();
+    // 绘制限频状态：Term 处理（advance）不限频，只有绘制限频。
+    // dirty = 有内容变化但尚未重绘（16ms 间隔内合并）。
+    let mut dirty = false;
     let mut last_redraw = Instant::now() - REDRAW_INTERVAL;
 
+    // ---- 启动即绘制：空网格 + 提示行（让用户知道程序已在运行）----
+    redraw(&term);
+
     while !pty_closed {
-        // 限频轮询：等 8ms 收集更多输出，或直接收事件
-        let ev = rx.recv_timeout(Duration::from_millis(8));
+        // 带超时轮询：超时 ≤ 16ms，保证超时返回时能补一次重绘
+        let ev = rx.recv_timeout(REDRAW_INTERVAL);
         match ev {
             Ok(Ev::Output(bytes)) => {
-                pending.extend_from_slice(&bytes);
+                // 处理不限频：立即喂给 Processor
+                processor.advance(&mut term, &bytes);
+                dirty = true;
             }
             Ok(Ev::Input(bytes)) => {
                 // Ctrl+] = 退出程序（不转发给 PTY）
@@ -286,23 +293,21 @@ fn main() -> Result<()> {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // 无事件：继续（限频重绘逻辑处理 pending）
+                // 无事件：dirty 且已过间隔则补一次重绘
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break, // 所有发送端关闭
         }
 
-        // 限频重绘：≥16ms 且有待处理字节
-        if last_redraw.elapsed() >= REDRAW_INTERVAL && !pending.is_empty() {
-            processor.advance(&mut term, &pending);
-            pending.clear();
+        // 绘制限频：≥16ms 且有变化才重绘
+        if dirty && last_redraw.elapsed() >= REDRAW_INTERVAL {
             redraw(&term);
             last_redraw = Instant::now();
+            dirty = false;
         }
     }
 
-    // ---- 7. 最后一次重绘（flush 残留输出）+ 统计 ----
-    if !pending.is_empty() {
-        processor.advance(&mut term, &pending);
+    // ---- 7. 最后补一次重绘（把最终状态画出来）+ 统计 ----
+    if dirty {
         redraw(&term);
     }
     say(&format!(
