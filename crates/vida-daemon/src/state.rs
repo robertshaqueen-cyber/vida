@@ -596,8 +596,10 @@ mod tests {
         // Set initial sync path
         let path_a = tmp.path().join("path_a");
         std::fs::create_dir_all(&path_a).unwrap();
-        let mut settings = Settings::default();
-        settings.sync_local_path = Some(path_a.to_str().unwrap().to_string());
+        let mut settings = Settings {
+            sync_local_path: Some(path_a.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
         state.update_settings(settings.clone()).unwrap();
 
         // Verify sync_state.json was cleared when switching paths
@@ -635,8 +637,10 @@ mod tests {
         state.unlock("pass", false).unwrap();
 
         // Set sync_local_path to the vault directory itself
-        let mut settings = Settings::default();
-        settings.sync_local_path = Some(tmp.path().to_str().unwrap().to_string());
+        let settings = Settings {
+            sync_local_path: Some(tmp.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        };
 
         let err = state.update_settings(settings).unwrap_err();
         let msg = format!("{}", err);
@@ -664,8 +668,10 @@ mod tests {
         state.lock();
         state.unlock("pass", false).unwrap();
 
-        let mut settings = Settings::default();
-        settings.sync_local_path = Some("/nonexistent/path/abc123".into());
+        let settings = Settings {
+            sync_local_path: Some("/nonexistent/path/abc123".into()),
+            ..Default::default()
+        };
 
         let err = state.update_settings(settings).unwrap_err();
         let msg = format!("{}", err);
@@ -697,8 +703,10 @@ mod tests {
         state.lock();
         state.unlock("pass", false).unwrap();
 
-        let mut settings = Settings::default();
-        settings.sync_local_path = Some(file_path.to_str().unwrap().to_string());
+        let settings = Settings {
+            sync_local_path: Some(file_path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
 
         let err = state.update_settings(settings).unwrap_err();
         assert!(format!("{}", err).contains("不是文件夹"));
@@ -726,8 +734,10 @@ mod tests {
         let symlink_path = tmp.path().join("sync_link");
         std::os::unix::fs::symlink(tmp.path(), &symlink_path).unwrap();
 
-        let mut settings = Settings::default();
-        settings.sync_local_path = Some(symlink_path.to_str().unwrap().to_string());
+        let settings = Settings {
+            sync_local_path: Some(symlink_path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
 
         let err = state.update_settings(settings).unwrap_err();
         let msg = format!("{}", err);
