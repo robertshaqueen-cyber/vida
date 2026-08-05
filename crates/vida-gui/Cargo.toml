@@ -18,10 +18,11 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+rfd = "0.17"
 
 [dependencies.iced]
-version = "0.14"
-features = ["tokio", "wgpu"]
+version = "= 0.14.0"
+features = ["tokio", "wgpu", "advanced"]
 
 [dev-dependencies]
 winit = "0.30"

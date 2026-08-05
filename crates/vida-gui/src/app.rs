@@ -61,8 +61,6 @@ pub enum SyncState {
     Unknown,
     /// Last sync completed successfully.
     Synced,
-    /// Hosts changed locally; sync not yet run.
-    LocalChanges,
     /// Sync request in flight.
     Syncing,
     /// Last sync failed.
@@ -70,6 +68,8 @@ pub enum SyncState {
     /// Sync completed but requires user attention (conflict / conflict files /
     /// remote missing).
     NeedsAttention,
+    /// Sync not configured — sync_local_path is empty.
+    NotConfigured,
 }
 
 impl SyncState {
@@ -78,10 +78,10 @@ impl SyncState {
         match self {
             SyncState::Unknown => "—",
             SyncState::Synced => "✓",
-            SyncState::LocalChanges => "●",
             SyncState::Syncing => "⟳",
             SyncState::Error => "✗",
             SyncState::NeedsAttention => "▲",
+            SyncState::NotConfigured => "—",
         }
     }
 
@@ -89,10 +89,10 @@ impl SyncState {
         match self {
             SyncState::Unknown => i18n.tr("sync_state_unknown").to_string(),
             SyncState::Synced => i18n.tr("sync_state_synced").to_string(),
-            SyncState::LocalChanges => i18n.tr("sync_state_local_changes").to_string(),
             SyncState::Syncing => i18n.tr("sync_state_syncing").to_string(),
             SyncState::Error => i18n.tr("sync_state_error").to_string(),
             SyncState::NeedsAttention => i18n.tr("sync_state_needs_attention").to_string(),
+            SyncState::NotConfigured => i18n.tr("sync_state_not_configured").to_string(),
         }
     }
 }
@@ -129,7 +129,8 @@ pub enum AppMessage {
     UnlockRememberToggled(bool),
     UnlockVault,
     UnlockSuccess,
-    UnlockFailed(String),
+    UnlockFailed(String, Option<String>), // (message, category)
+    UnlockToastHide,
 
     // S3: Main
     HostsLoaded(Vec<s3_main::HostItem>),
@@ -162,7 +163,10 @@ pub enum AppMessage {
 
     // S5: Settings
     SettingsLoaded(serde_json::Value),
+    SettingsSyncModeChanged(crate::screens::s5_settings::SyncModeItem),
     SettingsSyncPathChanged(String),
+    SettingsSyncPickFolder,
+    SettingsSyncQuickLocation(crate::screens::s5_settings::QuickLocation),
     SettingsScrollbackChanged(String),
     SettingsLanguageChanged(crate::screens::s5_settings::LangChoice),
     SettingsSectionChanged(crate::screens::s5_settings::SettingsSection),
@@ -223,6 +227,39 @@ fn new() -> (VidaApp, Task<AppMessage>) {
     );
 
     (app, connect)
+}
+
+impl VidaApp {
+    /// Replace the host list AND rebuild host tabs from it.
+    ///
+    /// This is the ONLY entry point for modifying `app.hosts` — all other
+    /// callers (HostsLoaded, SyncCompleted downloaded) must route through
+    /// it so tab titles never drift from the host list.
+    fn set_hosts(&mut self, hosts: Vec<s3_main::HostItem>) {
+        use crate::screens::TabKind;
+        self.hosts = hosts;
+        // Preserve non-host tabs (settings, add host, edit host)
+        let non_host_tabs: Vec<Tab> = self
+            .tabs
+            .iter()
+            .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
+            .cloned()
+            .collect();
+        // Rebuild host tabs from the new list (names may have changed)
+        let host_tabs: Vec<Tab> = self
+            .hosts
+            .iter()
+            .map(|h| Tab::host(h.id.clone(), h.name.clone()))
+            .collect();
+        self.tabs = host_tabs;
+        self.tabs.extend(non_host_tabs);
+        // Preserve active tab if it still exists, else fall back to first
+        if !self.active_tab_id.is_empty() && self.tabs.iter().any(|t| t.id == self.active_tab_id) {
+            // Keep current active tab
+        } else {
+            self.active_tab_id = self.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
+        }
+    }
 }
 
 fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
@@ -349,6 +386,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::UnlockPassphraseChanged(p) => {
             if let Screen::Unlock(s) = &mut app.screen {
                 s.passphrase = p;
+                // Clear error and hide toast when user starts typing
+                s.error = None;
+                s.error_category = None;
+                s.toast_visible = false;
             }
             Task::none()
         }
@@ -369,7 +410,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     async move {
                         match client.unlock(&passphrase, remember).await {
                             Ok(_) => AppMessage::UnlockSuccess,
-                            Err(e) => AppMessage::UnlockFailed(e.to_string()),
+                            Err(e) => AppMessage::UnlockFailed(e.message, e.category),
                         }
                     },
                     |r| r,
@@ -378,10 +419,33 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 Task::none()
             }
         }
-        AppMessage::UnlockFailed(e) => {
+        AppMessage::UnlockFailed(msg, category) => {
             if let Screen::Unlock(s) = &mut app.screen {
                 s.unlocking = false;
-                s.error = Some(e);
+                s.error = Some(msg);
+                s.error_category = category;
+                s.toast_visible = true;
+            }
+            // Focus password input and select all text for easy re-input
+            use iced::widget::Id;
+            let id = Id::from(crate::screens::s2_unlock::UNLOCK_PASSPHRASE_ID);
+            let focus =
+                iced::widget::operation::focus::<AppMessage>(id.clone()).map(|_| unreachable!());
+            let select =
+                iced::widget::operation::select_all::<AppMessage>(id).map(|_| unreachable!());
+            // Auto-hide toast after 3 seconds
+            let toast_hide = Task::perform(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    AppMessage::UnlockToastHide
+                },
+                |r| r,
+            );
+            Task::batch([focus, select, toast_hide])
+        }
+        AppMessage::UnlockToastHide => {
+            if let Screen::Unlock(s) = &mut app.screen {
+                s.toast_visible = false;
             }
             Task::none()
         }
@@ -502,33 +566,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S3: Main ----
         AppMessage::HostsLoaded(hosts) => {
-            use crate::screens::TabKind;
             // Business data lives on VidaApp so conflict/backup screens can
             // read it regardless of the current screen.
-            app.hosts = hosts;
-            // Preserve non-host tabs (settings, add host, edit host)
-            let non_host_tabs: Vec<Tab> = app
-                .tabs
-                .iter()
-                .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
-                .cloned()
-                .collect();
-            // Create tabs for hosts
-            let host_tabs: Vec<Tab> = app
-                .hosts
-                .iter()
-                .map(|h| Tab::host(h.id.clone(), h.name.clone()))
-                .collect();
-            // Merge: host tabs first, then non-host tabs
-            app.tabs = host_tabs;
-            app.tabs.extend(non_host_tabs);
-            // Preserve active tab if it still exists (e.g., Settings tab after re-entry)
-            if !app.active_tab_id.is_empty() && app.tabs.iter().any(|t| t.id == app.active_tab_id) {
-                // Keep current active tab
-            } else {
-                // Set active tab to first host, or first tab if no hosts
-                app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
-            }
+            app.set_hosts(hosts);
             app.screen = Screen::Main(s3_main::State {
                 revealed_credential: None,
                 credential_copied: false,
@@ -578,8 +618,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::DeleteHost => {
-            // Local change: hosts modified, needs sync
-            app.sync_state = SyncState::LocalChanges;
             // Reload hosts after deletion
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -809,8 +847,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
         }
         AppMessage::EditorSaved => {
-            // Local change: hosts modified, needs sync
-            app.sync_state = SyncState::LocalChanges;
             // Close the editor tab and reload hosts
             let active_id = app.active_tab_id.clone();
             app.tabs.retain(|t| {
@@ -954,15 +990,18 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 }
                 "downloaded" => {
                     app.sync_state = SyncState::Synced;
-                    // Replace business data directly; no dependence on the
-                    // current screen (sync may have been triggered elsewhere).
-                    app.hosts = val.get("hosts").map(parse_hosts).unwrap_or_default();
+                    // Replace business data + rebuild host tabs (names may
+                    // have changed on the remote side).
+                    app.set_hosts(val.get("hosts").map(parse_hosts).unwrap_or_default());
                     if !matches!(app.screen, Screen::Main(_)) {
                         app.screen = Screen::Main(s3_main::State {
                             revealed_credential: None,
                             credential_copied: false,
                         });
                     }
+                }
+                "sync_not_configured" => {
+                    app.sync_state = SyncState::NotConfigured;
                 }
                 _ => {
                     app.sync_state = SyncState::Synced;
@@ -996,9 +1035,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S5: Settings ----
         AppMessage::SettingsLoaded(val) => {
-            let mut settings = s5_settings::State::from_json(&val, &app.i18n);
-            // Connections list comes from the business data on VidaApp
-            settings.set_hosts(app.hosts.clone());
+            let settings = s5_settings::State::from_json(&val, &app.i18n);
             app.settings_state = Some(settings);
             Task::none()
         }
@@ -1036,6 +1073,63 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 s.active_section = section;
                 s.saved = false;
                 s.error = None;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsSyncModeChanged(item) => {
+            if let Some(s) = &mut app.settings_state {
+                use crate::screens::s5_settings::SyncMode;
+                s.sync_mode = item.mode;
+                match item.mode {
+                    SyncMode::None => {
+                        s.sync_local_path.clear();
+                    }
+                    SyncMode::Local => {
+                        // Keep existing path if any
+                    }
+                }
+                s.saved = false;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsSyncPickFolder => {
+            if let Some(s) = &mut app.settings_state
+                && let Some(handle) = rfd::FileDialog::new().pick_folder()
+                && let Some(path) = handle.to_str()
+            {
+                s.sync_local_path = path.to_string();
+                s.saved = false;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsSyncQuickLocation(loc) => {
+            if let Some(s) = &mut app.settings_state {
+                use crate::screens::s5_settings::QuickLocation;
+                let path = match loc {
+                    QuickLocation::ICloud => {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        let icloud_base = std::path::PathBuf::from(&home)
+                            .join("Library/Mobile Documents/com~apple~CloudDocs");
+                        if !icloud_base.exists() {
+                            s.error =
+                                Some(app.i18n.tr("settings_sync_icloud_not_found").to_string());
+                            return Task::none();
+                        }
+                        let vida_dir = icloud_base.join("vida");
+                        if let Err(e) = std::fs::create_dir_all(&vida_dir) {
+                            s.error = Some(format!(
+                                "{}: {}",
+                                app.i18n.tr("settings_sync_create_dir_failed"),
+                                e
+                            ));
+                            return Task::none();
+                        }
+                        vida_dir.to_str().unwrap_or_default().to_string()
+                    }
+                    QuickLocation::Home => std::env::var("HOME").unwrap_or_default(),
+                };
+                s.sync_local_path = path;
+                s.saved = false;
             }
             Task::none()
         }
@@ -1333,7 +1427,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     }
                     TabKind::Settings => {
                         if let Some(settings) = &app.settings_state {
-                            settings.view(&app.i18n)
+                            settings.view(&app.i18n, &app.hosts)
                         } else {
                             text(app.i18n.tr("main_settings_loading")).into()
                         }

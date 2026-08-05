@@ -112,8 +112,8 @@ impl State {
             i18n.tr("main_tab_lock"),
             tooltip::Position::Bottom,
         );
-        // Sync indicator: shows state (synced / local changes / syncing / error),
-        // click to trigger sync
+        // Sync indicator: always sends SyncTriggered on click.
+        // Daemon returns real state (including sync_not_configured).
         let sync_btn = tooltip(
             button(text(sync_symbol).size(14))
                 .on_press(AppMessage::SyncTriggered)

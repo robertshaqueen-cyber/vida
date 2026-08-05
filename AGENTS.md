@@ -42,6 +42,21 @@ vida/
 - 例如主机详情视图要展示的凭据显示状态（revealed_credential）属于
   Main 屏幕的 UI 状态，留在 `s3_main::State`
 - 违反此约定会导致：非 Main 屏幕触发同步时冲突界面拿不到本地列表
+- **`app.hosts` 只能通过 `set_hosts()` 修改**（app.rs 中 VidaApp 的方法）。
+  `set_hosts` 会同时重建主机标签页标题；绕过它直接写 `app.hosts`
+  会导致 tab 标题与内容漂移（已发生：同步下载后 tab 名不更新）
+
+## GUI 交互路径的验证
+
+daemon 层测试无法覆盖「按钮是否真的发出了请求」——测试直接调用
+`state.sync()`，绕过了 GUI 消息层。已发生的真实案例：76 个测试全部
+通过，而「点击同步按钮」这个最基本的路径是坏的。
+
+- 任何新增的用户可触发操作（按钮、菜单项、快捷键），
+  必须在 README 的手动验收清单中增加一条对应的检查项，
+  描述为「点击 X → 预期看到 Y」，由项目所有者实际操作确认
+- 状态类 UI（如同步状态图标）只能由服务端响应更新，
+  不得依据 GUI 本地推测决定是否发送请求或显示成功
 
 ## 内存测量规范
 
@@ -66,21 +81,27 @@ enum variant 形态变更，**必须在同一个提交内完成以下三件事**
 **版本快照测试** `version_snapshot`：序列化完整填充的 Vault，
 与当前版本号断言比对。结构一改此测试即失败，强制执行上述三步。
 
-## 跨层未完成契约
+## iced 版本锁定（强制）
 
-### daemon 层（已完成）
-| 契约 | 状态 |
-|---|---|
-| Downloaded 写入+替换内存+更新 SyncState | ✅ 已实现+测试 |
-| Conflict + resolve 替换内存 | ✅ 已实现+测试 |
-| ConflictFilesDetected 返回文件列表 | ✅ 已实现+测试 |
-| RemoteMissing + 两个处置方向 | ✅ 已实现+测试 |
+`vida-gui/Cargo.toml` 中 iced 版本锁定为精确版本（`= 0.14.0`）。
 
-### GUI 层（已完成）
-| 契约 | GUI 必须执行的动作 | 状态 |
-|---|---|---|
-| Downloaded / Conflict resolve | 收到 SyncResponse 后用其中的 hosts 刷新列表 | ✅ app.rs Downloaded handler 读取 val.get("hosts") 并更新列表 |
-| ConflictFilesDetected | 提示发现冲突文件，允许查看内容并选择采纳/忽略 | ✅ S7ConflictFileScreen 展示文件列表+pattern |
-| RemoteMissing | 提示远端文件缺失，提供「重新上传 / 清除同步状态」两个选项 | ✅ S8RemoteMissingScreen 两个按钮：handle_reupload / handle_clear_state |
+**原因**：`SecureTextInput` 依赖 iced 三条未在文档中承诺的内部行为：
+1. IME 启用时事件为 `Event::InputMethod` 而非 `Event::Keyboard`
+2. 键盘事件仅到达 focused widget
+3. `shell.input_method()` 前后差分可推断内部 widget 是否 focused
 
-**本节已全部清空。M1 不再被跨层契约阻塞。**
+**升级 iced 前必须**：
+1. 阅读 iced changelog，检查上述三条是否有变动
+2. 执行 IME 手动验证清单（见下）
+3. 验证通过后才可提升版本
+
+**IME 手动验证清单**（中文输入法下执行）：
+- [ ] S2 密码框：无候选窗，直接输入 ASCII
+- [ ] S1 口令框：同上
+- [ ] S4 口令框：同上
+- [ ] S4 主机名称框：中文输入正常，候选窗出现
+- [ ] S4 备注框：同上
+- [ ] S9 备份口令框：同上
+- [ ] S4 同屏：口令框无候选窗 + 主机名称框中文正常（同时成立）
+- [ ] Cmd+V 粘贴含中文字符串到六个 secure 框：成功
+- [ ] 空闲 CPU ≈ 0%（无常驻订阅）

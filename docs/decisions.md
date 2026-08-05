@@ -1,112 +1,295 @@
-# 技术决策记录
+# 设计决策记录
 
-## M0: 工作区结构与渲染方案
+## IME 安全缺陷分析 (2026-08-03)
 
-**决策**: 4-crate workspace (vida-core, vida-daemon, vida-gui, vida-mcp-cli)
+**Issue**: https://github.com/robertshaqueen-cyber/vida/issues/2
 
-**理由**: 
-- 核心逻辑与渲染分离，daemon 可独立运行
-- iced 仅用于 chrome（侧边栏/标签栏/对话框），终端 pane 用 wgpu 直接渲染
-- mcp-cli 是 stdio→WebSocket 桥接，给不支持 HTTP 的 MCP 客户端用
+### 问题描述
 
-**日期**: 2026-08-01
+在 macOS 上使用中文输入法时，密码输入框（`.secure(true)`）仍然显示输入法候选框。
+这意味着输入法正在拦截按键，字符进入输入法缓冲区而非密码框。
+云输入法（搜狗、百度等）会将输入内容上传至厂商服务器，导致主口令存在离开本机的风险。
 
-## M0: WebSocket 通信
+### 技术调查结果
 
-**决策**: daemon 监听 127.0.0.1 随机端口，GUI 通过 WebSocket 连接
+#### 1. InputMethod::Disabled 的定义与用法
 
-**理由**:
-- 即使同机也走 WebSocket，未来支持远程 daemon 时只需改配置
-- tungstenite/tokio-tungstenite 是 Rust 生态最成熟的 WebSocket 库
+```rust
+// iced_core-0.14.0/src/input_method.rs
+pub enum InputMethod<T = String> {
+    /// Input method is disabled.
+    Disabled,
+    /// Input method is enabled.
+    Enabled {
+        cursor: Rectangle,
+        purpose: Purpose,
+        preedit: Option<Preedit<T>>,
+    },
+}
+```
 
-**日期**: 2026-08-01
+- `Disabled`: 完全禁用 IME，窗口调用 `set_ime_allowed(false)`
+- `Enabled`: 启用 IME，可设置 purpose (Normal/Secure/Terminal)
 
-## M0: GUI 框架选择 iced
+#### 2. text_input .secure(true) 的行为
 
-**决策**: iced 0.14 作为 GUI 框架
+```rust
+// iced_widget-0.14.2/src/text_input.rs
+fn input_method(...) -> InputMethod<&'b str> {
+    // ...
+    let secure_value = self.is_secure.then(|| value.secure());
+    let value = secure_value.as_ref().unwrap_or(value);
+    // ...
+    InputMethod::Enabled {
+        cursor: ...,
+        purpose: if self.is_secure {
+            input_method::Purpose::Secure
+        } else {
+            input_method::Purpose::Normal
+        },
+        preedit: ...,
+    }
+}
+```
 
-**理由**:
-- 能做出 Zed/Linear 那种利落的工程感
-- 内置 wgpu 支持，可与终端渲染共享 GPU 上下文
-- 跨平台，未来扩展方便
-- 所有者接受风格差异
+**关键发现**: 即使 `secure(true)`，text_input 仍然返回 `InputMethod::Enabled`，
+只是 purpose 设为 `Secure`。这导致 IME 仍然被启用。
 
-**日期**: 2026-08-01
+#### 3. iced 是否提供应用层关闭 IME 的途径
 
-## M0: 内存指标与测量方法
+- `Shell::request_input_method(&mut self, ime: &InputMethod)` - widget 可以调用
+- 但 `merge()` 方法只在当前状态为 `Disabled` 时才会更新
+- 一旦 IME 被启用，widget 无法主动将其关闭
 
-**决策**: 唯一指标为 `vmmap --summary` 的 `Physical footprint`，不用 RSS。
+#### 4. winit 的 set_ime_allowed(false) 能否被间接触发
 
-**理由**:
-- RSS 包含共享库的只读映射（~60MB），不代表进程实际占用
-- 活动监视器的「内存」列显示的是 footprint
-- macOS 文档明确区分 footprint（独占）和 RSS（含共享）
+可以。当 widget 返回 `InputMethod::Disabled` 时：
+```rust
+// iced_winit-0.14.0/src/window.rs
+pub fn request_input_method(&mut self, input_method: InputMethod) {
+    match input_method {
+        InputMethod::Disabled => {
+            self.disable_ime();  // 调用 set_ime_allowed(false)
+        }
+        InputMethod::Enabled { ... } => {
+            self.enable_ime(...);  // 调用 set_ime_allowed(true)
+        }
+    }
+}
+```
 
-**实测数据**:
-- wgpu 裸空窗口 footprint: 24.9M (小) ~ 32.1M (全屏)
-- iced chrome 增量: ~6M
-- 字体加载: 0K dirty（macOS Core Text 内存映射）
-- 固定开销: ~24M（GPU 设备 + 驱动 + 堆结构）
-- 帧缓冲: 受显示器物理分辨率限制
+### 影响范围
 
-**日期**: 2026-08-01
+所有 `.secure(true)` 调用点：
 
-## M1: 加密算法 — scrypt（非 Argon2id）
+| 文件 | 行号 | 用途 |
+|------|------|------|
+| s1_setup.rs | 33 | 创建金库 - 口令输入 |
+| s1_setup.rs | 40 | 创建金库 - 确认口令 |
+| s2_unlock.rs | 49 | 解锁金库 - 口令输入 (error 分支) |
+| s2_unlock.rs | 59 | 解锁金库 - 口令输入 (normal 分支) |
+| s4_credential.rs | 113 | 主机编辑 - 口令输入 |
+| s9_backup.rs | 37 | 导出备份 - 口令输入 |
 
-**决策**: 口令加密使用 age 规范的 scrypt recipient，不用 Argon2id。
+### 可选方案
 
-**理由**:
-- age 规范中基于口令的加密只有 scrypt recipient stanza
-- Argon2id 不在 age 规范内，用它会导致标准 `age` CLI 无法解密
-- 设计铁律 2.4 要求金库可用标准 age CLI 解密（逃生舱）
-- `age` crate 0.12 的 `Encryptor::with_user_passphrase` 自动使用 scrypt
+#### 方案 A: Patch iced 的 text_input (推荐)
 
-**Work factor（实测）**:
-- 设置：`recipient.set_work_factor(18)` → log_n = 18, N = 262144, r = 8, p = 1
-- 与 `age` CLI 默认加密 work factor 一致
-- age header: `-> scrypt <salt_b64> 18`
-- **解密耗时实测**（`age` CLI 1.3.1, 10 次取中位）：**0.362 秒**
-- 对比 log_n=14（auto-tuned）：0.043s → 0.362s，强度提升 16 倍
-- 内存：scrypt 解密瞬时占用 ~256MB（预期行为，非泄漏）
+修改 text_input 的 `input_method()` 方法，当 `is_secure` 为 true 时返回 `InputMethod::Disabled`：
 
-**依赖变更**:
-- 之前：无加密依赖（占位符）
-- 现在：`age = "0.12"`, `secrecy = "0.10"`
-- `rage` 是 CLI 工具，不是库；库用 `age` crate
+```rust
+// 修改前
+InputMethod::Enabled {
+    purpose: if self.is_secure {
+        input_method::Purpose::Secure
+    } else {
+        input_method::Purpose::Normal
+    },
+    ...
+}
 
-**日期**: 2026-08-01
+// 修改后
+if self.is_secure {
+    InputMethod::Disabled
+} else {
+    InputMethod::Enabled { purpose: Purpose::Normal, ... }
+}
+```
 
-## M2: 终端解析 — alacritty_terminal（非 vte+vt100）
+**优点**: 最简单，一行代码修复
+**缺点**: 需要维护 iced fork
 
-**决策**: 使用 `alacritty_terminal` 0.26.0 作为终端状态机和 grid 后端。
+#### 方案 B: 自定义 widget 包装
 
-**理由**:
-- 规格书指定 alacritty_terminal（Alacritty 的 grid + VTE 状态机）
-- vte + vt100 同时引入是重复的（vt100 内部就是 vte）
-- alacritty_terminal 被 Zed 使用，仿真完整度远高于 vte+vt100
-- 自研 VT 解析是「出错了所有者无法描述、只能说看起来怪怪的」的模块
+创建 `SecureTextInput` widget，包装 `text_input` 并在 `update()` 方法中
+处理 IME 事件，拒绝所有 IME commit。
 
-**API 验证**（2026-08-01）:
+**优点**: 不需要 patch iced
+**缺点**: 实现复杂，需要处理所有键盘事件，可能遗漏
 
-- **版本**: `alacritty_terminal = "0.26"`（0.24 有 rustix 兼容性问题）
-- **Cell 类型**: `alacritty_terminal::term::cell::Cell`
-  ```rust
-  pub struct Cell {
-      pub c: char,              // 4 bytes
-      pub fg: vte::ansi::Color, // enum
-      pub bg: vte::ansi::Color, // enum
-      pub flags: Flags,         // bitflags
-      pub extra: Option<Arc<CellExtra>>,  // 8 bytes (64-bit)
-  }
-  ```
-  `size_of::<Cell>() = 24 bytes`
-- **Term**: `Term<T: EventListener>`，泛型参数 T 是事件代理
-  - `VoidListener` 提供空实现（unit struct）
-  - `Term::new(config, dimensions, event_proxy)` 创建实例
-  - `term.grid()` → `&Grid<Cell>`，`term.grid_mut()` → `&mut Grid<Cell>`
-  - `term.resize(size)` 调整大小
-- **Grid**: `Grid<Cell>` 支持 `grid[Point]` 索引，`grid.display_iter()` 遍历可见 cell
-- **VTE 集成**: `vte::Parser` + 实现 `vte::Perform` trait，调用 `Handler` 方法写入 Term
-- **内存**: 5000 行 × 200 列 = 1,000,000 cells × 24 bytes = **22.89 MB**
+#### 方案 C: NSTextField FFI (不采用)
 
-**日期**: 2026-08-01
+用户明确不采用此方案，因为：
+- 原生 NSView 叠在 wgpu 窗口上需要处理布局、缩放
+- 主题跟随困难
+- 成本与脆弱度过高
+
+### 临时规避
+
+在修复完成前，用户应：
+1. 输入主口令前切换到英文输入法
+2. SECUIRTY.md 已添加此警告
+
+### 下一步
+
+1. 向 iced 上游提交 PR，让 secure field 返回 `InputMethod::Disabled`
+2. 同时在本地使用 cargo patch 指向修复后的版本
+3. 修复完成后更新 SECURITY.md
+
+---
+
+## IME 修复实施 (2026-08-03)
+
+### 实际方案: 自定义 widget 包装 (方案 B)
+
+选择了 wrapper widget 而非 fork iced，理由：
+- 避免维护 fork 的长期成本
+- ~170 行代码，无需修改 iced 源码
+- 通过 `cargo advanced` feature flag 启用 `iced::advanced` 模块
+
+### Shell::input_method_mut() 的仲裁问题
+
+`Shell::merge()` 的逻辑：`Enabled` 优先于 `Disabled`。一旦任何 widget
+请求 `Enabled`，其他 widget 通过 `merge()` 无法将其关闭。
+
+因此 `input_method_mut()`（直接赋值）是唯一能为 secure 字段强制关闭
+IME 的方式。`request_input_method()` 无法覆盖已启用的状态。
+
+**为什么不能无条件写入**：
+
+RedrawRequested 事件到达所有可见 text_input。若非 secure 字段调用
+`request_input_method(Enabled)`，merge 使 `input_method = Enabled`。
+secure 字段的 `Disabled` 写入被 merge 忽略（Enabled 优先）。无条件
+写入会覆盖非 secure 字段的请求，导致同屏所有非 secure 字段无法输入
+中文（S4 主机名、备注等）。
+
+**最终方案：拦截 IME + 检测焦点 + Keyboard 禁用**
+
+三层防御：
+
+1. **Ime::Preedit / Ime::Commit**：直接 return，不传递给 inner text_input。
+   阻止中文字符被提交到 secure 字段。同时写入 Disabled。
+
+2. **RedrawRequested**：对比 inner update 前后的 shell.input_method 状态。
+   如果 inner text_input 调用了 request_input_method（仅 focused 时发生），
+   shell 状态会改变。检测到变化 → 写入 Disabled。未变化 → 不写入（不覆盖
+   兄弟 widget 的 IME 请求）。
+
+3. **Keyboard 事件**：无条件写入 Disabled。Keyboard 事件只到达 focused widget，
+   不影响兄弟。防止 IME 在下次 RedrawRequested 时被重新激活。
+
+**焦点检测原理**：text_input 仅在 focused + window focused 时调用
+request_input_method（line 1353）。对比 update 前后的 shell 状态，
+变化 = focused，未变化 = not focused。无需访问 inner widget 的私有状态。
+
+### classify_error 过渡方案
+
+当前通过字符串匹配错误消息来分类（wrong_passphrase / vault_corrupted）。
+这是过渡方案，存在误报风险（如 "invalid" 过宽）。
+
+**已收窄**: 仅匹配 core 层实际产出的稳定文案：
+- wrong_passphrase: "wrong passphrase", "auth failed", "hmac mismatch"
+- vault_corrupted: "corrupted data", "failed to parse vault json"
+
+**目标**: 在错误产生位置直接携带分类（VidaError { category, detail }），
+下游不再做文本匹配。
+
+---
+
+## 抖动动画 (改版 3) — 放弃
+
+iced 0.14 没有 CSS-like 的 keyframe 动画机制。实现抖动需要：
+1. 创建 `Subscription` 驱动定时器
+2. 在 N 帧内交替偏移 x 坐标
+3. 动画结束后取消订阅
+
+**放弃原因**: 复杂度与收益不成比例。错误提示已通过红色边框 + toast
+充分传达，抖动是锦上添花。若未来 iced 支持声明式动画，可重新考虑。
+
+**硬性要求**: 若实现，驱动订阅只能在动画期间存在，做完报告空闲 CPU ≈ 0%。
+
+---
+
+## 同步假成功案 — GUI 本地推测状态构成死锁 (2026-08-05)
+
+**症状**: 76 个测试全部通过，但「点击同步按钮」这个最基本的路径是坏的。
+A 设备显示 ✓（假成功），B 设备点击跳转设置（假跳转），daemon 日志中
+Sync 请求从未到达。
+
+### 三个叠加的 bug
+
+1. **按钮依据本地状态决定是否发请求**（死锁）：
+   `view_tab_bar` 检测 `sync_state == NotConfigured`（本地推断）后，
+   把按钮的 `on_press` 替换成 `OpenSettingsTab`。sync_state 初始为
+   Unknown/NotConfigured，GUI 不请求 → 状态永远不更新 → 按钮永远
+   不发请求。A 与 B 显示不一致是因为 sync_state 到达该状态的本地
+   路径不同，而非配置差异。
+
+2. **本地写入假成功**：`DeleteHost` / `EditorSaved` 直接把 sync_state
+   设为 `LocalChanges`；而 `SyncCompleted` 的 fallback 分支（`_`）把
+   任何未识别状态设为 `Synced`。任何一条路径都能让界面显示 ✓ 而
+   daemon 一无所知。
+
+3. **测试绕过 GUI 消息层**：所有测试直接调用 `state.sync()`，
+   「按钮是否真的发出了请求」从未被验证。
+
+### 修正原则（已写入 AGENTS.md）
+
+- 同步按钮永远发送 Sync 请求，由 daemon 返回真实状态
+- `sync_state` 只能由服务端响应（SyncCompleted / WsError）更新，
+  删除本地推测写入（`LocalChanges` 变体整个移除）
+- 新增端到端测试 `sync_end_to_end_config_to_upload`：
+  update_settings 配置路径 → 添加主机 → state.sync() → 断言远端
+  文件存在且解密后包含该主机
+
+### 可复用的教训
+
+- **GUI 依据本地推测状态决定是否发送请求 = 死锁**。
+  状态类 UI 只能由服务端响应更新，不得本地推测。
+- **报告成功但什么都没做**（假 ✓）与「报告已实测但无人验证」同源：
+  都需要一个从用户操作到真实结果的完整路径测试。
+
+---
+
+## 同步远端文件时间线疑案 (2026-08-05)
+
+**症状**: `/tmp/vida-sync/vault.age` 的创建时间（18:58）晚于两台
+daemon 的最后一条日志（18:57），而 `init_sync()` 与
+`update_settings()` 均被确认只读、不会写入远端文件。文件来源无法
+从日志中定位——因为当时的同步路径完全没有日志。
+
+**处置**: 同步功能现已正常，不再追查。补上日志使同类情况可定位：
+- `LocalPathBackend::upload` 成功后 `info!`，记录目标路径与字节数
+- `LocalPathBackend::download` 成功后 `info!`，记录字节数
+- `SyncCoordinator::sync` 进入判定分支前 `debug!`，记录
+  `remote_exists / remote_changed / local_changed` 三个布尔值
+
+**教训**: 任何会改动远端文件的操作都必须有日志。没有日志的
+文件变动 = 无法归因的谜团，调试成本远高于补日志的成本。
+
+---
+
+## M1 跨层契约闭环 (2026-08-05)
+
+M1 跨层契约于 2026-08-05 全部闭环，实测通过场景 5/6：
+- daemon 层 4 条：Downloaded 写入+替换内存+更新 SyncState、
+  Conflict + resolve 替换内存、ConflictFilesDetected 返回列表、
+  RemoteMissing + 两个处置方向 —— 均已有实现+测试
+- GUI 层 3 条：Downloaded/Conflict resolve 后刷新列表、S7 冲突文件
+  采纳/忽略、S8 远端缺失两个处置按钮 —— 均已在界面实现
+- 场景 5 实测：双设备模拟，Downloaded 分支刷新 + 持久化 + 无重复下载
+- 场景 6 实测：冲突界面两侧列表正确；resolve_conflict_remote 后编辑
+  保存，本地旧数据未被写回（内存替换真实生效）
+
+AGENTS.md 中「跨层未完成契约」一节已删除（不再有未完成项）。
+M1 关闭。

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Regex patterns for conflict file detection (compiled once)
@@ -225,6 +225,14 @@ pub enum SyncResult {
     /// 2. 提供「查看文件」按钮（调用系统文件管理器打开目录）
     /// 3. 提供「忽略」按钮（清除 SyncState，下次同步重新检测）
     ConflictFilesDetected { files: Vec<ConflictFile> },
+
+    /// Sync not configured — `Settings.sync_local_path` is `None`.
+    ///
+    /// # 调用方契约
+    ///
+    /// 向 UI 返回未配置状态，不执行任何文件操作。
+    /// GUI 应将同步按钮置为灰色，点击后跳转到设置的同步页。
+    SyncNotConfigured,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +311,8 @@ impl SyncBackend for LocalPathBackend {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
 
+        info!("Sync upload OK: {} ({} bytes)", target.display(), size);
+
         Ok(RemoteMeta {
             bytes_hash: hash,
             size,
@@ -342,6 +352,8 @@ impl SyncBackend for LocalPathBackend {
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
+
+        info!("Sync download OK: {} ({} bytes)", target.display(), size);
 
         Ok((
             data,
@@ -481,6 +493,10 @@ impl SyncCoordinator {
         };
 
         // Decision table
+        debug!(
+            "Sync decision: remote_exists={} remote_changed={} local_changed={}",
+            remote_exists, remote_changed, local_changed
+        );
         match (remote_exists, remote_changed, local_changed) {
             // Remote doesn't exist + local changed → upload
             (false, _, true) => {

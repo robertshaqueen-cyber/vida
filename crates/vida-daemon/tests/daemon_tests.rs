@@ -1145,3 +1145,57 @@ fn conflict_sync_returns_remote_hosts() {
         other => panic!("expected Conflict, got {:?}", other),
     }
 }
+
+#[test]
+fn sync_end_to_end_config_to_upload() {
+    let (mut state, _dir) = test_state("tok");
+    state.create_vault("pass").unwrap();
+
+    // Configure sync via the real settings path (triggers init_sync)
+    let sync_dir = tempfile::tempdir().unwrap();
+    let settings = vida_core::vault::Settings {
+        sync_local_path: Some(sync_dir.path().to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    state.update_settings(settings).unwrap();
+    assert!(
+        state.sync.is_some(),
+        "sync must be initialized after update_settings with a path"
+    );
+
+    // Add a host through the real host path
+    add_test_host(&mut state, "e2e-host");
+
+    // Sync through the real daemon sync() entry point
+    let (result, hosts) = tokio_test::block_on(state.sync()).unwrap();
+    assert!(
+        matches!(result, SyncResult::Uploaded { .. }),
+        "expected Uploaded, got: {:?}",
+        result
+    );
+    assert!(
+        hosts.is_none(),
+        "Uploaded should not return hosts (nothing downloaded)"
+    );
+
+    // Remote file must exist and contain the host after decryption
+    let remote_path = sync_dir.path().join("vault.age");
+    assert!(
+        remote_path.exists(),
+        "remote vault.age must exist after sync"
+    );
+    let remote_ct = std::fs::read(&remote_path).unwrap();
+    let remote_vault = vida_core::vault::decrypt(&remote_ct, "pass").unwrap();
+    assert!(
+        remote_vault.hosts.iter().any(|h| h.name == "e2e-host"),
+        "remote vault must contain the uploaded host"
+    );
+
+    // Second sync: no changes → NoChange
+    let (result2, _) = tokio_test::block_on(state.sync()).unwrap();
+    assert!(
+        matches!(result2, SyncResult::NoChange),
+        "expected NoChange on second sync, got: {:?}",
+        result2
+    );
+}

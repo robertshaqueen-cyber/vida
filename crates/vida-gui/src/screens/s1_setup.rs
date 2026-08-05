@@ -1,8 +1,9 @@
-use iced::widget::{button, column, container, text, text_input};
+use iced::widget::{button, column, container, text};
 use iced::{Element, Length};
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
+use crate::secure_text_input::SecureTextInput;
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -28,11 +29,12 @@ impl State {
         let title = text("vida").size(32);
         let subtitle = text(i18n.tr("setup_title")).size(18);
 
-        let pass_input = text_input(i18n.tr("setup_passphrase_placeholder"), &self.passphrase)
-            .on_input(AppMessage::SetupPassphraseChanged)
-            .secure(true);
+        let pass_input =
+            SecureTextInput::new(i18n.tr("setup_passphrase_placeholder"), &self.passphrase)
+                .on_input(AppMessage::SetupPassphraseChanged)
+                .secure(true);
 
-        let confirm_input = text_input(
+        let confirm_input = SecureTextInput::new(
             i18n.tr("setup_confirm_placeholder"),
             &self.confirm_passphrase,
         )

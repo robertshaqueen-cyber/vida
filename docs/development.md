@@ -83,11 +83,11 @@
 - [x] 主机条目增删改（凭据 Option 语义）
 - [x] LocalPath 同步后端（SyncBackend trait + LocalPathBackend + SyncCoordinator）
 - [x] GUI 屏幕 S0-S9 全部实现
-- [ ] 场景 2：首次启动创建金库
-- [ ] 场景 3：解锁已有金库
-- [ ] 场景 4：主机编辑器
-- [ ] 场景 5：远端更新后的同步（Downloaded 路径）
-- [ ] 场景 6：选择远端后的界面状态（resolve_conflict_remote 路径）
+- [x] 场景 2：首次启动创建金库（2026-08-05 实测通过）
+- [x] 场景 3：解锁已有金库（2026-08-05 实测通过）
+- [x] 场景 4：主机编辑器（2026-08-05 实测通过）
+- [x] 场景 5：远端更新后的同步（Downloaded 路径）（2026-08-05 实测通过）
+- [x] 场景 6：选择远端后的界面状态（resolve_conflict_remote 路径）（2026-08-05 实测通过）
 
 ---
 
@@ -148,6 +148,11 @@ cargo run --release --bin vida
 2. **关闭 B 的 GUI 重开，解锁** → 新主机仍在（文件已真实写入，不只是内存）
 3. B 再次同步 → 返回「无变化」（不会重复下载）
 
+**实测记录（2026-08-05）**：双设备模拟通过。B 同步后列表立即出现
+A 添加的主机；B 重启 GUI 解锁后主机仍在；B 再次同步显示 ✓ 无变化。
+另验证了同名 tab 场景：A 开 host 的 tab → B 改名后同步 → A 同步 →
+tab 标题已随 `set_hosts()` 重建为新名称，点击后内容与新名称一致。
+
 ### 场景 6：选择远端后的界面状态（resolve_conflict_remote 路径）
 
 ```bash
@@ -163,3 +168,27 @@ export VIDA_CONFIG_DIR=/tmp/vida-sync
 3. **不要重启**，直接编辑任意一台主机并保存
 4. 再次同步 → 远端仍是远端版本 + 那一处编辑
 5. **关键断言**：本地旧数据（host-B）没有被写回——否则说明内存未替换
+
+**实测记录（2026-08-05）**：冲突界面两侧列表和数量正确；选择「使用
+远端」后列表立即变为远端集合；随后直接编辑一台主机并保存，再次同步
+后远端是远端版本 + 该编辑。**关键断言成立**：本地旧数据（host-B）
+未被写回，说明 resolve_conflict_remote 确实替换了内存中的 Vault 而非
+只是界面层遮盖。
+
+### 场景 7：同步设置页 + 同步按钮
+
+```bash
+export VIDA_CONFIG_DIR=/tmp/vida-sync
+cargo run --release --bin vida-daemon &
+cargo run --release --bin vida
+#   → 解锁 → 打开设置 → 同步分区
+```
+
+验收点：
+1. 点击同步模式下拉 → 选择「本地文件夹」→ 预期看到路径输入框 + 选择文件夹按钮出现
+2. 点击「选择文件夹」→ 预期弹出系统文件夹对话框，选择后路径填入输入框
+3. 点击「常用位置：iCloud Drive」→ 预期路径变为 `~/Library/Mobile Documents/com~apple~CloudDocs/vida/`（不存在则创建）；未启用 iCloud 时显示错误提示
+4. 点击「常用位置：~」→ 预期路径变为用户主目录
+5. 切换回「不同步」→ 预期路径清空，保存后同步按钮显示「未配置同步」
+6. **关键断言（回归）**：点击同步按钮 → 无论当前显示什么状态，请求都会发出 —— daemon 日志出现 `Sync upload/download/decision` 记录；未配置同步时按钮点击也发出请求，由 daemon 返回 `sync_not_configured`，界面显示「未配置同步」而非跳转设置
+7. 保存路径后点同步 → daemon 日志出现 `Sync upload OK: <路径> (<字节> bytes)`，远端 `vault.age` 存在

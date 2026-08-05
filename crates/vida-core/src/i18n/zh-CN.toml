@@ -63,8 +63,16 @@ editor_hint_keep_password = "提示：口令框留空则保持原有口令不变
 editor_hint_need_password = "提示：新主机必须提供口令。"
 
 # ---- S5 设置 ----
+settings_sync_mode = "同步模式"
+settings_sync_mode_none = "不同步"
+settings_sync_mode_local = "本地文件夹"
+settings_sync_explain = "同步会将金库的加密副本写入指定文件夹。多台电脑通过共享文件夹（如 iCloud、Syncthing）实现同步。"
+settings_sync_pick_folder = "选择文件夹"
 settings_sync_path = "同步文件夹路径"
-settings_sync_path_hint = "留空 = 不同步。填写本地文件夹路径启用 LocalPath 同步。"
+settings_sync_path_hint = "填写本地文件夹路径"
+settings_sync_quick_locations = "常用位置："
+settings_sync_icloud_not_found = "未检测到 iCloud Drive，请在系统设置中启用"
+settings_sync_create_dir_failed = "创建文件夹失败"
 settings_scrollback = "回滚行数"
 settings_language = "界面语言"
 settings_lang_system = "跟随系统"
@@ -126,6 +134,17 @@ daemon_ws_not_authed = "未认证：首条消息必须是 auth"
 daemon_ws_auth_failed = "认证失败：token 不匹配"
 daemon_ws_unknown_request = "未知请求: {0}"
 
+# ---- 错误分类 (GUI 显示) ----
+error_wrong_passphrase = "口令错误，请重试"
+error_vault_corrupted = "金库数据损坏，无法解析"
+error_not_found = "请求的资源不存在"
+error_vault_locked = "金库已锁定，请先解锁"
+error_vault_exists = "金库已存在"
+error_invalid_json = "请求格式错误"
+error_not_authed = "未认证"
+error_auth_failed = "认证失败"
+error_unknown_request = "未知请求"
+
 # ---- 快速连接面板 ----
 main_tab_connect = "快速连接"
 main_connect_search = "搜索配置或输入地址"
@@ -149,7 +168,6 @@ settings_terminal = "终端设置"
 
 # ---- 同步状态 ----
 sync_state_synced = "已同步"
-sync_state_local_changes = "有本地变更，点击同步"
 sync_state_syncing = "同步中..."
 sync_state_error = "同步出错，点击重试"
 
@@ -162,6 +180,7 @@ main_credential_auto_hide = "15 秒后自动隐藏"
 # ---- 同步状态 ----
 sync_state_unknown = "尚未同步，点击开始"
 sync_state_needs_attention = "需要处理，点击查看"
+sync_state_not_configured = "未配置同步"
 
 # ---- S6 冲突差异 ----
 conflict_side_count = "主机数: {0}"

@@ -6,6 +6,71 @@ use crate::app::AppMessage;
 use crate::screens::s3_main::HostItem;
 
 // ---------------------------------------------------------------------------
+// Sync mode
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    None,
+    Local,
+}
+
+impl SyncMode {
+    pub fn from_path(path: &str) -> Self {
+        if path.is_empty() {
+            SyncMode::None
+        } else {
+            SyncMode::Local
+        }
+    }
+}
+
+/// Wrapper that carries the i18n-translated label for pick_list display.
+#[derive(Debug, Clone)]
+pub struct SyncModeItem {
+    pub mode: SyncMode,
+    label: String,
+}
+
+impl SyncModeItem {
+    pub fn none(i18n: &I18n) -> Self {
+        Self {
+            mode: SyncMode::None,
+            label: i18n.tr("settings_sync_mode_none").to_string(),
+        }
+    }
+
+    pub fn local(i18n: &I18n) -> Self {
+        Self {
+            mode: SyncMode::Local,
+            label: i18n.tr("settings_sync_mode_local").to_string(),
+        }
+    }
+}
+
+impl PartialEq for SyncModeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl std::fmt::Display for SyncModeItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quick location shortcuts
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickLocation {
+    ICloud,
+    Home,
+}
+
+// ---------------------------------------------------------------------------
 // Settings section navigation
 // ---------------------------------------------------------------------------
 
@@ -91,9 +156,8 @@ pub struct State {
     pub active_section: SettingsSection,
     // Application
     pub language: LangChoice,
-    // Connections
-    pub hosts: Vec<HostItem>,
     // Sync
+    pub sync_mode: SyncMode,
     pub sync_local_path: String,
     // Terminal
     pub scrollback_lines: String,
@@ -110,6 +174,7 @@ impl State {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let sync_mode = SyncMode::from_path(&sync_local_path);
 
         let scrollback_lines = val
             .get("scrollback_lines")
@@ -126,7 +191,7 @@ impl State {
         Self {
             active_section: SettingsSection::Application,
             language,
-            hosts: Vec::new(),
+            sync_mode,
             sync_local_path,
             scrollback_lines,
             saving: false,
@@ -135,13 +200,11 @@ impl State {
         }
     }
 
-    pub fn set_hosts(&mut self, hosts: Vec<HostItem>) {
-        self.hosts = hosts;
-    }
-
-    pub fn view(&self, i18n: &I18n) -> Element<'_, AppMessage> {
+    /// Hosts are business data on VidaApp; the screen reads them from the
+    /// caller instead of caching a snapshot (prevents stale lists).
+    pub fn view(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
         let sidebar = self.view_sidebar(i18n);
-        let content = self.view_content(i18n);
+        let content = self.view_content(i18n, hosts);
 
         row![sidebar, content]
             .width(Length::Fill)
@@ -175,10 +238,10 @@ impl State {
         container(sidebar_content).height(Length::Fill).into()
     }
 
-    fn view_content(&self, i18n: &I18n) -> Element<'_, AppMessage> {
+    fn view_content(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
         let content: Element<'_, AppMessage> = match self.active_section {
             SettingsSection::Application => self.view_application(i18n),
-            SettingsSection::Connections => self.view_connections(i18n),
+            SettingsSection::Connections => self.view_connections(i18n, hosts),
             SettingsSection::Sync => self.view_sync(i18n),
             SettingsSection::Terminal => self.view_terminal(i18n),
             SettingsSection::Backup => self.view_backup(i18n),
@@ -239,7 +302,7 @@ impl State {
         .into()
     }
 
-    fn view_connections(&self, i18n: &I18n) -> Element<'_, AppMessage> {
+    fn view_connections(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("settings_connections")).size(20);
 
         let mut items: Vec<Element<'_, AppMessage>> = Vec::new();
@@ -249,7 +312,7 @@ impl State {
             std::collections::HashMap::new();
         let mut ungrouped: Vec<&HostItem> = Vec::new();
 
-        for host in &self.hosts {
+        for host in hosts {
             match &host.group {
                 Some(g) if !g.is_empty() => {
                     grouped.entry(g.clone()).or_default().push(host);
@@ -304,19 +367,67 @@ impl State {
     fn view_sync(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("settings_sync")).size(20);
 
-        let sync_label = text(i18n.tr("settings_sync_path")).size(14);
-        let sync_input = text_input(i18n.tr("settings_sync_path_hint"), &self.sync_local_path)
-            .on_input(AppMessage::SettingsSyncPathChanged)
-            .width(Length::Fill);
-        let sync_hint = text(i18n.tr("settings_sync_path_hint")).size(11);
+        // Explanation
+        let explain = text(i18n.tr("settings_sync_explain")).size(12);
 
+        // Sync mode dropdown (with i18n labels via SyncModeItem wrapper)
+        let mode_label = text(i18n.tr("settings_sync_mode")).size(14);
+        let mode_options: Vec<SyncModeItem> =
+            vec![SyncModeItem::none(i18n), SyncModeItem::local(i18n)];
+        let selected_item = match self.sync_mode {
+            SyncMode::None => Some(SyncModeItem::none(i18n)),
+            SyncMode::Local => Some(SyncModeItem::local(i18n)),
+        };
+        let mode_pick = pick_list(
+            mode_options,
+            selected_item,
+            AppMessage::SettingsSyncModeChanged,
+        )
+        .width(Length::Fill);
+
+        // Path input + folder button (only when Local mode)
+        let path_section: Element<'_, AppMessage> = match self.sync_mode {
+            SyncMode::Local => {
+                let path_label = text(i18n.tr("settings_sync_path")).size(14);
+                let path_input =
+                    text_input(i18n.tr("settings_sync_path_hint"), &self.sync_local_path)
+                        .on_input(AppMessage::SettingsSyncPathChanged)
+                        .width(Length::Fill);
+                let pick_btn = button(text(i18n.tr("settings_sync_pick_folder")).size(13))
+                    .on_press(AppMessage::SettingsSyncPickFolder)
+                    .width(Length::Shrink);
+                let path_row = row![path_input, pick_btn].spacing(8).width(Length::Fill);
+
+                // Quick location shortcuts
+                let icloud_label = text("iCloud Drive").size(12);
+                let icloud_btn = button(icloud_label)
+                    .on_press(AppMessage::SettingsSyncQuickLocation(QuickLocation::ICloud))
+                    .style(button::text)
+                    .padding([2, 6]);
+                let home_label = text("~").size(12);
+                let home_btn = button(home_label)
+                    .on_press(AppMessage::SettingsSyncQuickLocation(QuickLocation::Home))
+                    .style(button::text)
+                    .padding([2, 6]);
+                let shortcuts_hint = text(i18n.tr("settings_sync_quick_locations")).size(11);
+                let shortcuts_row = row![shortcuts_hint, icloud_btn, home_btn]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center);
+
+                column![path_label, path_row, shortcuts_row]
+                    .spacing(4)
+                    .into()
+            }
+            SyncMode::None => text("").into(),
+        };
+
+        // Save button
         let can_save = !self.saving;
         let save_btn = if self.saving {
             button(i18n.tr("common_saving")).width(Length::Shrink)
         } else {
             button(i18n.tr("common_save")).width(Length::Shrink)
         };
-
         let save_btn = if can_save {
             save_btn.on_press(AppMessage::SettingsSave)
         } else {
@@ -337,9 +448,10 @@ impl State {
         column![
             title,
             rule::horizontal(1),
-            sync_label,
-            sync_input,
-            sync_hint,
+            explain,
+            mode_label,
+            mode_pick,
+            path_section,
             save_btn,
             status_text,
             error_text,

@@ -143,6 +143,7 @@ async fn handle_message(
                 payload: ResponsePayload::Error {
                     code: -1,
                     message: format!("Invalid JSON: {}", e),
+                    category: Some("invalid_json".to_string()),
                 },
             })
             .unwrap();
@@ -160,6 +161,7 @@ async fn handle_message(
                 payload: ResponsePayload::Error {
                     code: -2,
                     message: i18n.tr("daemon_ws_not_authed").to_string(),
+                    category: Some("not_authed".to_string()),
                 },
             })
             .unwrap();
@@ -179,6 +181,7 @@ async fn handle_message(
                 payload: ResponsePayload::Error {
                     code: -3,
                     message: i18n.tr("daemon_ws_auth_failed").to_string(),
+                    category: Some("auth_failed".to_string()),
                 },
             })
             .unwrap();
@@ -204,6 +207,7 @@ async fn handle_message(
                 payload: ResponsePayload::Error {
                     code: -4,
                     message: i18n.trf("daemon_ws_unknown_request", &[&e.to_string()]),
+                    category: Some("unknown_request".to_string()),
                 },
             })
             .unwrap();
@@ -221,11 +225,16 @@ async fn handle_message(
         Err(e) => {
             let msg = format!("{:#}", e);
             warn!("Request {} failed: {}", method, msg);
+
+            // Classify error based on message content
+            let category = classify_error(&msg);
+
             serde_json::to_string(&Response {
                 id,
                 payload: ResponsePayload::Error {
                     code: -5,
                     message: msg,
+                    category,
                 },
             })
             .unwrap()
@@ -363,6 +372,7 @@ fn sync_status_string(result: &SyncResult) -> String {
         SyncResult::NoChange => "no_change".to_string(),
         SyncResult::RemoteMissing => "remote_missing".to_string(),
         SyncResult::ConflictFilesDetected { .. } => "conflict_files_detected".to_string(),
+        SyncResult::SyncNotConfigured => "sync_not_configured".to_string(),
     }
 }
 
@@ -372,6 +382,34 @@ fn extract_remote_meta(result: &SyncResult) -> Option<serde_json::Value> {
         SyncResult::Downloaded { meta, .. } => serde_json::to_value(meta).ok(),
         SyncResult::Conflict { remote_meta, .. } => serde_json::to_value(remote_meta).ok(),
         _ => None,
+    }
+}
+
+/// Classify error based on message content for GUI i18n display.
+///
+/// This is a transitional approach. Goal: carry category from the error source
+/// (VidaError { category, detail }) so downstream doesn't match on text.
+fn classify_error(msg: &str) -> Option<String> {
+    let lower = msg.to_lowercase();
+
+    if lower.contains("wrong passphrase")
+        || lower.contains("auth failed")
+        || lower.contains("hmac mismatch")
+    {
+        Some("wrong_passphrase".to_string())
+    } else if lower.contains("corrupted data") || lower.contains("failed to parse vault json") {
+        // Narrowed: only match vault-specific corruption messages from core.
+        // Removed "invalid" (too broad: port invalid, path invalid, etc.)
+        // and "parse" (too broad: JSON field invalid, config parse, etc.)
+        Some("vault_corrupted".to_string())
+    } else if lower.contains("not found") || lower.contains("missing") {
+        Some("not_found".to_string())
+    } else if lower.contains("locked") {
+        Some("vault_locked".to_string())
+    } else if lower.contains("exists") {
+        Some("vault_exists".to_string())
+    } else {
+        None
     }
 }
 
