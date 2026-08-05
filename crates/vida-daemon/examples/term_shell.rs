@@ -1,8 +1,8 @@
 //! M2a-1: PTY + Term 打通探针。
 //!
-//! 真实启动一个 shell，字节流经 Processor 进 Term，把 grid 打印到 stdout。
-//! 运行后在终端里敲命令（echo hello / ls --color / pwd），
-//! 每次输出后打印一次当前屏幕网格 + 光标。
+//! 真实启动一个 shell，字节流经 Processor 进 Term，把 grid 原地重绘到
+//! stdout（看起来就是一个正常终端）。vim / htop / ls --color 显示对
+//! 不对，肉眼直接可见。
 //!
 //! 规格四个必须处理项：
 //! a. 阻塞读放在专用 OS 线程（std::thread::spawn），不占 tokio worker
@@ -14,14 +14,17 @@
 //! - PTY 读线程发 Ev::Output / Ev::OutputClosed
 //! - stdin 读线程（raw mode，字节透传）发 Ev::Input / Ev::InputClosed
 //! - 主循环单点 recv 按事件分派，任一侧无数据都不阻塞另一侧
-//!   → sleep / htop / Ctrl+C 都能正常交互
-//! - SessionInput 约定：原始字节透传，daemon 不做行缓冲/换行转换/
-//!   按键解释（写入 decisions.md 供 M2a-2 遵循）
+//! - **Ctrl+] (0x1d) 退出程序**；Ctrl+C (0x03) 原样透传给 shell
+//! - 所有输出显式 \r\n（raw mode 关闭 ONLCR，\n 只下移不回车）
+//! - 原地重绘：\x1b[H\x1b[2J 清屏 → 逐行 grid → 光标定位，
+//!   重绘限频 60fps（16ms 内多次变化合并为一次）
+//! - SessionInput 约定：原始字节透传（写入 decisions.md 供 M2a-2 遵循）
 
 use std::io::{Read, Write};
 use std::process::Command as StdCommand;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
@@ -30,6 +33,11 @@ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::{Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+/// Ctrl+] — 退出 term_shell（raw mode 下 Ctrl+C 属于 shell）。
+const EXIT_BYTE: u8 = 0x1d;
+/// 重绘间隔：60fps。
+const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 /// 事件：PTY 输出与 stdin 输入多路复用。
 enum Ev {
@@ -72,6 +80,12 @@ impl Dimensions for ShellSize {
     }
 }
 
+/// 状态消息。raw mode 下 \n 只下移不回车，必须显式 \r\n。
+fn say(msg: &str) {
+    print!("\r\n[term_shell] {}", msg);
+    let _ = std::io::stdout().flush();
+}
+
 /// 确定 shell 路径：$SHELL → /bin/zsh → /bin/sh。
 fn detect_shell() -> String {
     if let Ok(s) = std::env::var("SHELL")
@@ -92,23 +106,6 @@ fn detect_shell() -> String {
     "/bin/sh".to_string()
 }
 
-/// 打印当前屏幕（display_iter 遍历可见区）。
-fn print_grid(term: &Term<VoidListener>) {
-    let mut current_row: i32 = i32::MIN;
-    for indexed in term.grid().display_iter() {
-        let point = indexed.point;
-        if point.line.0 != current_row {
-            if current_row != i32::MIN {
-                println!();
-            }
-            current_row = point.line.0;
-            print!("{:2}| ", point.line.0);
-        }
-        print!("{}", indexed.cell.c);
-    }
-    println!();
-}
-
 /// 统计非默认 cell（验证颜色/属性确实进入了 Term）。
 fn count_style_cells(term: &Term<VoidListener>) -> usize {
     use alacritty_terminal::vte::ansi::NamedColor;
@@ -120,21 +117,31 @@ fn count_style_cells(term: &Term<VoidListener>) -> usize {
         .count()
 }
 
-/// 把一块字节喂进 Term 并打印屏幕。
-fn process_and_print(
-    processor: &mut Processor<StdSyncHandler>,
-    term: &mut Term<VoidListener>,
-    bytes: &[u8],
-) {
-    processor.advance(term, bytes);
-    let styled = count_style_cells(term);
-    println!("--- screen (styled cells: {}) ---", styled);
-    print_grid(term);
+/// 原地重绘：清屏 → 逐行 grid → 光标定位。
+fn redraw(term: &Term<VoidListener>) {
+    let mut out = String::with_capacity(4 * 1024);
+    out.push_str("\x1b[H\x1b[2J");
+    let mut current_row: i32 = i32::MIN;
+    for indexed in term.grid().display_iter() {
+        let point = indexed.point;
+        if point.line.0 != current_row {
+            if current_row != i32::MIN {
+                out.push_str("\r\n");
+            }
+            current_row = point.line.0;
+        }
+        out.push(indexed.cell.c);
+    }
+    out.push_str("\r\n");
+    // 光标定位（ANSI 1-based，grid 内 0-based）
     let cursor = term.grid().cursor.point;
-    println!(
-        "--- cursor: row={} col={} ---",
-        cursor.line.0, cursor.column.0
-    );
+    out.push_str(&format!(
+        "\x1b[{};{}H",
+        cursor.line.0 + 1,
+        cursor.column.0 + 1
+    ));
+    print!("{}", out);
+    let _ = std::io::stdout().flush();
 }
 
 /// PTY 读线程：阻塞读，发 Ev::Output，EOF 发 Ev::OutputClosed。
@@ -154,7 +161,6 @@ fn pty_reader_thread(mut reader: Box<dyn Read + Send>, tx: Sender<Ev>) {
     }
     let _ = tx.send(Ev::OutputClosed);
     drop(tx);
-    println!("[term_shell] 读线程已退出（EOF/关闭）");
 }
 
 /// stdin 读线程：raw mode 逐字节透传，发 Ev::Input，EOF 发 Ev::InputClosed。
@@ -173,7 +179,6 @@ fn stdin_thread(mut stdin: std::io::Stdin, tx: Sender<Ev>) {
     }
     let _ = tx.send(Ev::InputClosed);
     drop(tx);
-    println!("[term_shell] stdin 线程已退出（EOF）");
 }
 
 fn main() -> Result<()> {
@@ -201,7 +206,6 @@ fn main() -> Result<()> {
         .spawn_command(cmd)
         .with_context(|| format!("spawn {} 失败", shell))?;
     drop(pair.slave);
-    println!("[term_shell] shell: {}", shell);
 
     // ---- 3. Term + Processor ----
     let config = Config {
@@ -223,67 +227,107 @@ fn main() -> Result<()> {
 
     // ---- 5. stdin raw mode + 读线程 ----
     // 真实终端行为：逐字节透传，Ctrl+C(0x03)/方向键(ESC 序列)/Tab 原样到 PTY。
-    // 管道模式（stdin 非 tty）下 raw mode 不可用，降级为行模式继续，
-    // 透传逻辑不变（管道输入本来就是整块到达）。
+    // 管道模式（stdin 非 tty）下 raw mode 不可用，降级为行模式继续。
     let raw = enable_raw_mode().is_ok();
     let _guard = RawModeGuard;
-    if raw {
-        println!("[term_shell] stdin raw mode 已启用（字节透传）");
-    } else {
-        println!("[term_shell] stdin 非 tty，raw mode 跳过（降级行模式）");
-    }
     let stdin = std::io::stdin();
     let stdin_handle = thread::spawn(move || stdin_thread(stdin, tx));
     // 主线程仅接收（两个发送端都已移入线程）
 
-    // ---- 6. 主循环：单点 recv，按事件类型分派 ----
-    // writer 用 Option 包裹，InputClosed 时 take 掉并 drop（通知 shell EOF）
+    // ---- 6. 启动提示 + 主循环 ----
     let mut writer: Option<Box<dyn Write + Send>> =
         Some(pair.master.take_writer().context("take_writer 失败")?);
+    println!(
+        "\r\n[term_shell] shell: {} | raw mode: {} | Ctrl+] 退出 | Ctrl+C 发送给 shell",
+        shell, raw
+    );
+
     let mut pty_closed = false;
+    // Ctrl+] 已请求退出：关闭 writer 通知 shell，但仍继续消费
+    // PTY 输出直到 OutputClosed（shell 真正退出），避免子进程
+    // 因 stdout 缓冲阻塞而永远不退出。
+    let mut exit_requested = false;
+    // 待喂给 Processor 的积压字节（16ms 限频合并）
+    let mut pending: Vec<u8> = Vec::new();
+    let mut last_redraw = Instant::now() - REDRAW_INTERVAL;
 
     while !pty_closed {
-        match rx.recv() {
-            Ok(Ev::Output(bytes)) => process_and_print(&mut processor, &mut term, &bytes),
+        // 限频轮询：等 8ms 收集更多输出，或直接收事件
+        let ev = rx.recv_timeout(Duration::from_millis(8));
+        match ev {
+            Ok(Ev::Output(bytes)) => {
+                pending.extend_from_slice(&bytes);
+            }
             Ok(Ev::Input(bytes)) => {
-                if let Some(w) = writer.as_mut()
-                    && w.write_all(&bytes).is_err()
-                {
-                    writer.take(); // PTY 已关闭
-                }
-                if let Some(w) = writer.as_mut() {
+                // Ctrl+] = 退出程序（不转发给 PTY）
+                if bytes.contains(&EXIT_BYTE) {
+                    if !exit_requested {
+                        say("Ctrl+] 收到，关闭 PTY writer + SIGHUP 通知 shell 退出");
+                        writer.take(); // 关闭 PTY writer
+                        let _ = child.kill(); // SIGHUP（标准 PTY 关闭行为）
+                        exit_requested = true;
+                    }
+                } else if let Some(w) = writer.as_mut() {
+                    let write_ok = w.write_all(&bytes).is_ok();
                     w.flush().ok();
+                    if !write_ok {
+                        writer.take(); // PTY 已关闭
+                    }
                 }
             }
             Ok(Ev::OutputClosed) => {
-                println!("[term_shell] PTY 已关闭，等待子进程回收");
+                say("PTY 已关闭，等待子进程回收");
                 pty_closed = true;
             }
             Ok(Ev::InputClosed) => {
                 // stdin EOF（Ctrl+D）→ 关闭 PTY writer，通知 shell 退出
                 if writer.take().is_some() {
-                    println!("[term_shell] stdin EOF，关闭 PTY writer");
+                    say("stdin EOF，关闭 PTY writer");
                 }
             }
-            Err(_) => break, // 所有发送端关闭
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // 无事件：继续（限频重绘逻辑处理 pending）
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // 所有发送端关闭
+        }
+
+        // 限频重绘：≥16ms 且有待处理字节
+        if last_redraw.elapsed() >= REDRAW_INTERVAL && !pending.is_empty() {
+            processor.advance(&mut term, &pending);
+            pending.clear();
+            redraw(&term);
+            last_redraw = Instant::now();
         }
     }
 
-    // ---- 7. 子进程回收 ----
+    // ---- 7. 最后一次重绘（flush 残留输出）+ 统计 ----
+    if !pending.is_empty() {
+        processor.advance(&mut term, &pending);
+        redraw(&term);
+    }
+    say(&format!(
+        "styled cells: {}（含颜色的 cell 数；颜色重绘留待 --ansi 模式）",
+        count_style_cells(&term)
+    ));
+
+    // ---- 8. 子进程回收 ----
     match child.wait() {
         Ok(status) => {
-            println!(
-                "[term_shell] 子进程退出: success={} exit_code={}",
+            say(&format!(
+                "子进程退出: success={} exit_code={}",
                 status.success(),
                 status.exit_code()
-            );
+            ));
         }
-        Err(e) => println!("[term_shell] wait() 失败: {}", e),
+        Err(e) => say(&format!("wait() 失败: {}", e)),
     }
 
-    // ---- 8. 确保两个读线程结束（不泄漏线程）----
+    // ---- 9. 确保读线程结束（不泄漏线程）----
     let _ = reader_handle.join();
-    let _ = stdin_handle.join();
-    println!("[term_shell] 线程已 join，退出");
+    // stdin 线程阻塞在 read(stdin) 上：Ctrl+] 退出时 stdin 仍打开，
+    // join 会死等。程序退出时 OS 回收该线程，这里不 join。
+    // （EOF 路径下 stdin 线程早已自行退出，join 与否无副作用。）
+    let _ = stdin_handle;
+    say("读线程已 join，退出");
     Ok(())
 }
