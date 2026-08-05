@@ -508,3 +508,41 @@ RLE 只覆盖 `start_col..=end_col` 区间。相比整行发送，yes/htop 这�
 
 **要求测试**（M2a-2 实现时）：断言 Term 构造时使用的
 `scrolling_history` 等于金库设置值。
+
+### M2a-1 结论 4：UTF-8 跨读边界已由 vte 内部处理
+
+**实测验证**（term_probe 第 8 节）：构造 `"你好世界"`（12 字节），
+从字节 5 切开（"世" 的中间），分两次 `processor.advance()`，最终
+grid 中四字完整（CJK 宽字符每字占 2 列，第二个 cell 是
+WIDE_CHAR_SPACER 空格，过滤空格后还原原文）。断言通过。
+
+**原理**：vte 0.15 `Parser` 内部维护 `partial_utf8: [u8; 4]` +
+`partial_utf8_len`（lib.rs:68-69）。`advance` 遇到 buffer 尾部不完整
+UTF-8（`error_len() == None` 且无 ESC 截断）时存入 partial 缓冲
+（lib.rs:656），下次 `advance` 先补全（lib.rs:113/148）。
+
+**结论**：**daemon 读线程无需缓存不完整字节**，直接整块喂
+`Processor` 即可。跨读边界由 vte 状态机处理。
+
+### M2a-1 结论 5：SessionInput 必须是原始字节透传
+
+**约定**（M2a-2 及以后必须遵循）：
+
+> SessionInput 不做行缓冲、不做换行转换、不解释任何按键。
+> 客户端发什么就写什么到 PTY。
+
+理由：daemon 侧若做行处理，M5 的 agent 将无法发送 Ctrl-C、
+方向键、以及任何 TUI 交互所需的控制序列。
+
+term_shell 已验证：raw mode 下 `\x03`（Ctrl+C）透传到 shell，
+中断 `sleep 30` 后 `pwd` 立即可用（expect 实测）。
+
+### M2a-1 结论 6：OpenLocalSession 固定 cwd = HOME
+
+portable-pty 的 `spawn_command` 默认 cwd 是 HOME（探针实测）。
+规格确认：**OpenLocalSession 不接受客户端指定 cwd，固定使用
+HOME**（与固定 `$SHELL` 同理）。理由：M5 的 MCP 客户端会调用
+此接口，cwd 不应成为可被 agent 操纵的输入。
+
+term_shell 探针为了便于演示显式 `cmd.cwd(current_dir)`，daemon
+接入时**不**继承，使用 HOME。

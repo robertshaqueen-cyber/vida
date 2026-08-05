@@ -9,10 +9,18 @@
 //! b. 子进程退出后 child.wait() 回收，不留僵尸
 //! c. 读线程在 EOF/PTY 关闭时干净退出（不泄漏线程）
 //! d. 单次读取 ≥8KB（16KB 缓冲，整块喂给 Processor）
+//!
+//! 交互模型（评审必改）：
+//! - PTY 读线程发 Ev::Output / Ev::OutputClosed
+//! - stdin 读线程（raw mode，字节透传）发 Ev::Input / Ev::InputClosed
+//! - 主循环单点 recv 按事件分派，任一侧无数据都不阻塞另一侧
+//!   → sleep / htop / Ctrl+C 都能正常交互
+//! - SessionInput 约定：原始字节透传，daemon 不做行缓冲/换行转换/
+//!   按键解释（写入 decisions.md 供 M2a-2 遵循）
 
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::process::Command as StdCommand;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use alacritty_terminal::event::VoidListener;
@@ -20,7 +28,29 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::{Context, Result};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+/// 事件：PTY 输出与 stdin 输入多路复用。
+enum Ev {
+    /// PTY 输出块。
+    Output(Vec<u8>),
+    /// stdin 原始字节。
+    Input(Vec<u8>),
+    /// PTY 读线程 EOF（shell 退出 / PTY 关闭）。
+    OutputClosed,
+    /// stdin EOF（Ctrl+D）。
+    InputClosed,
+}
+
+/// raw mode guard：任何路径退出（含 panic）都恢复终端。
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
 
 /// 网格尺寸参数。
 struct ShellSize {
@@ -107,6 +137,45 @@ fn process_and_print(
     );
 }
 
+/// PTY 读线程：阻塞读，发 Ev::Output，EOF 发 Ev::OutputClosed。
+fn pty_reader_thread(mut reader: Box<dyn Read + Send>, tx: Sender<Ev>) {
+    let mut buf = [0u8; 16 * 1024]; // ≥8KB 缓冲
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break, // EOF：shell 退出 / PTY 关闭
+            Ok(n) => {
+                // 整块发送，不逐字节
+                if tx.send(Ev::Output(buf[..n].to_vec())).is_err() {
+                    return; // 主线程已退出
+                }
+            }
+            Err(_) => break, // 读错误（PTY 关闭）→ 干净退出
+        }
+    }
+    let _ = tx.send(Ev::OutputClosed);
+    drop(tx);
+    println!("[term_shell] 读线程已退出（EOF/关闭）");
+}
+
+/// stdin 读线程：raw mode 逐字节透传，发 Ev::Input，EOF 发 Ev::InputClosed。
+fn stdin_thread(mut stdin: std::io::Stdin, tx: Sender<Ev>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) => break, // stdin EOF（Ctrl+D）
+            Ok(n) => {
+                if tx.send(Ev::Input(buf[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = tx.send(Ev::InputClosed);
+    drop(tx);
+    println!("[term_shell] stdin 线程已退出（EOF）");
+}
+
 fn main() -> Result<()> {
     // ---- 1. 打开 PTY 80×24 ----
     let pty_system = native_pty_system();
@@ -122,8 +191,8 @@ fn main() -> Result<()> {
     let shell = detect_shell();
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color"); // 让 ls --color 等正常工作
-    // portable-pty spawn 默认 cwd 是 HOME；显式继承当前目录，
-    // 让 ls/pwd 显示与运行目录一致（daemon 接入时由上层决定 cwd）。
+    // portable-pty spawn 默认 cwd 是 HOME；探针显式继承当前目录。
+    // M2a-2 的 OpenLocalSession 固定使用 HOME（见 decisions.md）。
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -132,7 +201,7 @@ fn main() -> Result<()> {
         .spawn_command(cmd)
         .with_context(|| format!("spawn {} 失败", shell))?;
     drop(pair.slave);
-    println!("[term_shell] shell: {} (pid 见下方 exit 输出)", shell);
+    println!("[term_shell] shell: {}", shell);
 
     // ---- 3. Term + Processor ----
     let config = Config {
@@ -143,79 +212,64 @@ fn main() -> Result<()> {
         Term::new(config, &ShellSize { cols: 80, rows: 24 }, VoidListener);
     let mut processor: Processor<StdSyncHandler> = Processor::new();
 
-    // ---- 4. 读线程（阻塞读，专用 OS 线程）----
-    let mut reader = pair
+    // ---- 4. 事件通道 + PTY 读线程 ----
+    let (tx, rx): (Sender<Ev>, Receiver<Ev>) = mpsc::channel();
+    let reader_tx = tx.clone();
+    let reader = pair
         .master
         .try_clone_reader()
         .context("try_clone_reader 失败")?;
-    let (tx, rx): (mpsc::Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
+    let reader_handle = thread::spawn(move || pty_reader_thread(reader, reader_tx));
 
-    let reader_handle = thread::spawn(move || {
-        let mut buf = [0u8; 16 * 1024]; // ≥8KB 缓冲
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF：shell 退出 / PTY 关闭
-                Ok(n) => {
-                    // 整块发送，不逐字节
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break; // 主线程已退出
-                    }
-                }
-                Err(_) => break, // 读错误（PTY 关闭）→ 干净退出
-            }
-        }
-        drop(tx);
-        println!("[term_shell] 读线程已退出（EOF/关闭）");
-    });
-
-    // ---- 5. 主线程：把 PTY 输出喂进 Term，处理 stdin 输入 ----
-    let mut writer = pair.master.take_writer().context("take_writer 失败")?;
+    // ---- 5. stdin raw mode + 读线程 ----
+    // 真实终端行为：逐字节透传，Ctrl+C(0x03)/方向键(ESC 序列)/Tab 原样到 PTY。
+    // 管道模式（stdin 非 tty）下 raw mode 不可用，降级为行模式继续，
+    // 透传逻辑不变（管道输入本来就是整块到达）。
+    let raw = enable_raw_mode().is_ok();
+    let _guard = RawModeGuard;
+    if raw {
+        println!("[term_shell] stdin raw mode 已启用（字节透传）");
+    } else {
+        println!("[term_shell] stdin 非 tty，raw mode 跳过（降级行模式）");
+    }
     let stdin = std::io::stdin();
-    let mut stdin_lines = stdin.lock();
+    let stdin_handle = thread::spawn(move || stdin_thread(stdin, tx));
+    // 主线程仅接收（两个发送端都已移入线程）
 
-    // 主循环：读 channel 喂 Processor → 打印 grid；stdin 有输入则写入 PTY
-    loop {
-        // 等待 shell 输出的第一个块
+    // ---- 6. 主循环：单点 recv，按事件类型分派 ----
+    // writer 用 Option 包裹，InputClosed 时 take 掉并 drop（通知 shell EOF）
+    let mut writer: Option<Box<dyn Write + Send>> =
+        Some(pair.master.take_writer().context("take_writer 失败")?);
+    let mut pty_closed = false;
+
+    while !pty_closed {
         match rx.recv() {
-            Ok(bytes) => process_and_print(&mut processor, &mut term, &bytes),
-            Err(_) => {
-                // 读线程退出 → shell 已结束
-                println!("[term_shell] PTY 已关闭，等待子进程回收");
-                break;
-            }
-        }
-        // 排空 channel 中剩余输出块（连续打印，避免阻塞在 stdin 上）
-        while let Ok(bytes) = rx.try_recv() {
-            process_and_print(&mut processor, &mut term, &bytes);
-        }
-
-        // 读 stdin：整行输入写回 PTY
-        let mut line = String::new();
-        match stdin_lines.read_line(&mut line) {
-            Ok(0) => {
-                // stdin EOF（Ctrl+D）→ 关闭 PTY writer，通知 shell 退出。
-                // 之后继续消费 channel 中剩余的输出块（可能有在途数据），
-                // 直到读线程退出（channel 关闭）。
-                drop(writer);
-                println!("[term_shell] stdin EOF，关闭 PTY，排空剩余输出");
-                while let Ok(bytes) = rx.recv() {
-                    process_and_print(&mut processor, &mut term, &bytes);
+            Ok(Ev::Output(bytes)) => process_and_print(&mut processor, &mut term, &bytes),
+            Ok(Ev::Input(bytes)) => {
+                if let Some(w) = writer.as_mut()
+                    && w.write_all(&bytes).is_err()
+                {
+                    writer.take(); // PTY 已关闭
                 }
-                break;
+                if let Some(w) = writer.as_mut() {
+                    w.flush().ok();
+                }
             }
-            Ok(_) => {
-                let stripped = line.trim_end_matches(['\n', '\r']);
-                writer
-                    .write_all(stripped.as_bytes())
-                    .and_then(|_| writer.write_all(b"\r\n"))
-                    .context("写入 PTY 失败")?;
-                writer.flush().ok();
+            Ok(Ev::OutputClosed) => {
+                println!("[term_shell] PTY 已关闭，等待子进程回收");
+                pty_closed = true;
             }
-            Err(_) => break,
+            Ok(Ev::InputClosed) => {
+                // stdin EOF（Ctrl+D）→ 关闭 PTY writer，通知 shell 退出
+                if writer.take().is_some() {
+                    println!("[term_shell] stdin EOF，关闭 PTY writer");
+                }
+            }
+            Err(_) => break, // 所有发送端关闭
         }
     }
 
-    // ---- 6. 子进程回收 ----
+    // ---- 7. 子进程回收 ----
     match child.wait() {
         Ok(status) => {
             println!(
@@ -227,8 +281,9 @@ fn main() -> Result<()> {
         Err(e) => println!("[term_shell] wait() 失败: {}", e),
     }
 
-    // 确保读线程结束（不泄漏线程）
+    // ---- 8. 确保两个读线程结束（不泄漏线程）----
     let _ = reader_handle.join();
-    println!("[term_shell] 读线程已 join，退出");
+    let _ = stdin_handle.join();
+    println!("[term_shell] 线程已 join，退出");
     Ok(())
 }
