@@ -161,4 +161,43 @@ fn main() {
         }
     );
     term.reset_damage();
+
+    // ---- 8. UTF-8 跨读边界验证（规格陷阱 #7）----
+    // 构造中文（UTF-8 3 字节/字），从"世"的中间切成两半，
+    // 分两次 advance。若 vte 内部维护 partial_utf8 状态，
+    // 最终 grid 中该汉字应完整。
+    let text = "你好世界";
+    let bytes = text.as_bytes(); // 12 字节
+    let split = 5; // "你好" = 6 字节，"世" = 字节 6..9，从字节 5 切 = 世 的中间
+    let (first, second) = bytes.split_at(split);
+
+    // 先清屏移到行 0
+    processor.advance(&mut term, b"\x1b[2J\x1b[1;1H");
+    processor.advance(&mut term, first);
+    processor.advance(&mut term, second);
+
+    let mut chars: Vec<char> = Vec::new();
+    for indexed in term.grid().display_iter() {
+        if indexed.point.line.0 == 0 {
+            chars.push(indexed.cell.c);
+        }
+    }
+    let grid_text: String = chars.into_iter().collect();
+    println!("=== UTF-8 split test ===");
+    println!(
+        "split at byte {}: first={:?} second={:?}",
+        split, first, second
+    );
+    println!("grid row 0 = {:?}", grid_text);
+    // CJK 是宽字符：每字占 2 列，第二个 cell 是 WIDE_CHAR_SPACER（空格）。
+    // 过滤掉空格后应还原原文。
+    let stripped: String = grid_text.chars().filter(|c| *c != ' ').collect();
+    assert!(
+        stripped == text,
+        "UTF-8 split failed: grid has {:?}, expected {:?}",
+        stripped,
+        text
+    );
+    println!("PASS: vte Processor 内部处理跨读边界 UTF-8，daemon 无需缓存");
+    println!("=== end UTF-8 split test ===");
 }

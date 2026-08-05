@@ -508,3 +508,127 @@ RLE 只覆盖 `start_col..=end_col` 区间。相比整行发送，yes/htop 这�
 
 **要求测试**（M2a-2 实现时）：断言 Term 构造时使用的
 `scrolling_history` 等于金库设置值。
+
+### M2a-1 结论 4：UTF-8 跨读边界已由 vte 内部处理
+
+**实测验证**（term_probe 第 8 节）：构造 `"你好世界"`（12 字节），
+从字节 5 切开（"世" 的中间），分两次 `processor.advance()`，最终
+grid 中四字完整（CJK 宽字符每字占 2 列，第二个 cell 是
+WIDE_CHAR_SPACER 空格，过滤空格后还原原文）。断言通过。
+
+**原理**：vte 0.15 `Parser` 内部维护 `partial_utf8: [u8; 4]` +
+`partial_utf8_len`（lib.rs:68-69）。`advance` 遇到 buffer 尾部不完整
+UTF-8（`error_len() == None` 且无 ESC 截断）时存入 partial 缓冲
+（lib.rs:656），下次 `advance` 先补全（lib.rs:113/148）。
+
+**结论**：**daemon 读线程无需缓存不完整字节**，直接整块喂
+`Processor` 即可。跨读边界由 vte 状态机处理。
+
+### M2a-1 结论 5：SessionInput 必须是原始字节透传
+
+**约定**（M2a-2 及以后必须遵循）：
+
+> SessionInput 不做行缓冲、不做换行转换、不解释任何按键。
+> 客户端发什么就写什么到 PTY。
+
+理由：daemon 侧若做行处理，M5 的 agent 将无法发送 Ctrl-C、
+方向键、以及任何 TUI 交互所需的控制序列。
+
+term_shell 已验证：raw mode 下 `\x03`（Ctrl+C）透传到 shell，
+中断 `sleep 30` 后 `pwd` 立即可用（expect 实测）。
+
+### M2a-1 结论 6：OpenLocalSession 固定 cwd = HOME
+
+portable-pty 的 `spawn_command` 默认 cwd 是 HOME（探针实测）。
+规格确认：**OpenLocalSession 不接受客户端指定 cwd，固定使用
+HOME**（与固定 `$SHELL` 同理）。理由：M5 的 MCP 客户端会调用
+此接口，cwd 不应成为可被 agent 操纵的输入。
+
+term_shell 探针为了便于演示显式 `cmd.cwd(current_dir)`，daemon
+接入时**不**继承，使用 HOME。
+
+### M2a-1 结论 7：推送限频「合并后延迟发送」，禁止丢弃
+
+term_shell 三轮评审发现：限频若施加在**处理**（advance）而不是
+**绘制**上，窗口内的变化会被跳过——启动 5ms 时的提示符因 <16ms
+被跳过，之后无新事件唤醒，屏幕永远空白。expect 测试恰好总在
+发送字节（唤醒循环），因此两次都没发现。
+
+**原则（M2a-2 推送限频同样适用）**：
+
+> 帧率限制窗口内的多次变化必须「合并后延迟发送」，不能丢弃。
+> 处理（Term 状态更新）不限频，只有发送/绘制限频。
+
+实现模式：
+```
+收到 Ev::Output → 立即 processor.advance(&mut term, &bytes)  // 处理不限频
+                   dirty = true
+绘制/发送： if dirty && last >= 16ms { 发送; dirty = false }
+             else 保留 dirty（合并，下次超时返回时补发）
+主循环 recv 带超时（≤16ms），超时返回时若 dirty 则补一次发送
+```
+
+若窗口内变化被丢弃，一次突发输出的**最终状态**永远不会到达
+客户端——与本次屏幕空白的现象完全相同，只是发生在网络一侧。
+`yes` 场景下最终状态（堆积的 y）必须到达，只是可以晚到。
+
+### M2a-1 结论 8：stdin 读取用 libc::read(fd 0)，不用 std::io::Stdin
+
+**症状**：程序启动后立即退出（真实终端/重定向输入下）。expect 伪
+TTY 下测试通过，因为 expect 的 stdin 是打开的、启动后立即有数据。
+
+**根因**（eprintln 诊断确认）：stdin 即时 EOF（如 `/dev/null`）时
+`std::io::Stdin::read` 立即返回 `Ok(0)` → 触发退出链：InputClosed →
+关闭 PTY writer → shell EOF 退出 → OutputClosed → 程序退出。全程
+几十毫秒，表现为「什么都没执行」。
+
+**修复**：stdin 读线程改用 `libc::read(fd 0)`——纯 syscall，绕开
+`std::io::Stdin` 内部的 BufReader 行缓冲（raw mode 下与行缓冲可能
+冲突）。EINTR 重试。
+
+### M2a-1 结论 9：Ev::InputClosed 不关闭 PTY writer
+
+真实终端中 Ctrl+D 是把 `0x04` 字节传给 shell，由 shell 自行决定
+是否退出；客户端不应替它关闭管道。
+
+**规则**：InputClosed 仅记录日志，不动 writer。**程序唯一退出出口
+是 Ctrl+] (0x1d)**。这同时消除了「stdin 线程异常 → 程序退出」的
+整条副作用链——即使 stdin 通道异常结束，终端会话仍继续。
+
+### M2a-1 结论 10：Ctrl+] 退出流程（优雅终止 + SIGKILL 兜底）
+
+portable-pty 的 `Child::kill()` 发送的是 **SIGKILL**（不是 SIGHUP，
+早期注释写错）。Ctrl+] 流程：
+
+1. `writer.take()` —— 关闭写端，shell 收到 EOF **自行退出**（干净）
+2. 等待 OutputClosed，**超时 2 秒**
+3. 超时未退出（shell 卡在子进程）才 `child.kill()`（SIGKILL），
+   打印 warn 说明是强制终止
+
+实测：正常路径 shell EOF 退出 exit_code=0，kill 兜底未触发。
+
+### M2a-1 结论 11：expect 无法覆盖真实 TTY 启动路径
+
+term_shell 三轮评审中三类 bug（限频跳过、启动即退出）均因
+**expect 伪 TTY 与真实终端差异**而漏测：expect 的 stdin 打开且
+启动后立即有数据可读，永远碰不到「真实终端下启动瞬间 read 返回
+0」或「无事件时积压不处理」的情况。
+
+**规则**：交互式工具（term_shell 等）PR 描述必须明确写
+「本工具的行为依赖真实 TTY，expect 测试无法覆盖启动路径，
+需所有者在真实终端中确认」，并列出 expect 覆盖了什么、
+没覆盖什么。
+
+### M2a-1 结论 12：vim 默认无状态栏，TUI 验收判据选择
+
+检查点 B 中 vim 启动画面「无状态栏」曾被误判为渲染缺陷，实为
+vim 默认 `laststatus=1`（单窗口不显示状态栏）的正确行为，与
+Term 渲染无关。
+
+**验收 TUI 渲染时**：应挑选默认就有明显边框/状态行的程序
+（htop、less、tmux），vim 的启动画面不适合作为唯一判据。
+
+**另记录**：`crossterm::terminal::size()` 在伪 TTY（expect）下
+可能返回 0×0，直接用于 `PtySize`/`Term` 会触发
+alacritty grid 的 `columns() - 1` 下溢 panic（grid/mod.rs:499）。
+非 tty / 0 尺寸均须降级 80×24。
