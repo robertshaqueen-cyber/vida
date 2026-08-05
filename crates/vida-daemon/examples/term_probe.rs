@@ -53,7 +53,9 @@ fn main() {
     let mut processor: Processor<alacritty_terminal::vte::ansi::StdSyncHandler> = Processor::new();
 
     // ---- 1. 喂入混合字节流 ----
-    let bytes = b"\x1b[31mRED\x1b[0m plain text\x1b[2;5H\x1b[32mGREEN@5,2\x1b[0m\x1b[2J\x1b[1;1Hhello world\x1b[3;1Hline three\nline four";
+    // 顺序：清屏 → 普通文本 → 红色前景 → 光标移动+绿色前景 →
+    // 加粗 → 蓝色背景 → 换行。最终状态保留颜色行，便于肉眼验证。
+    let bytes = b"\x1b[2J\x1b[1;1Hhello world\x1b[2;1H\x1b[31mRED\x1b[0m\x1b[3;5H\x1b[32mGREEN\x1b[0m\x1b[4;1H\x1b[1mBOLD\x1b[0m\x1b[5;1H\x1b[44mBLUE_BG\x1b[0m\nnext";
     processor.advance(&mut term, bytes);
 
     // ---- 2. grid 遍历：打印屏幕 ----
@@ -74,14 +76,30 @@ fn main() {
     println!();
     println!("=== end grid ===");
 
-    // ---- 3. 光标位置 ----
+    // ---- 3. 非默认 cell 属性清单（验证颜色确实生效） ----
+    use alacritty_terminal::vte::ansi::NamedColor;
+    println!("=== non-default cells ===");
+    for indexed in term.grid().display_iter() {
+        let cell = indexed.cell;
+        let default_bg = Color::Named(NamedColor::Background);
+        let default_fg = Color::Named(NamedColor::Foreground);
+        if cell.fg != default_fg || cell.bg != default_bg || !cell.flags.is_empty() {
+            println!(
+                "({:2},{:2}) {:?} fg={:?} bg={:?} flags={:?}",
+                indexed.point.line.0, indexed.point.column.0, cell.c, cell.fg, cell.bg, cell.flags
+            );
+        }
+    }
+    println!("=== end non-default cells ===");
+
+    // ---- 4. 光标位置 ----
     let cursor_point = term.grid().cursor.point;
     println!(
         "cursor: row={} col={}",
         cursor_point.line.0, cursor_point.column.0
     );
 
-    // ---- 4. Cell 字段 ----
+    // ---- 5. Cell 字段 ----
     let cell = term.grid()[alacritty_terminal::index::Point::new(
         alacritty_terminal::index::Line(0),
         alacritty_terminal::index::Column(0),
@@ -95,7 +113,7 @@ fn main() {
     println!("size_of::<Color>() = {}", std::mem::size_of::<Color>());
     println!("size_of::<Colors>() = {}", std::mem::size_of::<Colors>());
 
-    // ---- 5. resize ----
+    // ---- 6. resize ----
     let before = term.grid().screen_lines();
     term.resize(ProbeSize { cols: 40, rows: 12 });
     let after = term.grid().screen_lines();
