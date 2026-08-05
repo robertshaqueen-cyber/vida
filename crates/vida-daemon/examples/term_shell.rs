@@ -118,8 +118,9 @@ fn count_style_cells(term: &Term<VoidListener>) -> usize {
 }
 
 /// 原地重绘：光标归位 → 逐行 grid（每行 \x1b[K 清到行尾，不残留
-/// 上一帧字符，省掉整屏 2J）→ 光标定位。行数 = grid 行数，不多不少。
-fn redraw(term: &Term<VoidListener>) {
+/// 上一帧字符，省掉整屏 2J）→ grid 下方预留一行画状态消息 →
+/// 光标定位。行数 = grid 行数，不多不少。
+fn redraw(term: &Term<VoidListener>, status: &str, rows: usize) {
     let mut out = String::with_capacity(4 * 1024);
     out.push_str("\x1b[H");
     let mut current_row: i32 = i32::MIN;
@@ -134,6 +135,9 @@ fn redraw(term: &Term<VoidListener>) {
         out.push(indexed.cell.c);
     }
     out.push_str("\x1b[K"); // 最后一行清到行尾（不换行）
+    // 状态行：grid 下方预留一行，循环内的状态消息画在这里，
+    // 不会被 redraw 覆盖。
+    out.push_str(&format!("\x1b[{};1H\x1b[K{}", rows + 1, status));
     // 光标定位（ANSI 1-based，grid 内 0-based）
     let cursor = term.grid().cursor.point;
     out.push_str(&format!(
@@ -199,12 +203,25 @@ fn stdin_thread(tx: Sender<Ev>) {
 }
 
 fn main() -> Result<()> {
-    // ---- 1. 打开 PTY 80×24 ----
+    // ---- 0. 真实终端尺寸（SIGWINCH 动态 resize 留到 M2a-2 的
+    //          ResizeSession，本轮不做；此处仅启动时取一次）----
+    // crossterm::terminal::size() 在非 tty（管道/重定向）或伪 TTY 下
+    // 可能失败或返回 0，均降级 80×24。
+    let (cols, rows) = crossterm::terminal::size()
+        .map(|(c, r)| (c as usize, r as usize))
+        .unwrap_or((80, 24));
+    let (cols, rows) = if cols == 0 || rows == 0 {
+        (80, 24)
+    } else {
+        (cols, rows)
+    };
+
+    // ---- 1. 打开 PTY（尺寸匹配真实终端）----
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: rows as u16,
+            cols: cols as u16,
             ..Default::default()
         })
         .context("openpty 失败")?;
@@ -229,8 +246,7 @@ fn main() -> Result<()> {
         scrolling_history: 3000,
         ..Config::default()
     };
-    let mut term: Term<VoidListener> =
-        Term::new(config, &ShellSize { cols: 80, rows: 24 }, VoidListener);
+    let mut term: Term<VoidListener> = Term::new(config, &ShellSize { cols, rows }, VoidListener);
     let mut processor: Processor<StdSyncHandler> = Processor::new();
 
     // ---- 4. 事件通道 + PTY 读线程 ----
@@ -272,9 +288,11 @@ fn main() -> Result<()> {
     // dirty = 有内容变化但尚未重绘（16ms 间隔内合并）。
     let mut dirty = false;
     let mut last_redraw = Instant::now() - REDRAW_INTERVAL;
+    // 状态行：循环内消息画在 grid 下方，redraw 一并绘制
+    let mut status = String::new();
 
     // ---- 启动即绘制：空网格 + 提示行（让用户知道程序已在运行）----
-    redraw(&term);
+    redraw(&term, &status, rows);
 
     while !pty_closed {
         // 带超时轮询：超时 ≤ 16ms，保证超时返回时能补一次重绘
@@ -289,7 +307,9 @@ fn main() -> Result<()> {
                 // Ctrl+] = 退出程序（不转发给 PTY）
                 if bytes.contains(&EXIT_BYTE) {
                     if !exit_requested {
-                        say("Ctrl+] 收到，关闭 PTY writer，等待 shell 自行退出");
+                        status =
+                            "[term_shell] Ctrl+] 收到，关闭 PTY writer，等待 shell 自行退出".into();
+                        dirty = true;
                         writer.take(); // 关闭 writer → shell 收到 EOF
                         exit_requested = true;
                         exit_deadline = Some(Instant::now() + EXIT_KILL_TIMEOUT);
@@ -303,7 +323,7 @@ fn main() -> Result<()> {
                 }
             }
             Ok(Ev::OutputClosed) => {
-                say("PTY 已关闭，等待子进程回收");
+                status = "[term_shell] PTY 已关闭，等待子进程回收".into();
                 pty_closed = true;
             }
             Ok(Ev::InputClosed) => {
@@ -311,7 +331,9 @@ fn main() -> Result<()> {
                 // 真实终端中 Ctrl+D 是把 0x04 传给 shell 由 shell 决定，
                 // 这里只记录日志，不关闭 writer —— 程序唯一退出出口
                 // 是 Ctrl+]。
-                say("stdin EOF（Ctrl+D 或重定向），输入通道关闭，程序继续运行");
+                status =
+                    "[term_shell] stdin EOF（Ctrl+D 或重定向），输入通道关闭，程序继续运行".into();
+                dirty = true;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // 无事件：dirty 且已过间隔则补一次重绘
@@ -324,14 +346,15 @@ fn main() -> Result<()> {
             && !pty_closed
             && Instant::now() >= deadline
         {
-            say("shell 2 秒内未退出，强制终止（SIGKILL）");
+            status = "[term_shell] shell 2 秒内未退出，强制终止（SIGKILL）".into();
+            dirty = true;
             let _ = child.kill();
             exit_deadline = None;
         }
 
         // 绘制限频：≥16ms 且有变化才重绘
         if dirty && last_redraw.elapsed() >= REDRAW_INTERVAL {
-            redraw(&term);
+            redraw(&term, &status, rows);
             last_redraw = Instant::now();
             dirty = false;
         }
@@ -339,7 +362,7 @@ fn main() -> Result<()> {
 
     // ---- 7. 最后补一次重绘（把最终状态画出来）+ 统计 ----
     if dirty {
-        redraw(&term);
+        redraw(&term, &status, rows);
     }
     say(&format!(
         "styled cells: {}（含颜色的 cell 数；颜色重绘留待 --ansi 模式）",

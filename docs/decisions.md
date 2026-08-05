@@ -618,3 +618,17 @@ term_shell 三轮评审中三类 bug（限频跳过、启动即退出）均因
 「本工具的行为依赖真实 TTY，expect 测试无法覆盖启动路径，
 需所有者在真实终端中确认」，并列出 expect 覆盖了什么、
 没覆盖什么。
+
+### M2a-1 结论 12：vim 默认无状态栏，TUI 验收判据选择
+
+检查点 B 中 vim 启动画面「无状态栏」曾被误判为渲染缺陷，实为
+vim 默认 `laststatus=1`（单窗口不显示状态栏）的正确行为，与
+Term 渲染无关。
+
+**验收 TUI 渲染时**：应挑选默认就有明显边框/状态行的程序
+（htop、less、tmux），vim 的启动画面不适合作为唯一判据。
+
+**另记录**：`crossterm::terminal::size()` 在伪 TTY（expect）下
+可能返回 0×0，直接用于 `PtySize`/`Term` 会触发
+alacritty grid 的 `columns() - 1` 下溢 panic（grid/mod.rs:499）。
+非 tty / 0 尺寸均须降级 80×24。
