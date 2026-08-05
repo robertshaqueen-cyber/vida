@@ -179,7 +179,7 @@ impl State {
         let scrollback_lines = val
             .get("scrollback_lines")
             .and_then(|v| v.as_u64())
-            .unwrap_or(5000)
+            .unwrap_or(3000)
             .to_string();
 
         let language = match vida_core::config::load_language_choice().as_deref() {
@@ -464,9 +464,10 @@ impl State {
         let title = text(i18n.tr("settings_terminal")).size(20);
 
         let scroll_label = text(i18n.tr("settings_scrollback")).size(14);
-        let scroll_input = text_input("5000", &self.scrollback_lines)
+        let scroll_input = text_input("3000", &self.scrollback_lines)
             .on_input(AppMessage::SettingsScrollbackChanged)
             .width(Length::Fill);
+        let scroll_hint = text(i18n.tr("settings_scrollback_hint")).size(11);
 
         let can_save = !self.saving;
         let save_btn = if self.saving {
@@ -497,6 +498,7 @@ impl State {
             rule::horizontal(1),
             scroll_label,
             scroll_input,
+            scroll_hint,
             save_btn,
             status_text,
             error_text,

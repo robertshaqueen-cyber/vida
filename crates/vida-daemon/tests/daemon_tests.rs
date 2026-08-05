@@ -1006,7 +1006,7 @@ async fn get_settings_returns_vault_settings() {
     let resp = send_recv(&mut ws, &mut reader, r#"{"method":"GetSettings","id":3}"#).await;
     assert_eq!(resp["type"], "Ok", "GetSettings should succeed: {}", resp);
     let result = &resp["result"];
-    assert_eq!(result["scrollback_lines"], 5000, "default scrollback_lines");
+    assert_eq!(result["scrollback_lines"], 3000, "default scrollback_lines");
     assert!(
         result["sync_local_path"].is_null(),
         "default sync_local_path is null"

@@ -442,7 +442,7 @@ M2a-2 中 PTY 侧 ioctl 与 Term::resize 必须成对调用（陷阱 #5）。
 ### 滚动回看容量
 
 `Config.scrolling_history`（默认 10000）。M2a-2 接入时须从金库
-`Settings.scrollback_lines`（默认 5000）读取并显式设置。
+`Settings.scrollback_lines`（默认 3000，见结论 2）读取并显式设置。
 `Term::resize` 不改变历史容量；`Term::new` 时由
 `config.scrolling_history` 决定（term/mod.rs:414）。
 
@@ -455,3 +455,56 @@ M2a-2 中 PTY 侧 ioctl 与 Term::resize 必须成对调用（陷阱 #5）。
 3. 光标从 `term.grid().cursor.point` 读取，每帧必推。
 4. wide 标志直接来自 `Cell.flags`（WIDE_CHAR），协议 flags 字段
    已预留 wide 位（规格 5.4 的 flags: u8）。
+
+### 结论 1：damage 提供「行 + 列范围」，推送协议按列区间发送
+
+检查点 A 实测：`Partial([(5, 0, 25), (6, 0, 0)])` = (行号, 起始列, 结束列)。
+
+推送协议据此调整——**不必发送整行，只发送 damage 报告的列区间**。
+M2a-2 的帧格式改为：
+
+```
+[seq: u64 BE]                        // 单调递增，检测丢帧
+[cursor_row: u16][cursor_col: u16][cursor_visible: u8]
+[line_count: u16]
+  每行：
+    [row: u16][start_col: u16][end_col: u16][run_count: u16]
+      每个 run：
+        [run_len: u16]
+        [flags: u8]                  // bold/italic/underline/reverse/... + wide
+        [fg_tag: u8][fg payload]     // 0x00 默认(0字节) / 0x01 索引(1字节) / 0x02 RGB(3字节)
+        [bg_tag: u8][bg payload]
+        [char_len: u8][char bytes]   // UTF-8，run 内所有 cell 同字符时才合并
+```
+
+RLE 只覆盖 `start_col..=end_col` 区间。相比整行发送，yes/htop 这类
+高频局部刷新场景的带宽显著降低。
+
+**reset 时机**：每次推送完成后必须调用 `term.reset_damage()`，否则脏区
+累积，下次推送会重复发送旧行。`damage()` 与 `reset_damage()` 是成对操作。
+
+**要求测试**（M2a-2 实现时）：连续两次写入之间调用 `reset_damage()`，
+断言第二次 `damage()` 不包含第一次写入的行。
+
+### 结论 2：scrollback 默认值 5000 → 3000
+
+`size_of::<Cell>() = 24` 实测。5000 行 × 200 列 × 24 字节 = 24 MB，
+超出「每标签增量 < 20 MB」目标。Cell 内部布局已紧凑
+（char 4 + fg 4 + bg 4 + flags 4 + Option<Arc> 8），无压缩空间。
+
+**决定**：`Settings.scrollback_lines` 默认值从 5000 改为 **3000**。
+3000 × 200 × 24 = 14.4 MB，留出余量给 Grid 的行索引开销。
+
+- 属于 Settings 默认值变更，不改变结构，**不需要升 vault version**
+- 设置页「回滚行数」默认显示同步更新，字段下方加说明：
+  「每 1000 行约占用 5 MB 内存」
+- docs/development.md 内存指标一节写明换算关系
+
+### 结论 3：Config::scrolling_history 必须显式设置
+
+`Config::scrolling_history` 默认 10000（alacritty 的默认值），
+与金库默认 3000 不同。M2a-2 接入时**不得使用 `Config::default()`**，
+必须显式设置为 `Settings.scrollback_lines`。
+
+**要求测试**（M2a-2 实现时）：断言 Term 构造时使用的
+`scrolling_history` 等于金库设置值。
