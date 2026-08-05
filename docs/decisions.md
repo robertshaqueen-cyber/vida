@@ -571,3 +571,50 @@ term_shell 三轮评审发现：限频若施加在**处理**（advance）而不�
 若窗口内变化被丢弃，一次突发输出的**最终状态**永远不会到达
 客户端——与本次屏幕空白的现象完全相同，只是发生在网络一侧。
 `yes` 场景下最终状态（堆积的 y）必须到达，只是可以晚到。
+
+### M2a-1 结论 8：stdin 读取用 libc::read(fd 0)，不用 std::io::Stdin
+
+**症状**：程序启动后立即退出（真实终端/重定向输入下）。expect 伪
+TTY 下测试通过，因为 expect 的 stdin 是打开的、启动后立即有数据。
+
+**根因**（eprintln 诊断确认）：stdin 即时 EOF（如 `/dev/null`）时
+`std::io::Stdin::read` 立即返回 `Ok(0)` → 触发退出链：InputClosed →
+关闭 PTY writer → shell EOF 退出 → OutputClosed → 程序退出。全程
+几十毫秒，表现为「什么都没执行」。
+
+**修复**：stdin 读线程改用 `libc::read(fd 0)`——纯 syscall，绕开
+`std::io::Stdin` 内部的 BufReader 行缓冲（raw mode 下与行缓冲可能
+冲突）。EINTR 重试。
+
+### M2a-1 结论 9：Ev::InputClosed 不关闭 PTY writer
+
+真实终端中 Ctrl+D 是把 `0x04` 字节传给 shell，由 shell 自行决定
+是否退出；客户端不应替它关闭管道。
+
+**规则**：InputClosed 仅记录日志，不动 writer。**程序唯一退出出口
+是 Ctrl+] (0x1d)**。这同时消除了「stdin 线程异常 → 程序退出」的
+整条副作用链——即使 stdin 通道异常结束，终端会话仍继续。
+
+### M2a-1 结论 10：Ctrl+] 退出流程（优雅终止 + SIGKILL 兜底）
+
+portable-pty 的 `Child::kill()` 发送的是 **SIGKILL**（不是 SIGHUP，
+早期注释写错）。Ctrl+] 流程：
+
+1. `writer.take()` —— 关闭写端，shell 收到 EOF **自行退出**（干净）
+2. 等待 OutputClosed，**超时 2 秒**
+3. 超时未退出（shell 卡在子进程）才 `child.kill()`（SIGKILL），
+   打印 warn 说明是强制终止
+
+实测：正常路径 shell EOF 退出 exit_code=0，kill 兜底未触发。
+
+### M2a-1 结论 11：expect 无法覆盖真实 TTY 启动路径
+
+term_shell 三轮评审中三类 bug（限频跳过、启动即退出）均因
+**expect 伪 TTY 与真实终端差异**而漏测：expect 的 stdin 打开且
+启动后立即有数据可读，永远碰不到「真实终端下启动瞬间 read 返回
+0」或「无事件时积压不处理」的情况。
+
+**规则**：交互式工具（term_shell 等）PR 描述必须明确写
+「本工具的行为依赖真实 TTY，expect 测试无法覆盖启动路径，
+需所有者在真实终端中确认」，并列出 expect 覆盖了什么、
+没覆盖什么。

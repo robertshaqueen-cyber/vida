@@ -4881,6 +4881,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures-util",
+ "libc",
  "portable-pty",
  "rand 0.9.5",
  "scopeguard",

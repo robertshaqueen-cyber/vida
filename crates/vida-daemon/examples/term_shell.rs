@@ -165,17 +165,33 @@ fn pty_reader_thread(mut reader: Box<dyn Read + Send>, tx: Sender<Ev>) {
 }
 
 /// stdin 读线程：raw mode 逐字节透传，发 Ev::Input，EOF 发 Ev::InputClosed。
-fn stdin_thread(mut stdin: std::io::Stdin, tx: Sender<Ev>) {
+///
+/// 直接用 libc::read(fd 0) 而非 std::io::Stdin：
+/// std::io::Stdin 内部有 BufReader 行缓冲，raw mode 下可能与其
+/// 冲突（实测：stdin 即时 EOF 时 read 立即 Ok(0)，误触发退出链）。
+/// libc::read 是纯 syscall，无缓冲层，行为与真实终端一致。
+#[cfg(unix)]
+fn stdin_thread(tx: Sender<Ev>) {
     let mut buf = [0u8; 1024];
     loop {
-        match stdin.read(&mut buf) {
-            Ok(0) => break, // stdin EOF（Ctrl+D）
-            Ok(n) => {
-                if tx.send(Ev::Input(buf[..n].to_vec())).is_err() {
-                    return;
+        // EINTR 重试；EOF 返回 0
+        let n = loop {
+            let r = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
+                let _ = tx.send(Ev::InputClosed);
+                return;
             }
-            Err(_) => break,
+            break r as usize;
+        };
+        if n == 0 {
+            break;
+        }
+        if tx.send(Ev::Input(buf[..n].to_vec())).is_err() {
+            return;
         }
     }
     let _ = tx.send(Ev::InputClosed);
@@ -231,8 +247,9 @@ fn main() -> Result<()> {
     // 管道模式（stdin 非 tty）下 raw mode 不可用，降级为行模式继续。
     let raw = enable_raw_mode().is_ok();
     let _guard = RawModeGuard;
-    let stdin = std::io::stdin();
-    let stdin_handle = thread::spawn(move || stdin_thread(stdin, tx));
+    // libc::read(fd 0) 直读，绕开 std::io::Stdin 的 BufReader 行缓冲
+    //（raw mode 下可能与行缓冲冲突，实测 stdin 即时 EOF 时误触发退出链）
+    let stdin_handle = thread::spawn(move || stdin_thread(tx));
     // 主线程仅接收（两个发送端都已移入线程）
 
     // ---- 6. 启动提示 + 主循环 ----
@@ -244,10 +261,13 @@ fn main() -> Result<()> {
     );
 
     let mut pty_closed = false;
-    // Ctrl+] 已请求退出：关闭 writer 通知 shell，但仍继续消费
-    // PTY 输出直到 OutputClosed（shell 真正退出），避免子进程
-    // 因 stdout 缓冲阻塞而永远不退出。
+    // Ctrl+] 已请求退出：关闭 writer 通知 shell（EOF 自行退出），
+    // 仍继续消费 PTY 输出直到 OutputClosed。若 2 秒内 shell 未退出
+    // （如卡在子进程），才 child.kill() 强制终止（SIGKILL，注意
+    // portable-pty 的 kill 是 SIGKILL 不是 SIGHUP）。
     let mut exit_requested = false;
+    let mut exit_deadline: Option<Instant> = None;
+    const EXIT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
     // 绘制限频状态：Term 处理（advance）不限频，只有绘制限频。
     // dirty = 有内容变化但尚未重绘（16ms 间隔内合并）。
     let mut dirty = false;
@@ -269,10 +289,10 @@ fn main() -> Result<()> {
                 // Ctrl+] = 退出程序（不转发给 PTY）
                 if bytes.contains(&EXIT_BYTE) {
                     if !exit_requested {
-                        say("Ctrl+] 收到，关闭 PTY writer + SIGHUP 通知 shell 退出");
-                        writer.take(); // 关闭 PTY writer
-                        let _ = child.kill(); // SIGHUP（标准 PTY 关闭行为）
+                        say("Ctrl+] 收到，关闭 PTY writer，等待 shell 自行退出");
+                        writer.take(); // 关闭 writer → shell 收到 EOF
                         exit_requested = true;
+                        exit_deadline = Some(Instant::now() + EXIT_KILL_TIMEOUT);
                     }
                 } else if let Some(w) = writer.as_mut() {
                     let write_ok = w.write_all(&bytes).is_ok();
@@ -287,15 +307,26 @@ fn main() -> Result<()> {
                 pty_closed = true;
             }
             Ok(Ev::InputClosed) => {
-                // stdin EOF（Ctrl+D）→ 关闭 PTY writer，通知 shell 退出
-                if writer.take().is_some() {
-                    say("stdin EOF，关闭 PTY writer");
-                }
+                // stdin EOF（Ctrl+D 或 stdin 重定向关闭）。
+                // 真实终端中 Ctrl+D 是把 0x04 传给 shell 由 shell 决定，
+                // 这里只记录日志，不关闭 writer —— 程序唯一退出出口
+                // 是 Ctrl+]。
+                say("stdin EOF（Ctrl+D 或重定向），输入通道关闭，程序继续运行");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // 无事件：dirty 且已过间隔则补一次重绘
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break, // 所有发送端关闭
+        }
+
+        // Ctrl+] 超时兜底：2 秒内 shell 未退出（OutputClosed 未到）→ SIGKILL
+        if let Some(deadline) = exit_deadline
+            && !pty_closed
+            && Instant::now() >= deadline
+        {
+            say("shell 2 秒内未退出，强制终止（SIGKILL）");
+            let _ = child.kill();
+            exit_deadline = None;
         }
 
         // 绘制限频：≥16ms 且有变化才重绘
