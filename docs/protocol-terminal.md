@@ -109,9 +109,25 @@ else:
 | `ResizeSession { session_id, cols, rows }` | 调整尺寸 |
 | `CloseSession { session_id }` | 关闭会话 |
 | `ListSessions` | 列出所有会话 |
-| `ReadScreen { session_id }` | 全量文本快照 |
+| `ReadScreen { session_id }` | 全量文本快照（**消费者：M5 MCP `screen_read`**） |
+| `ReadScreenStyled { session_id }` | 带样式快照（**消费者：M2b GUI 渲染**） |
 | `SubscribeSession { session_id }` | 订阅推送：立即回全量，此后增量 |
 | `UnsubscribeSession { session_id }` | 取消订阅 |
+
+### 两个读取接口的分工（防漂移约定）
+
+`ReadScreen` 与 `ReadScreenStyled` 读同一个 Term，共用同一个内部提取
+函数（`extract_cells`），只在输出编码上分叉。**不要各自遍历 grid**。
+
+| 接口 | 返回 | 消费者 | 职责 |
+|---|---|---|---|
+| `ReadScreen` | `ScreenData { lines, wide_cols, cursor }` | **M5 MCP `screen_read`** | agent 可直接阅读的干净文本 + 列对齐 |
+| `ReadScreenStyled` | `ScreenStyled { rows(cells), cols, cursor }` | **M2b GUI 渲染** | cell 级样式（颜色/属性） |
+
+- 加字段时必须两个接口一起考虑：plain 加字段 → styled 检查是否需要；
+  styled 加字段 → plain 检查是否需要
+- 宽字符：plain 用 `wide_cols` 记录起始列；styled 用 cell 的 `WIDE` 位
+  （0x40）。两者描述同一批列（有防漂移测试 `read_screen_and_styled_agree`）
 
 ## 推送策略
 

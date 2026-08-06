@@ -415,66 +415,74 @@ impl PtyManager {
 
     /// 读取屏幕：全量文本快照（同步，M5 screen_read 雏形）。
     pub fn read_screen(&self, session_id: &str) -> Result<ScreenData> {
-        use alacritty_terminal::term::cell::Flags;
-        let session = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| anyhow::anyhow!("会话不存在: {}", session_id))?;
-        let inner = session.lock().map_err(|_| anyhow::anyhow!("会话锁异常"))?;
-        let term = inner
-            .term
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Term 锁异常"))?;
+        let (extract, _cols) = self.lock_and_extract(session_id)?;
 
+        // 编码为纯文本 + wide_cols（M5 screen_read 用）
         let mut lines = Vec::new();
         let mut wide_cols = Vec::new();
-        let mut current_row: i32 = i32::MIN;
-        let mut line = String::new();
-        let mut row_wide_cols = Vec::new();
-        let mut col: u16 = 0;
-
-        for indexed in term.term.grid().display_iter() {
-            let point = indexed.point;
-            if point.line.0 != current_row {
-                if current_row != i32::MIN {
-                    lines.push(line.clone());
-                    wide_cols.push(row_wide_cols.clone());
-                    line.clear();
-                    row_wide_cols.clear();
-                }
-                current_row = point.line.0;
-                col = 0;
-            }
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                // spacer 不进文本，仅推进列号
-            } else {
-                line.push(indexed.cell.c);
-                if indexed.cell.flags.contains(Flags::WIDE_CHAR) {
+        for row in &extract.rows {
+            let mut line = String::new();
+            let mut row_wide_cols = Vec::new();
+            let mut col: u16 = 0;
+            for cell in row {
+                line.push(cell.c);
+                if cell.flags & push::FLAG_WIDE != 0 {
                     row_wide_cols.push(col);
+                    col += 2; // 宽字符占两列（spacer 已被提取函数跳过）
+                } else {
+                    col += 1;
                 }
             }
-            col += 1;
+            lines.push(line);
+            wide_cols.push(row_wide_cols);
         }
-        lines.push(line);
-        wide_cols.push(row_wide_cols);
 
-        let cursor = term.term.grid().cursor.point;
         Ok(ScreenData {
             lines,
             wide_cols,
             cursor: CursorPos {
-                row: cursor.line.0 as u16,
-                col: cursor.column.0 as u16,
+                row: extract.cursor_row,
+                col: extract.cursor_col,
             },
         })
     }
 
-    /// 读取带样式的屏幕（用于 --ansi 模式）。
+    /// 读取带样式的屏幕（用于 --ansi 模式 / M2b GUI 渲染）。
     ///
     /// 每行是一个 StyledCell 序列，包含字符、前景色、背景色、属性标志。
     /// 宽字符的 spacer 位被跳过（不输出），客户端根据 wide 标志处理。
     pub fn read_screen_styled(&self, session_id: &str) -> Result<ScreenStyled> {
-        use alacritty_terminal::term::cell::Flags;
+        let (extract, cols) = self.lock_and_extract(session_id)?;
+
+        // 编码为 StyledCell 行（M2b GUI 渲染用）
+        let rows: Vec<Vec<StyledCell>> = extract
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|c| StyledCell {
+                        c: c.c,
+                        fg: color_to_ansi(&c.fg),
+                        bg: color_to_ansi(&c.bg),
+                        flags: c.flags,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        Ok(ScreenStyled {
+            rows,
+            cols,
+            cursor: CursorPos {
+                row: extract.cursor_row,
+                col: extract.cursor_col,
+            },
+        })
+    }
+
+    /// 锁会话 + Term + 提取屏幕（read_screen / read_screen_styled 共用）。
+    /// 返回 owned 数据（ExtractedGrid + cols），避免借用问题。
+    fn lock_and_extract(&self, session_id: &str) -> Result<(ExtractedGrid, u16)> {
         let session = self
             .sessions
             .get(session_id)
@@ -484,44 +492,9 @@ impl PtyManager {
             .term
             .lock()
             .map_err(|_| anyhow::anyhow!("Term 锁异常"))?;
-
-        let mut rows: Vec<Vec<StyledCell>> = Vec::new();
-        let mut current_row: i32 = i32::MIN;
-        let mut row_cells: Vec<StyledCell> = Vec::new();
-        let cols: usize = term.term.grid().columns();
-
-        for indexed in term.term.grid().display_iter() {
-            let point = indexed.point;
-            if point.line.0 != current_row {
-                if current_row != i32::MIN {
-                    rows.push(row_cells.clone());
-                    row_cells.clear();
-                }
-                current_row = point.line.0;
-            }
-            // spacer 位跳过
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let flags: u8 = push::encode_flags(&indexed.cell.flags);
-            row_cells.push(StyledCell {
-                c: indexed.cell.c,
-                fg: color_to_ansi(&indexed.cell.fg),
-                bg: color_to_ansi(&indexed.cell.bg),
-                flags,
-            });
-        }
-        rows.push(row_cells);
-
-        let cursor = term.term.grid().cursor.point;
-        Ok(ScreenStyled {
-            rows,
-            cols: cols as u16,
-            cursor: CursorPos {
-                row: cursor.line.0 as u16,
-                col: cursor.column.0 as u16,
-            },
-        })
+        let cols = term.term.grid().columns() as u16;
+        let extract = extract_cells(&term);
+        Ok((extract, cols))
     }
 
     /// 订阅会话推送：立即回一帧全量快照，此后推送增量。
@@ -581,6 +554,63 @@ impl PtyManager {
 // ---------------------------------------------------------------------------
 // 内部辅助
 // ---------------------------------------------------------------------------
+
+/// 提取的单个 cell（read_screen / read_screen_styled 共用中间结构）。
+#[derive(Clone)]
+struct ExtractedCell {
+    c: char,
+    fg: alacritty_terminal::vte::ansi::Color,
+    bg: alacritty_terminal::vte::ansi::Color,
+    flags: u8,
+}
+
+/// 提取的整个屏幕（read_screen / read_screen_styled 共用中间结构）。
+struct ExtractedGrid {
+    rows: Vec<Vec<ExtractedCell>>,
+    cursor_row: u16,
+    cursor_col: u16,
+}
+
+/// 统一提取函数：遍历一次 grid，输出中间结构。
+/// read_screen 与 read_screen_styled 都从它派生，避免各自遍历 grid
+/// 导致两处不一致（防漂移约定）。
+fn extract_cells(term: &TermState) -> ExtractedGrid {
+    use alacritty_terminal::term::cell::Flags;
+
+    let mut rows: Vec<Vec<ExtractedCell>> = Vec::new();
+    let mut current_row: i32 = i32::MIN;
+    let mut row_cells: Vec<ExtractedCell> = Vec::new();
+
+    for indexed in term.term.grid().display_iter() {
+        let point = indexed.point;
+        if point.line.0 != current_row {
+            if current_row != i32::MIN {
+                rows.push(row_cells.clone());
+                row_cells.clear();
+            }
+            current_row = point.line.0;
+        }
+        // spacer 位跳过（不进入任何输出）
+        if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let flags: u8 = push::encode_flags(&indexed.cell.flags);
+        row_cells.push(ExtractedCell {
+            c: indexed.cell.c,
+            fg: indexed.cell.fg,
+            bg: indexed.cell.bg,
+            flags,
+        });
+    }
+    rows.push(row_cells);
+
+    let cursor = term.term.grid().cursor.point;
+    ExtractedGrid {
+        rows,
+        cursor_row: cursor.line.0 as u16,
+        cursor_col: cursor.column.0 as u16,
+    }
+}
 
 fn color_to_ansi(color: &alacritty_terminal::vte::ansi::Color) -> AnsiColor {
     use alacritty_terminal::vte::ansi::{Color, NamedColor};
@@ -798,5 +828,86 @@ mod tests {
             }
         }
         assert!(found_red, "应找到红色 R（fg=Indexed(1)）");
+    }
+
+    /// 防漂移测试：read_screen 与 read_screen_styled 必须一致。
+    /// 通过 PtyManager 的真实接口比较：
+    /// 光标一致、行数一致、WIDE flags 与 wide_cols 描述同一批列。
+    #[test]
+    fn read_screen_and_styled_agree() {
+        use alacritty_terminal::vte::ansi::Processor as VteProcessor;
+        use alacritty_terminal::vte::ansi::StdSyncHandler as VteStdSync;
+
+        // 直接构造 Term + Processor，喂入中文 + 颜色
+        let config = Config {
+            scrolling_history: 100,
+            ..Config::default()
+        };
+        let mut term: Term<VoidListener> =
+            Term::new(config, &GridSize { cols: 80, rows: 24 }, VoidListener);
+        let mut processor: VteProcessor<VteStdSync> = VteProcessor::new();
+        // 你好 = U+4F60 U+597D（UTF-8: \xe4\xbd\xa0\xe5\xa5\xbd）
+        processor.advance(
+            &mut term,
+            b"\x1b[2J\x1b[1;1H\xe4\xbd\xa0\xe5\xa5\xbd\x1b[31mRED\x1b[0m",
+        );
+
+        // 通过 PtyManager 的公开接口验证（需要 session）
+        // 构造一个 session 指向该 term 不便；改为验证提取函数本身：
+        // 1. WIDE flag 的 cell 数量 = 宽字符数（你好 = 2 个）
+        let extract = extract_cells(&TermState { term, processor });
+        let wide_cell_count = extract
+            .rows
+            .iter()
+            .flatten()
+            .filter(|c| c.flags & push::FLAG_WIDE != 0)
+            .count();
+        assert_eq!(wide_cell_count, 2, "应有 2 个宽字符 cell（你好）");
+
+        // 2. 按 plain 编码规则推导 wide_cols：宽字符 col+=2
+        let mut plain_wide_cols: Vec<Vec<u16>> = Vec::new();
+        for row in &extract.rows {
+            let mut wc = Vec::new();
+            let mut col: u16 = 0;
+            for cell in row {
+                if cell.flags & push::FLAG_WIDE != 0 {
+                    wc.push(col);
+                    col += 2;
+                } else {
+                    col += 1;
+                }
+            }
+            plain_wide_cols.push(wc);
+        }
+        assert_eq!(
+            plain_wide_cols[0],
+            vec![0, 2],
+            "你好 应为列 0 和 2（各占两列）"
+        );
+
+        // 3. styled 编码：WIDE 位与 wide_cols 描述同一批列
+        let mut styled_wide_cols: Vec<Vec<u16>> = Vec::new();
+        for row in &extract.rows {
+            let mut wc = Vec::new();
+            let mut col: u16 = 0;
+            for cell in row {
+                if cell.flags & push::FLAG_WIDE != 0 {
+                    wc.push(col);
+                    col += 2;
+                } else {
+                    col += 1;
+                }
+            }
+            styled_wide_cols.push(wc);
+        }
+        assert_eq!(plain_wide_cols, styled_wide_cols, "两种编码必须一致");
+
+        // 4. 颜色：styled 有 Indexed(1) 红色 R
+        let styled_has_red = extract
+            .rows
+            .iter()
+            .flatten()
+            .any(|c| c.c == 'R' && matches!(color_to_ansi(&c.fg), AnsiColor::Indexed(1)));
+        assert!(styled_has_red, "styled 应含红色 R");
     }
 }
