@@ -59,7 +59,12 @@ enum Commands {
         rows: u16,
     },
     /// 监听推送帧
-    Watch { session_id: String },
+    Watch {
+        session_id: String,
+        /// 运行 N 秒后自动退出并打印统计（Ctrl+C 同样触发）
+        #[arg(long)]
+        duration: Option<u64>,
+    },
     /// 列出会话
     List,
     /// 关闭会话
@@ -107,6 +112,7 @@ fn parse_escape(input: &str) -> Result<Vec<u8>> {
             Some('r') => out.push(0x0D),
             Some('t') => out.push(0x09),
             Some('e') => out.push(0x1B),
+            Some('\\') => out.push(0x5C),
             Some('x') => {
                 let hex: String = chars.by_ref().take(2).collect();
                 let byte = u8::from_str_radix(&hex, 16)
@@ -117,9 +123,14 @@ fn parse_escape(input: &str) -> Result<Vec<u8>> {
                 if chars.next() != Some('{') {
                     anyhow::bail!("\\u 转义必须使用 {{}} 包裹，如 \\u{{4f60}}");
                 }
-                let hex: String = chars.by_ref().take_while(|c| *c != '}').collect();
-                if chars.next() != Some('}') {
-                    anyhow::bail!("\\u 转义未闭合: \\u{{{}", hex);
+                let mut hex = String::new();
+                loop {
+                    match chars.next() {
+                        Some(c) if c != '}' => hex.push(c),
+                        Some('}') => break,
+                        Some(_) => {}
+                        None => anyhow::bail!("\\u 转义未闭合: \\u{{{}", hex),
+                    }
                 }
                 let cp = u32::from_str_radix(&hex, 16)
                     .with_context(|| format!("无效的 Unicode 码点: \\u{{{}", hex))?;
@@ -553,56 +564,127 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Watch { session_id } => {
+        Commands::Watch {
+            session_id,
+            duration,
+        } => {
             // 先订阅
             let sub_req = Request::Pty(PtyRequest::SubscribeSession {
                 session_id: session_id.clone(),
             });
             client.call(&sub_req).await?;
+            eprintln!("已订阅 {}（Ctrl+C 或 --duration 到期退出）", session_id);
 
             let mut last_seq: Option<u64> = None;
             let mut last_time = std::time::Instant::now();
+            let start_time = std::time::Instant::now();
+            let mut frame_count: u64 = 0;
+            let mut total_bytes: u64 = 0;
+            let mut intervals_ms: Vec<u128> = Vec::new();
+
+            // 退出信号：Ctrl+C 或 duration 到期（duration 用截止时间，不随循环重置）
+            let duration_deadline =
+                duration.map(|d| std::time::Instant::now() + std::time::Duration::from_secs(d));
 
             loop {
-                match client.recv_raw().await {
-                    Some(Ok(Message::Binary(bytes))) => {
-                        let now = std::time::Instant::now();
-                        let interval_ms = now.duration_since(last_time).as_millis();
-                        if let Some((seq, line_count)) = decode_frame(&bytes) {
-                            let expected_seq = last_seq.map(|s| s + 1).unwrap_or(seq);
-                            let seq_status = if seq == expected_seq { "OK" } else { "GAP!" };
-                            println!(
-                                "seq={:4} lines={:3} bytes={:5} interval={}ms [{}]",
-                                seq,
-                                line_count,
-                                bytes.len(),
-                                interval_ms,
-                                seq_status
-                            );
-                            last_seq = Some(seq);
-                        } else {
-                            println!(
-                                "invalid frame: {} bytes, interval={}ms",
-                                bytes.len(),
-                                interval_ms
-                            );
+                let ctrl_c = tokio::signal::ctrl_c();
+                let duration_sleep = async {
+                    if let Some(deadline) = duration_deadline {
+                        tokio::time::sleep_until(deadline.into()).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    msg = client.recv_raw() => {
+                        match msg {
+                            Some(Ok(Message::Binary(bytes))) => {
+                                let now = std::time::Instant::now();
+                                let interval_ms = now.duration_since(last_time).as_millis();
+                                last_time = now;
+                                intervals_ms.push(interval_ms);
+                                frame_count += 1;
+                                total_bytes += bytes.len() as u64;
+
+                                if let Some((seq, line_count)) = decode_frame(&bytes) {
+                                    let expected_seq = last_seq.map(|s| s + 1).unwrap_or(seq);
+                                    let seq_status = if seq == expected_seq { "OK" } else { "GAP!" };
+                                    println!(
+                                        "seq={:4} lines={:3} bytes={:5} interval={}ms [{}]",
+                                        seq, line_count, bytes.len(), interval_ms, seq_status
+                                    );
+                                    last_seq = Some(seq);
+                                } else {
+                                    println!(
+                                        "invalid frame: {} bytes, interval={}ms",
+                                        bytes.len(), interval_ms
+                                    );
+                                }
+                            }
+                            Some(Ok(Message::Text(text))) => {
+                                println!("text: {}", text);
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                eprintln!("error: {}", e);
+                                break;
+                            }
+                            None => {
+                                eprintln!("连接关闭");
+                                break;
+                            }
                         }
-                        last_time = now;
                     }
-                    Some(Ok(Message::Text(text))) => {
-                        println!("text: {}", text);
-                    }
-                    Some(Ok(_)) => {} // Ping/Pong/Frame 忽略
-                    Some(Err(e)) => {
-                        eprintln!("error: {}", e);
+                    _ = ctrl_c => {
+                        eprintln!("\n[watch] Ctrl+C 收到，退出");
                         break;
                     }
-                    None => {
-                        eprintln!("连接关闭");
+                    _ = duration_sleep => {
+                        eprintln!("\n[watch] --duration 到期，退出");
                         break;
                     }
                 }
             }
+
+            // 统计
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let avg_interval = if !intervals_ms.is_empty() {
+                intervals_ms.iter().sum::<u128>() as f64 / intervals_ms.len() as f64
+            } else {
+                0.0
+            };
+            let min_interval = intervals_ms.iter().min().copied().unwrap_or(0);
+            let max_interval = intervals_ms.iter().max().copied().unwrap_or(0);
+            let below_16 = intervals_ms.iter().filter(|&&v| v < 16).count();
+            let below_pct = if intervals_ms.is_empty() {
+                0.0
+            } else {
+                100.0 * below_16 as f64 / intervals_ms.len() as f64
+            };
+            let fps = if elapsed > 0.0 {
+                frame_count as f64 / elapsed
+            } else {
+                0.0
+            };
+
+            eprintln!(
+                "=== 统计 ===\n\
+                 帧数: {}（{:.1} fps）\n\
+                 总字节: {}（{:.2} KB/s）\n\
+                 平均间隔: {:.1} ms\n\
+                 最小间隔: {} ms\n\
+                 最大间隔: {} ms\n\
+                 低于 16ms: {} 帧（{:.1}%）",
+                frame_count,
+                fps,
+                total_bytes,
+                total_bytes as f64 / elapsed.max(0.001) / 1000.0,
+                avg_interval,
+                min_interval,
+                max_interval,
+                below_16,
+                below_pct
+            );
         }
 
         Commands::List => {
@@ -657,4 +739,57 @@ async fn main() -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(200), client.read.next()).await;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::parse_escape;
+
+    /// 必改 1：\xNN 转义解析必须产生正确的字节值。
+    #[test]
+    fn escape_xnn_produces_correct_bytes() {
+        assert_eq!(parse_escape("\\x03").unwrap(), vec![3]);
+        assert_eq!(parse_escape("\\x1b").unwrap(), vec![27]);
+        assert_eq!(parse_escape("\\x41").unwrap(), vec![65]); // 'A'
+    }
+
+    /// 必改 1：常用转义序列。
+    #[test]
+    fn escape_common_sequences() {
+        assert_eq!(parse_escape("\\n").unwrap(), vec![10]);
+        assert_eq!(parse_escape("\\r").unwrap(), vec![13]);
+        assert_eq!(parse_escape("\\t").unwrap(), vec![9]);
+        assert_eq!(parse_escape("\\e").unwrap(), vec![27]);
+        assert_eq!(parse_escape("\\\\").unwrap(), vec![92]);
+    }
+
+    /// 必改 1：\u{NNNN} 转义为 UTF-8 字节。
+    #[test]
+    fn escape_unicode_codepoint() {
+        // 「你」= U+4F60 = UTF-8 [228, 189, 160]
+        assert_eq!(parse_escape("\\u{4f60}").unwrap(), vec![228, 189, 160]);
+    }
+
+    /// 必改 1：混合文本 + 转义。
+    #[test]
+    fn escape_mixed_text() {
+        assert_eq!(parse_escape("echo hi\\n").unwrap(), b"echo hi\n".to_vec());
+        assert_eq!(
+            parse_escape("ls --color\\n").unwrap(),
+            b"ls --color\n".to_vec()
+        );
+    }
+
+    /// 必改 1：无效转义应报错而非静默产出错误字节。
+    #[test]
+    fn escape_invalid_errors() {
+        assert!(parse_escape("\\q").is_err(), "未知转义应报错");
+        assert!(parse_escape("\\x").is_err(), "不完整 \\x 应报错");
+        assert!(parse_escape("\\xZZ").is_err(), "非法十六进制应报错");
+        assert!(parse_escape("\\u{110000}").is_err(), "超范围码点应报错");
+    }
 }

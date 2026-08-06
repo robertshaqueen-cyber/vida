@@ -207,7 +207,14 @@ pub fn build_partial_frame(
     damage: &[(usize, usize, usize)],
 ) -> Frame {
     let mut lines: Vec<DirtyLine> = Vec::new();
+    let rows: usize = term.grid().screen_lines();
     for &(line, left, right) in damage {
+        // 只发送可见屏幕内的脏行。
+        // damage 行号是 grid 绝对坐标（含 scrollback 偏移），
+        // 超出屏幕的行是滚动历史，客户端不渲染（跳过避免 row>rows 异常）。
+        if line >= rows {
+            continue;
+        }
         if let Some(dirty_line) =
             build_dirty_line_range(term, line as u16, left as u16, right as u16)
         {
