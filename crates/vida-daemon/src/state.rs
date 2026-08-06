@@ -18,6 +18,8 @@ pub struct DaemonState {
     pub vault_path: PathBuf,
     pub sync: Option<SyncCoordinator>,
     pub i18n: vida_core::i18n::I18n,
+    /// PTY 会话管理器：独立锁（Arc<RwLock>），PTY 路径不持有金库锁。
+    pub pty: std::sync::Arc<std::sync::RwLock<crate::pty::PtyManager>>,
 }
 
 impl DaemonState {
@@ -30,6 +32,7 @@ impl DaemonState {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::detect_lang()),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         })
     }
 
@@ -551,6 +554,7 @@ mod tests {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
 
         let passphrase = "test-passphrase";
@@ -588,6 +592,7 @@ mod tests {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
         state.lock();
@@ -631,6 +636,7 @@ mod tests {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
         state.lock();
@@ -663,6 +669,7 @@ mod tests {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
         state.lock();
@@ -698,6 +705,7 @@ mod tests {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
         state.lock();
@@ -725,6 +733,7 @@ mod tests {
             vault_path,
             sync: None,
             i18n: vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn),
+            pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
         state.lock();

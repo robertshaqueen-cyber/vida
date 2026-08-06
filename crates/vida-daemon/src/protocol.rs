@@ -68,6 +68,24 @@ pub enum Request {
     // Remote missing
     /// Handle RemoteMissing: "reupload" or "clear_state".
     HandleRemoteMissing { action: String },
+
+    // PTY sessions (M2a-2)
+    /// Open a local shell session. Fixed $SHELL, cwd=HOME.
+    OpenLocalSession { cols: u16, rows: u16 },
+    /// Send raw bytes to a session (no line/byte conversion).
+    SessionInput { session_id: String, data: Vec<u8> },
+    /// Resize a session (both PTY ioctl and Term).
+    ResizeSession {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Close a session (kill child + wait).
+    CloseSession { session_id: String },
+    /// List all sessions.
+    ListSessions,
+    /// Read current screen as plain text snapshot.
+    ReadScreen { session_id: String },
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,9 @@ fn test_state(token: &str) -> (DaemonState, tempfile::TempDir) {
         vault_path,
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     (state, dir)
 }
@@ -54,6 +57,9 @@ async fn start_daemon() -> (std::net::SocketAddr, String, tempfile::TempDir) {
         vault_path,
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
 
     let state = Arc::new(Mutex::new(state));
@@ -293,6 +299,9 @@ fn remote_missing_after_delete() {
         vault_path: dir.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state.vault = Some(vida_core::vault::Vault::default());
     state.passphrase = Some("pass".to_string());
@@ -354,6 +363,9 @@ fn remote_missing_clear_state_removes_sync_state() {
         vault_path: dir.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     // Set up without writing file
     state.vault = Some(vida_core::vault::Vault::default());
@@ -398,6 +410,9 @@ fn write_failure_does_not_update_sync_state() {
         vault_path: vault_path.clone(),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state.create_vault("pass").unwrap();
 
@@ -716,6 +731,9 @@ fn downloaded_writes_file_and_updates_vault() {
         vault_path: dir_a.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_a.create_vault("pass").unwrap();
     add_test_host(&mut state_a, "host-from-a");
@@ -728,6 +746,9 @@ fn downloaded_writes_file_and_updates_vault() {
         vault_path: dir_b.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
@@ -776,6 +797,9 @@ fn downloaded_write_failure_preserves_sync_state() {
         vault_path: dir_a.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_a.create_vault("pass").unwrap();
     add_test_host(&mut state_a, "host-from-a");
@@ -788,6 +812,9 @@ fn downloaded_write_failure_preserves_sync_state() {
         vault_path: dir_b.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
@@ -893,6 +920,9 @@ fn conflict_resolve_remote_replaces_vault() {
         vault_path: dir_a.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_a.create_vault("pass").unwrap();
     add_test_host(&mut state_a, "host-a");
@@ -905,6 +935,9 @@ fn conflict_resolve_remote_replaces_vault() {
         vault_path: dir_b.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
@@ -1069,6 +1102,9 @@ fn conflict_sync_returns_remote_hosts() {
         vault_path: dir_a.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_a.create_vault("pass").unwrap();
     add_test_host(&mut state_a, "host-a");
@@ -1081,6 +1117,9 @@ fn conflict_sync_returns_remote_hosts() {
         vault_path: dir_b.path().join("vault.age"),
         sync: None,
         i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
     };
     state_b.vault = Some(vida_core::vault::Vault::default());
     state_b.passphrase = Some("pass".to_string());
@@ -1197,5 +1236,182 @@ fn sync_end_to_end_config_to_upload() {
         matches!(result2, SyncResult::NoChange),
         "expected NoChange on second sync, got: {:?}",
         result2
+    );
+}
+
+// -----------------------------------------------------------------------
+// PTY session tests (M2a-2)
+// -----------------------------------------------------------------------
+
+/// 打开会话 → 输入 → 读屏幕 → resize → 列出 → 关闭。
+/// 覆盖规格 5.2 全部 6 个 IPC 方法。
+#[tokio::test]
+async fn pty_session_full_cycle() {
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut ws, mut reader) = connect(addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    let resp = send_recv(&mut ws, &mut reader, &auth).await;
+    assert_eq!(resp["type"], "Ok", "auth failed: {}", resp);
+
+    // 1. OpenLocalSession
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":24},"id":2}"#,
+    )
+    .await;
+    assert_eq!(resp["type"], "Ok", "open failed: {}", resp);
+    let session_id = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    // 2. SessionInput（data 是字节数组）
+    let input_data = serde_json::to_string(&b"echo hello\r\n".to_vec()).unwrap();
+    let input = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{}}},"id":3}}"#,
+        session_id, input_data
+    );
+    let resp = send_recv(&mut ws, &mut reader, &input).await;
+    assert_eq!(resp["type"], "Ok", "input failed: {}", resp);
+    assert_eq!(resp["result"]["ok"], true);
+
+    // 3. ReadScreen（等 shell 输出到达）
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let screen = format!(
+        r#"{{"method":"ReadScreen","params":{{"session_id":"{}"}},"id":4}}"#,
+        session_id
+    );
+    let resp = send_recv(&mut ws, &mut reader, &screen).await;
+    assert_eq!(resp["type"], "Ok", "read_screen failed: {}", resp);
+    let lines: Vec<String> = resp["result"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("hello"),
+        "screen should contain hello: {}",
+        joined
+    );
+    assert!(
+        resp["result"]["cursor"]["row"].is_number(),
+        "cursor row missing"
+    );
+    assert!(
+        resp["result"]["cursor"]["col"].is_number(),
+        "cursor col missing"
+    );
+
+    // 4. ResizeSession
+    let resize = format!(
+        r#"{{"method":"ResizeSession","params":{{"session_id":"{}","cols":40,"rows":12}},"id":5}}"#,
+        session_id
+    );
+    let resp = send_recv(&mut ws, &mut reader, &resize).await;
+    assert_eq!(resp["type"], "Ok", "resize failed: {}", resp);
+    assert_eq!(resp["result"]["ok"], true);
+
+    // 5. ListSessions — 应含该会话且尺寸已更新
+    let resp = send_recv(&mut ws, &mut reader, r#"{"method":"ListSessions","id":6}"#).await;
+    assert_eq!(resp["type"], "Ok", "list failed: {}", resp);
+    let sessions = resp["result"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "should have 1 session: {}", resp);
+    assert_eq!(sessions[0]["cols"], 40, "cols should be resized");
+    assert_eq!(sessions[0]["rows"], 12, "rows should be resized");
+    assert_eq!(sessions[0]["alive"], true);
+
+    // 6. CloseSession
+    let close = format!(
+        r#"{{"method":"CloseSession","params":{{"session_id":"{}"}},"id":7}}"#,
+        session_id
+    );
+    let resp = send_recv(&mut ws, &mut reader, &close).await;
+    assert_eq!(resp["type"], "Ok", "close failed: {}", resp);
+    assert_eq!(resp["result"]["ok"], true);
+
+    // 关闭后 ListSessions 应为空
+    let resp = send_recv(&mut ws, &mut reader, r#"{"method":"ListSessions","id":8}"#).await;
+    let sessions = resp["result"].as_array().unwrap();
+    assert_eq!(sessions.len(), 0, "sessions should be empty after close");
+}
+
+/// 尺寸校验：0 和超大值必须被拒绝（规格约束 4）。
+#[tokio::test]
+async fn pty_session_size_validation() {
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut ws, mut reader) = connect(addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    let resp = send_recv(&mut ws, &mut reader, &auth).await;
+    assert_eq!(resp["type"], "Ok");
+
+    // cols=0
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":0,"rows":24},"id":2}"#,
+    )
+    .await;
+    assert_eq!(resp["type"], "Error", "cols=0 should be rejected: {}", resp);
+    assert!(resp["message"].as_str().unwrap().contains("不能为 0"));
+
+    // rows=0
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":0},"id":3}"#,
+    )
+    .await;
+    assert_eq!(resp["type"], "Error", "rows=0 should be rejected: {}", resp);
+
+    // 超大 1001×24
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":1001,"rows":24},"id":4}"#,
+    )
+    .await;
+    assert_eq!(
+        resp["type"], "Error",
+        "huge cols should be rejected: {}",
+        resp
+    );
+    assert!(resp["message"].as_str().unwrap().contains("超限"));
+
+    // 超大 80×1001
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":1001},"id":5}"#,
+    )
+    .await;
+    assert_eq!(
+        resp["type"], "Error",
+        "huge rows should be rejected: {}",
+        resp
+    );
+
+    // 非法会话 ID
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"SessionInput","params":{"session_id":"nonexistent","data":"x"},"id":6}"#,
+    )
+    .await;
+    assert_eq!(
+        resp["type"], "Error",
+        "nonexistent session should error: {}",
+        resp
+    );
+    let msg = resp["message"].as_str().unwrap();
+    assert!(
+        !msg.is_empty(),
+        "error message should explain the failure: {}",
+        resp
     );
 }
