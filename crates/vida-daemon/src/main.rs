@@ -19,10 +19,18 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(Mutex::new(vida_daemon::state::DaemonState::new(token)?));
 
-    let addr = vida_daemon::ws_server::start(state).await?;
+    let addr = vida_daemon::ws_server::start(state.clone()).await?;
     info!("WebSocket server listening on {}", addr);
 
     tokio::signal::ctrl_c().await?;
+
+    // 回收所有 PTY 会话子进程，不留僵尸
+    {
+        let state = state.lock().await;
+        if let Ok(mut pty) = state.pty.write() {
+            pty.shutdown();
+        }
+    }
 
     vida_daemon::ws_server::cleanup_token();
     info!("vida daemon shutting down");

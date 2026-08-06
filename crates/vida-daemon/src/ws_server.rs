@@ -8,7 +8,9 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-use crate::protocol::{Request, Response, ResponsePayload, SyncResponse};
+use crate::PushPayload;
+use crate::protocol::{PtyRequest, Request, Response, ResponsePayload, SyncResponse};
+use crate::pty::push::BoundedReceiver;
 use crate::state::DaemonState;
 use vida_core::sync::SyncResult;
 
@@ -103,34 +105,98 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
     let (mut write, mut read) = ws_stream.split();
     let mut authenticated = false;
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let response = handle_message(&text, &state, &mut authenticated).await;
-                if let Err(e) = write.send(Message::Text(response.into())).await {
-                    error!("Failed to send response to {}: {}", addr, e);
+    // 推送通道：PTY 推送循环 → 桥接任务 → tokio channel → 此处
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let mut push_bridge: Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
+        tokio::select! {
+            // WebSocket 输入
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let push_cmd_arc: Arc<Mutex<Option<PushCommand>>> =
+                            Arc::new(Mutex::new(None));
+                        let response = handle_message(
+                            &text, &state, &mut authenticated, &push_cmd_arc,
+                        ).await;
+                        // 处理推送相关命令（订阅/取消订阅）
+                        if let Some(cmd) = push_cmd_arc.lock().await.take() {
+                            match cmd {
+                                PushCommand::Subscribe(rx) => {
+                                    let tx = push_tx.clone();
+                                    // 桥接任务：轮询 std BoundedReceiver（try_recv），
+                                    // 避免阻塞 tokio runtime 线程。
+                                    push_bridge = Some(tokio::spawn(async move {
+                                        loop {
+                                            match rx.try_recv() {
+                                                Some(payload) => {
+                                                    if tx.send(payload.bytes).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                None => {
+                                                    // 无帧时让出，10ms 后重试
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_millis(5),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                    }));
+                                }
+                                PushCommand::Unsubscribe => {
+                                    if let Some(handle) = push_bridge.take() {
+                                        handle.abort();
+                                    }
+                                }
+                            }
+                        }
+                        if let Err(e) = write.send(Message::Text(response.into())).await {
+                            error!("Failed to send response to {}: {}", addr, e);
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        info!("Connection closed by {}", addr);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        error!("Error reading from {}: {}", addr, e);
+                        break;
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+
+            // PTY 推送输出
+            Some(bytes) = push_rx.recv() => {
+                if let Err(e) = write.send(Message::Binary(tokio_tungstenite::tungstenite::Bytes::from(bytes))).await {
+                    error!("Failed to push binary frame to {}: {}", addr, e);
                     break;
                 }
             }
-            Ok(Message::Close(_)) => {
-                info!("Connection closed by {}", addr);
-                break;
-            }
-            Err(e) => {
-                error!("Error reading from {}: {}", addr, e);
-                break;
-            }
-            _ => {}
         }
     }
 
     info!("Connection dropped: {}", addr);
 }
 
+/// 推送控制命令：handle_message 返回给连接层，用于管理订阅桥接。
+enum PushCommand {
+    /// 订阅推送：携带 BoundedReceiver，由连接层启动桥接任务。
+    Subscribe(BoundedReceiver<PushPayload>),
+    /// 取消订阅：中止桥接任务。
+    Unsubscribe,
+}
+
 async fn handle_message(
     text: &str,
     state: &Arc<Mutex<DaemonState>>,
     authenticated: &mut bool,
+    push_cmd_out: &Arc<Mutex<Option<PushCommand>>>,
 ) -> String {
     // Clone i18n once (lightweight, language table only) for all messages in this call
     let i18n = state.lock().await.i18n.clone();
@@ -214,6 +280,96 @@ async fn handle_message(
         }
     };
 
+    // 提前取出 pty 的 Arc 引用（避免持 tokio MutexGuard 跨 await）
+    let pty_arc = state.lock().await.pty.clone();
+
+    // PTY 订阅/取消订阅：在分发前处理，需写入 push_cmd_out
+    if let Request::Pty(PtyRequest::SubscribeSession { session_id }) = &request {
+        // 同步获取订阅接收端（持锁时间最短）
+        let rx = {
+            let pty = match pty_arc.read() {
+                Ok(p) => p,
+                Err(_) => {
+                    return serde_json::to_string(&Response {
+                        id,
+                        payload: ResponsePayload::Error {
+                            code: -5,
+                            message: "PTY 锁异常".to_string(),
+                            category: None,
+                        },
+                    })
+                    .unwrap();
+                }
+            };
+            match pty.subscribe_session(session_id) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    return serde_json::to_string(&Response {
+                        id,
+                        payload: ResponsePayload::Error {
+                            code: -5,
+                            message: format!("{}", e),
+                            category: None,
+                        },
+                    })
+                    .unwrap();
+                }
+            }
+        };
+        // pty guard 已释放，现在可以安全 await
+        push_cmd_out
+            .lock()
+            .await
+            .replace(PushCommand::Subscribe(rx));
+        return serde_json::to_string(&Response {
+            id,
+            payload: ResponsePayload::Ok {
+                result: serde_json::json!({"ok": true}),
+            },
+        })
+        .unwrap();
+    }
+    if let Request::Pty(PtyRequest::UnsubscribeSession { .. }) = &request {
+        // 同步检查会话存在性（持锁时间最短）
+        let has_sessions = {
+            let pty = match pty_arc.read() {
+                Ok(p) => p,
+                Err(_) => {
+                    return serde_json::to_string(&Response {
+                        id,
+                        payload: ResponsePayload::Error {
+                            code: -5,
+                            message: "PTY 锁异常".to_string(),
+                            category: None,
+                        },
+                    })
+                    .unwrap();
+                }
+            };
+            !pty.list_sessions().is_empty()
+        };
+        if !has_sessions {
+            return serde_json::to_string(&Response {
+                id,
+                payload: ResponsePayload::Error {
+                    code: -5,
+                    message: "没有活跃的会话".to_string(),
+                    category: None,
+                },
+            })
+            .unwrap();
+        }
+        // pty guard 已释放，安全 await
+        push_cmd_out.lock().await.replace(PushCommand::Unsubscribe);
+        return serde_json::to_string(&Response {
+            id,
+            payload: ResponsePayload::Ok {
+                result: serde_json::json!({"ok": true}),
+            },
+        })
+        .unwrap();
+    }
+
     let result = handle_request(request, state).await;
 
     match result {
@@ -246,9 +402,20 @@ async fn handle_request(
     request: Request,
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<serde_json::Value> {
+    // PTY 请求：不持金库锁，只锁 state.pty（独立 RwLock）。
+    // PtyRequest 由 #[serde(untagged)] 在反序列化时已分流，
+    // 编译器保证 handle_pty_request 穷尽匹配所有 PtyRequest 变体。
+    if let Request::Pty(pty_req) = &request {
+        return handle_pty_request(pty_req, state).await;
+    }
+
     let mut state = state.lock().await;
 
     match request {
+        // PTY 请求已在 handle_pty_request 处理（上方 if let 提前返回）；
+        // 此处不可达，但编译器需要穷尽匹配。
+        Request::Pty(_) => unreachable!("PTY 请求已在 handle_pty_request 处理"),
+
         Request::Auth { .. } => unreachable!(),
 
         // Vault
@@ -360,6 +527,59 @@ async fn handle_request(
         Request::HandleRemoteMissing { action } => {
             state.handle_remote_missing(&action)?;
             Ok(serde_json::json!({"handled": true}))
+        }
+    }
+}
+
+/// PTY 会话请求（M2a-2）。只锁 `state.pty`（独立 RwLock），
+/// 全程不接触金库锁。编译器强制穷尽匹配所有 PtyRequest 变体。
+#[allow(clippy::all, unused_mut)]
+async fn handle_pty_request(
+    request: &PtyRequest,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<serde_json::Value> {
+    // 短暂拿金库锁仅为了取出 pty 的 Arc 引用，随即释放；
+    // 后续 PTY 操作只持有 pty 自己的 RwLock，不与金库锁争用。
+    let pty = state.lock().await.pty.clone();
+
+    match request {
+        PtyRequest::OpenLocalSession { cols, rows } => {
+            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let session_id = pty.open_session(*cols, *rows)?;
+            Ok(serde_json::json!({"session_id": session_id}))
+        }
+        PtyRequest::SessionInput { session_id, data } => {
+            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            pty.session_input(session_id, data)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        PtyRequest::ResizeSession {
+            session_id,
+            cols,
+            rows,
+        } => {
+            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            pty.resize_session(session_id, *cols, *rows)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        PtyRequest::CloseSession { session_id } => {
+            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            pty.close_session(session_id)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        PtyRequest::ListSessions => {
+            let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let sessions = pty.list_sessions();
+            Ok(serde_json::to_value(sessions)?)
+        }
+        PtyRequest::ReadScreen { session_id } => {
+            let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let screen = pty.read_screen(session_id)?;
+            Ok(serde_json::to_value(screen)?)
+        }
+        // SubscribeSession / UnsubscribeSession 已在 handle_message 层面处理
+        PtyRequest::SubscribeSession { .. } | PtyRequest::UnsubscribeSession { .. } => {
+            anyhow::bail!("PTY 订阅请求未在上游处理（内部错误）")
         }
     }
 }

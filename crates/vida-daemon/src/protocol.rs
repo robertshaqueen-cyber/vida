@@ -68,6 +68,40 @@ pub enum Request {
     // Remote missing
     /// Handle RemoteMissing: "reupload" or "clear_state".
     HandleRemoteMissing { action: String },
+
+    // PTY sessions (M2a-2)
+    // untagged: 尝试将 JSON 直接反序列化为 PtyRequest（内部
+    // tag="method" 匹配）。wire format 不变：
+    // {"method":"OpenLocalSession","params":{...}}
+    #[serde(untagged)]
+    Pty(PtyRequest),
+}
+
+/// PTY 会话相关请求。与 Request 分开使编译器能强制穷尽匹配——
+/// 新增 PtyRequest 变体时若 handle_pty_request 漏加分支，编译失败。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params")]
+pub enum PtyRequest {
+    /// Open a local shell session. Fixed $SHELL, cwd=HOME.
+    OpenLocalSession { cols: u16, rows: u16 },
+    /// Send raw bytes to a session (no line/byte conversion).
+    SessionInput { session_id: String, data: Vec<u8> },
+    /// Resize a session (both PTY ioctl and Term).
+    ResizeSession {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Close a session (kill child + wait).
+    CloseSession { session_id: String },
+    /// List all sessions.
+    ListSessions,
+    /// Read current screen as plain text snapshot.
+    ReadScreen { session_id: String },
+    /// Subscribe to session push: immediate full snapshot, then deltas.
+    SubscribeSession { session_id: String },
+    /// Unsubscribe from session push (drop the receiver).
+    UnsubscribeSession { session_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -170,4 +204,53 @@ pub struct SyncResponse {
     /// Present when ConflictFilesDetected — decoded hosts from conflict files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_hosts: Option<Vec<HostSummary>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 必改 1：PTY 请求使用 untagged 序列化，wire format 不变。
+    /// 客户端发送的 JSON 与重构前完全一致。
+    #[test]
+    fn pty_request_wire_format_unchanged() {
+        // OpenLocalSession
+        let json = r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":24}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Pty(PtyRequest::OpenLocalSession { cols, rows }) => {
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
+            }
+            other => panic!("expected Pty(OpenLocalSession), got {:?}", other),
+        }
+        // 序列化回 JSON 应与输入一致（method 字段名不变）
+        let back = serde_json::to_string(&req).unwrap();
+        assert!(
+            back.contains("\"method\":\"OpenLocalSession\""),
+            "serialized: {}",
+            back
+        );
+        assert!(back.contains("\"cols\":80"), "serialized: {}", back);
+
+        // SessionInput（data 是字节数组）
+        let json =
+            r#"{"method":"SessionInput","params":{"session_id":"abc","data":[101,99,104,111]}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Pty(PtyRequest::SessionInput { session_id, data }) => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(data, b"echo");
+            }
+            other => panic!("expected Pty(SessionInput), got {:?}", other),
+        }
+
+        // 非 PTY 请求不受影响
+        let json = r#"{"method":"Auth","params":{"token":"xyz"}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Auth { token } => assert_eq!(token, "xyz"),
+            other => panic!("expected Auth, got {:?}", other),
+        }
+    }
 }
