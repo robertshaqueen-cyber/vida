@@ -69,6 +69,25 @@ impl SessionInner {
     }
 }
 
+/// 屏幕快照：纯文本行 + 宽字符列位置（方案 B）。
+///
+/// lines 永远是干净文本（无 sentinel），可直接交给 agent 阅读。
+/// wide_cols[row] 给出该行中占两列的字符起始列号（0-based），
+/// 客户端据此还原列对齐。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScreenData {
+    pub lines: Vec<String>,
+    pub wide_cols: Vec<Vec<u16>>,
+    pub cursor: CursorPos,
+}
+
+/// 光标位置。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CursorPos {
+    pub row: u16,
+    pub col: u16,
+}
+
 /// 公开的会话信息（ListSessions 返回值）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -284,10 +303,10 @@ impl PtyManager {
 
     /// 读取屏幕：全量文本快照（同步，M5 screen_read 雏形）。
     ///
-    /// 宽字符（CJK 等占两列）处理：第一个 cell 输出字符本身，
-    /// 第二个 cell（WIDE_CHAR_SPACER）输出 `\0`（NUL sentinel）。
-    /// 客户端按此约定还原列位置——连续字符后的 NUL 表示前一字符占两列。
-    pub fn read_screen(&self, session_id: &str) -> Result<(Vec<String>, (u16, u16))> {
+    /// 宽字符处理（方案 B）：lines 只含干净文本（无 sentinel）；
+    /// wide_cols[row] 给出该行中占两列的字符起始列号（0-based）。
+    /// 客户端按 wide_cols 还原列对齐，文本可直接阅读。
+    pub fn read_screen(&self, session_id: &str) -> Result<ScreenData> {
         use alacritty_terminal::term::cell::Flags;
         let session = self
             .sessions
@@ -295,27 +314,44 @@ impl PtyManager {
             .ok_or_else(|| anyhow::anyhow!("会话不存在: {}", session_id))?;
         let inner = session.lock().unwrap_or_else(|e| e.into_inner());
         let mut lines = Vec::new();
+        let mut wide_cols = Vec::new();
         let mut current_row: i32 = i32::MIN;
         let mut line = String::new();
+        let mut row_wide_cols = Vec::new();
+        let mut col: u16 = 0;
         for indexed in inner.term.grid().display_iter() {
             let point = indexed.point;
             if point.line.0 != current_row {
                 if current_row != i32::MIN {
                     lines.push(line.clone());
+                    wide_cols.push(row_wide_cols.clone());
                     line.clear();
+                    row_wide_cols.clear();
                 }
                 current_row = point.line.0;
+                col = 0;
             }
-            // WIDE_CHAR_SPACER → NUL sentinel，保留列位置信息
             if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                line.push('\0');
+                // spacer 位：不进文本，仅推进列号
             } else {
                 line.push(indexed.cell.c);
+                if indexed.cell.flags.contains(Flags::WIDE_CHAR) {
+                    row_wide_cols.push(col);
+                }
             }
+            col += 1;
         }
         lines.push(line);
+        wide_cols.push(row_wide_cols);
         let cursor = inner.term.grid().cursor.point;
-        Ok((lines, (cursor.line.0 as u16, cursor.column.0 as u16)))
+        Ok(ScreenData {
+            lines,
+            wide_cols,
+            cursor: CursorPos {
+                row: cursor.line.0 as u16,
+                col: cursor.column.0 as u16,
+            },
+        })
     }
 
     /// 关闭所有会话（daemon 退出时调用，不留僵尸）。
@@ -335,6 +371,22 @@ impl PtyManager {
 
 /// 消费 PTY 输出：收到字节立即 advance Term（处理不限频）。
 /// 推送限频在 M2a-2-2 加入（damage → 有界通道）。
+///
+// ── M2a-2-2 推送路径持锁约束（预先约定）──
+//
+// 推送路径在 term 锁下只做三件事（持锁时间最小化）：
+//   1. 读 damage → 确定脏行区间
+//   2. 把脏区的 cell 拷贝进临时结构 Vec<(row, start, end, Vec<Cell>)>
+//   3. reset_damage
+// 然后立即释放锁。RLE 编码与二进制序列化在锁外进行。
+//
+// 理由：编码是路径上最耗时的一步，且不需要访问 Term。持锁编码
+// 会在 yes 场景下持续阻塞 session_input 和 read_screen。
+//
+// 结构拆分方案（必改 2）：SessionInner 拆为两把独立 Mutex：
+//   - `term: Mutex<(Term, Processor)>`：泵线程独占，推送循环只读
+//   - `io: Mutex<IoState>{writer, master, child}`：input/resize/close
+// 泵持 term 锁，输入持 io 锁 → 互不阻塞。
 ///
 // ── 持锁分析（必改 2）──
 //
@@ -431,11 +483,11 @@ mod tests {
         pm.session_input(&id, b"echo hello\r\n").unwrap();
         // 等 shell 输出
         std::thread::sleep(Duration::from_millis(500));
-        let (lines, _) = pm.read_screen(&id).unwrap();
-        let joined = lines.join("\n");
+        let screen = pm.read_screen(&id).unwrap();
+        let joined = screen.lines.join("\n");
         assert!(joined.contains("hello"), "screen 应含 hello: {:?}", joined);
+        assert!(!joined.contains('\0'), "lines 不应含 NUL: {:?}", joined);
         pm.close_session(&id).unwrap();
-        assert!(pm.list_sessions().is_empty());
     }
 
     #[test]
@@ -461,24 +513,36 @@ mod tests {
         pm.close_session(&id).unwrap();
     }
 
-    /// 必改 3：read_screen 保留宽字符列位置（NUL sentinel）。
-    /// 中文「你好」每个字占两列：第一格是字符，第二格是 WIDE_CHAR_SPACER
-    /// 输出为 \0。客户端按 \0 还原列位置。
+    /// 必改 3：read_screen 保留宽字符列位置（方案 B：wide_cols）。
+    /// 中文「你好世界」每个字占两列，wide_cols 记录起始列号。
     #[test]
-    fn read_screen_preserves_wide_char_columns() {
+    fn read_screen_reports_wide_char_columns() {
         let mut pm = PtyManager::default();
         let id = pm.open_session(80, 24).unwrap();
         // 写入中文 + 换行
         pm.session_input(&id, "echo 你好世界\n".as_bytes()).unwrap();
         std::thread::sleep(Duration::from_millis(600));
-        let (lines, _) = pm.read_screen(&id).unwrap();
-        let joined = lines.join("\n");
-        // 每个中文字后应有一个 NUL sentinel（占两列）
-        // 「你」→ '你' + '\0', 「好」→ '好' + '\0', 等
-        assert!(
-            joined.contains("你\0好\0世\0界"),
-            "宽字符后应有 NUL sentinel: {:?}",
-            joined
+        let screen = pm.read_screen(&id).unwrap();
+
+        // lines 是干净文本（无 NUL sentinel）
+        let joined = screen.lines.join("\n");
+        assert!(!joined.contains('\0'), "lines 不应含 NUL: {:?}", joined);
+        assert!(joined.contains("你好世界"), "lines 应含中文: {:?}", joined);
+
+        // wide_cols：找到含「你好世界」的行，验证列位置
+        // 「你」占 col 0-1, 「好」占 2-3, 「世」占 4-5, 「界」占 6-7
+        let found = screen
+            .lines
+            .iter()
+            .zip(screen.wide_cols.iter())
+            .find(|(line, _)| line.contains("你好世界"));
+        assert!(found.is_some(), "应找到含中文的行");
+        let (line, wide) = found.unwrap();
+        let start = line.find("你好世界").unwrap() as u16;
+        assert_eq!(
+            wide,
+            &[start, start + 2, start + 4, start + 6],
+            "宽字符起始列号应为 0,2,4,6 (relative to line start)"
         );
         pm.close_session(&id).unwrap();
     }

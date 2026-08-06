@@ -417,11 +417,8 @@ async fn handle_pty_request(
         }
         PtyRequest::ReadScreen { session_id } => {
             let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            let (lines, cursor) = pty.read_screen(session_id)?;
-            Ok(serde_json::json!({
-                "lines": lines,
-                "cursor": { "row": cursor.0, "col": cursor.1 },
-            }))
+            let screen = pty.read_screen(session_id)?;
+            Ok(serde_json::to_value(screen)?)
         }
     }
 }
