@@ -577,6 +577,11 @@ async fn handle_pty_request(
             let screen = pty.read_screen(session_id)?;
             Ok(serde_json::to_value(screen)?)
         }
+        PtyRequest::ReadScreenStyled { session_id } => {
+            let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let screen = pty.read_screen_styled(session_id)?;
+            Ok(serde_json::to_value(screen)?)
+        }
         // SubscribeSession / UnsubscribeSession 已在 handle_message 层面处理
         PtyRequest::SubscribeSession { .. } | PtyRequest::UnsubscribeSession { .. } => {
             anyhow::bail!("PTY 订阅请求未在上游处理（内部错误）")

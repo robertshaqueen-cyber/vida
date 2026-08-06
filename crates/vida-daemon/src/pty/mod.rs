@@ -118,6 +118,31 @@ pub struct CursorPos {
     pub col: u16,
 }
 
+/// 带样式的单元格（用于 --ansi 模式）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StyledCell {
+    pub c: char,
+    pub fg: AnsiColor,
+    pub bg: AnsiColor,
+    pub flags: u8,
+}
+
+/// ANSI 颜色表示。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum AnsiColor {
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// 带样式的屏幕快照（每行是一个 StyledCell 序列）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScreenStyled {
+    pub rows: Vec<Vec<StyledCell>>,
+    pub cols: u16,
+    pub cursor: CursorPos,
+}
+
 /// 公开的会话信息（ListSessions 返回值）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -444,6 +469,61 @@ impl PtyManager {
         })
     }
 
+    /// 读取带样式的屏幕（用于 --ansi 模式）。
+    ///
+    /// 每行是一个 StyledCell 序列，包含字符、前景色、背景色、属性标志。
+    /// 宽字符的 spacer 位被跳过（不输出），客户端根据 wide 标志处理。
+    pub fn read_screen_styled(&self, session_id: &str) -> Result<ScreenStyled> {
+        use alacritty_terminal::term::cell::Flags;
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("会话不存在: {}", session_id))?;
+        let inner = session.lock().map_err(|_| anyhow::anyhow!("会话锁异常"))?;
+        let term = inner
+            .term
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Term 锁异常"))?;
+
+        let mut rows: Vec<Vec<StyledCell>> = Vec::new();
+        let mut current_row: i32 = i32::MIN;
+        let mut row_cells: Vec<StyledCell> = Vec::new();
+        let cols: usize = term.term.grid().columns();
+
+        for indexed in term.term.grid().display_iter() {
+            let point = indexed.point;
+            if point.line.0 != current_row {
+                if current_row != i32::MIN {
+                    rows.push(row_cells.clone());
+                    row_cells.clear();
+                }
+                current_row = point.line.0;
+            }
+            // spacer 位跳过
+            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let flags: u8 = push::encode_flags(&indexed.cell.flags);
+            row_cells.push(StyledCell {
+                c: indexed.cell.c,
+                fg: color_to_ansi(&indexed.cell.fg),
+                bg: color_to_ansi(&indexed.cell.bg),
+                flags,
+            });
+        }
+        rows.push(row_cells);
+
+        let cursor = term.term.grid().cursor.point;
+        Ok(ScreenStyled {
+            rows,
+            cols: cols as u16,
+            cursor: CursorPos {
+                row: cursor.line.0 as u16,
+                col: cursor.column.0 as u16,
+            },
+        })
+    }
+
     /// 订阅会话推送：立即回一帧全量快照，此后推送增量。
     pub fn subscribe_session(&self, session_id: &str) -> Result<BoundedReceiver<PushPayload>> {
         let session = self
@@ -495,6 +575,19 @@ impl PtyManager {
         }
         self.sessions.clear();
         info!("所有会话已关闭");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 内部辅助
+// ---------------------------------------------------------------------------
+
+fn color_to_ansi(color: &alacritty_terminal::vte::ansi::Color) -> AnsiColor {
+    use alacritty_terminal::vte::ansi::Color;
+    match color {
+        Color::Spec(rgb) => AnsiColor::Rgb(rgb.r, rgb.g, rgb.b),
+        Color::Indexed(idx) => AnsiColor::Indexed(*idx),
+        Color::Named(_) => AnsiColor::Default,
     }
 }
 

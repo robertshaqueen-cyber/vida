@@ -203,3 +203,152 @@ cargo run --release --bin vida
 5. 切换回「不同步」→ 预期路径清空，保存后同步按钮显示「未配置同步」
 6. **关键断言（回归）**：点击同步按钮 → 无论当前显示什么状态，请求都会发出 —— daemon 日志出现 `Sync upload/download/decision` 记录；未配置同步时按钮点击也发出请求，由 daemon 返回 `sync_not_configured`，界面显示「未配置同步」而非跳转设置
 7. 保存路径后点同步 → daemon 日志出现 `Sync upload OK: <路径> (<字节> bytes)`，远端 `vault.age` 存在
+
+---
+
+## M2a 终端核心 — 验收清单
+
+> 全部使用 `VIDA_CONFIG_DIR=/tmp/vida-m2a` 隔离，不触碰真实配置。
+
+### 指标（M2a-spec 第 8 节，实测）
+
+| 指标 | 实测值 | 说明 |
+|---|---|---|
+| `size_of::<Cell>()` | **24 字节** | char 4 + fg 4 + bg 4 + flags 4 + Option\<Arc\> 8 |
+| 5000 行 × 200 列满载内存增量 | 待实测 | 目标 \< 20 MB（3000×200×24 = 14.4 MB + 索引开销） |
+| `yes` 持续 10 秒带宽 | 待实测 | 目标 \< 1 MB/s |
+| `cat` 100MB 文件 | 待实测 | daemon 内存峰值 ≤ 基线 + 50 MB |
+| 空闲 CPU | ≈ 0% | 无常驻定时器 |
+| 内存测量方式 | `vmmap --summary` Physical footprint | 禁止 RSS |
+
+### 工具
+
+```bash
+export VIDA_CONFIG_DIR=/tmp/vida-m2a
+cargo run --release --bin vida-daemon &
+DAEMON_PID=$!
+sleep 1
+
+# CLI 验收工具
+cargo run --release --bin vida-term-test
+```
+
+### 场景 8 — 基本回显
+
+```bash
+SID=$(vida-term-test open)
+vida-term-test send "$SID" 'echo hello\n'
+sleep 0.5
+vida-term-test screen "$SID"
+```
+
+预期：屏幕上有 `hello`，光标在下一行行首。
+
+### 场景 9 — 颜色
+
+```bash
+vida-term-test send "$SID" 'ls --color\n'
+sleep 0.5
+vida-term-test screen "$SID" --ansi
+```
+
+预期：目录名带颜色，与在真实终端中执行 `ls --color` 的结果一致。
+
+### 场景 10 — 全屏 TUI
+
+```bash
+vida-term-test send "$SID" 'vim\n'
+sleep 1
+vida-term-test screen "$SID"
+```
+
+预期：看到 vim 界面（波浪号列、状态行）。
+
+```bash
+vida-term-test send "$SID" '\e:q!\n'
+sleep 0.5
+vida-term-test screen "$SID"
+```
+
+预期：回到 shell 提示符。
+
+### 场景 11 — 动态刷新
+
+```bash
+vida-term-test send "$SID" 'htop\n'
+sleep 2
+vida-term-test screen "$SID"
+sleep 2
+vida-term-test screen "$SID"
+sleep 2
+vida-term-test screen "$SID"
+```
+
+预期：三次内容不同（说明在刷新），布局不错乱。
+
+```bash
+vida-term-test send "$SID" 'q'
+sleep 0.5
+vida-term-test screen "$SID"
+```
+
+预期：回到 shell。
+
+### 场景 12 — 中文对齐
+
+先创建中文名文件：
+
+```bash
+touch /tmp/vida-m2a/测试文件.txt /tmp/vida-m2a/中文文档.md /tmp/vida-m2a/数据.csv
+```
+
+```bash
+vida-term-test send "$SID" 'ls -la /tmp/vida-m2a\n'
+sleep 0.5
+vida-term-test screen "$SID"
+```
+
+预期：文件名不串列。
+
+### 场景 13 — resize
+
+```bash
+vida-term-test send "$SID" 'echo before resize\n'
+sleep 0.3
+# 通过 daemon IPC 调整尺寸（CLI 暂不支持 resize 命令，需手动或用 screen 观察）
+# 预期：网格变为 40 列 12 行，内容重排后没有乱码
+```
+
+### 场景 14 — 会话结束
+
+```bash
+vida-term-test send "$SID" 'exit\n'
+sleep 0.5
+vida-term-test list
+```
+
+预期：该会话标记为已结束或已移除；`ps` 中无僵尸进程。
+
+### 场景 15 — 高吞吐
+
+```bash
+# 终端 1：启动 yes 并 watch
+SID=$(vida-term-test open --cols 200 --rows 50)
+vida-term-test send "$SID" 'yes\n'
+# 另一个终端：
+vida-term-test watch "$SID"
+# 10 秒后：
+vida-term-test send "$SID" '\x03'
+```
+
+预期：
+- `watch` 输出的帧率不超过 60fps（间隔 ≥ 16ms）
+- 带宽符合第 8 节指标
+- daemon 内存不持续增长（用 `vmmap --summary $DAEMON_PID` 观察）
+
+同时用 vmmap 观察 daemon 内存：
+
+```bash
+vmmap --summary $DAEMON_PID | grep "Physical footprint"
+```
+

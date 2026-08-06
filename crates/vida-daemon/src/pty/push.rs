@@ -299,7 +299,7 @@ fn build_dirty_line_range(
     })
 }
 
-fn encode_flags(cell_flags: &Flags) -> u8 {
+pub(crate) fn encode_flags(cell_flags: &Flags) -> u8 {
     let mut flags: u8 = 0;
     if cell_flags.contains(Flags::BOLD) {
         flags |= FLAG_BOLD;
