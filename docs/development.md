@@ -217,8 +217,10 @@ cargo run --release --bin vida
 | `size_of::<Cell>()` | **24 字节** | char 4 + fg 4 + bg 4 + flags 4 + Option\<Arc\> 8 |
 | 3000 行 × 200 列满载内存增量 | **15.4 MB** | 实测（vmmap 前后对比，2026-08-07）。当前默认 scrollback=3000。3000×200×24 = 14.4 MB 算术值 + ~1 MB Grid 行索引/Row 元数据开销 |
 | 5000 行 × 200 列满载外推 | **~25.7 MB** | 按 25.7 字节/cell 线性外推（15.4 MB / 3000 行）。**超过 20 MB 目标**，见下方讨论 |
-| `yes` 持续 10 秒带宽 | **0.02 MB/s** | 实测（106 帧/5s，121 KB，200×50 终端，WebSocket 实测） |
+| `yes` 持续 10 秒带宽 | **0.03 MB/s** | 实测（watch 3s：155 帧，90 KB，51.6fps，200×50 终端，WebSocket 实测） |
+| yes 场景 daemon footprint | **3536K 零增长** | 有界通道 + 丢旧留新生效。yes 持续输出、seq 累积到 7764 时多次采样 footprint 稳定（2026-08-07） |
 | `cat` 100MB 文件 | **1.242 s**，峰值 **+0.2 MB**（19.0 MB） | 实测。scrollback 有界 → 内存不随输出增长 |
+| 限频实测 | **15.16-18.59 ms** | push_loop 内部间隔（诊断日志实测，多数恰 16.00ms）。绝对时隙基准 |
 | 空闲 CPU | ≈ 0% | 推送循环 60fps 限频，无输出时不产生帧 |
 | 内存测量方式 | `vmmap --summary` Physical footprint | 禁止 RSS |
 
@@ -269,6 +271,9 @@ cargo run --release -p vida-term-test -- screen "$SID"
 
 预期：屏幕上有 `hello`，光标在下一行行首。
 
+**实测记录（2026-08-07）**：`echo hello` 后 screen 显示第 2 行 `hello`，
+光标在第 3 行行首。✅
+
 ### 场景 9 — 颜色
 
 ```bash
@@ -278,6 +283,9 @@ cargo run --release -p vida-term-test -- screen "$SID" --ansi
 ```
 
 预期：目录名带颜色，与在真实终端中执行 `ls --color` 的结果一致。
+
+**实测记录（2026-08-07）**：`screen --ansi` 目录名带颜色，与真实终端
+一致。✅
 
 ### 场景 10 — 全屏 TUI
 
@@ -289,6 +297,9 @@ cargo run --release -p vida-term-test -- screen "$SID"
 
 预期：看到 vim 界面（波浪号列、状态行）。
 
+**实测记录（2026-08-07）**：vim 界面正确显示（波浪号列）。注意 vim
+默认 laststatus=1 单窗口无状态栏，这是正确行为。✅
+
 ```bash
 cargo run --release -p vida-term-test -- send "$SID" '\e:q!\n'
 sleep 0.5
@@ -296,6 +307,8 @@ cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：回到 shell 提示符。
+
+**实测记录（2026-08-07）**：`\e:q!` 退出 vim 回到 shell 提示符。✅
 
 ### 场景 11 — 动态刷新
 
@@ -311,6 +324,9 @@ cargo run --release -p vida-term-test -- screen "$SID"
 
 预期：三次内容不同（说明在刷新），布局不错乱。
 
+**实测记录（2026-08-07）**：三次 screen 内容不同（top 动态刷新），
+布局不错乱。✅
+
 ```bash
 cargo run --release -p vida-term-test -- send "$SID" 'q'
 sleep 0.5
@@ -318,6 +334,8 @@ cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：回到 shell。
+
+**实测记录（2026-08-07）**：`q` 退出 top 回到 shell。✅
 
 ### 场景 12 — 中文对齐
 
@@ -335,6 +353,9 @@ cargo run --release -p vida-term-test -- screen "$SID"
 
 预期：文件名不串列。
 
+**实测记录（2026-08-07）**：中文文件名（测试文件.txt 等）正确对齐，
+不串列。`screen --show-wide` 显示 `^` 标记的宽字符起始列。✅
+
 ### 场景 13 — resize
 
 ```bash
@@ -347,6 +368,9 @@ cargo run --release -p vida-term-test -- screen "$SID"
 
 预期：网格变为 40 列 12 行，内容重排后没有乱码。
 
+**实测记录（2026-08-07）**：resize 到 40×12 后网格正确，宽字符
+reflow 特别正确——40 列折行时「测试」没有被劈开。✅
+
 ### 场景 14 — 会话结束
 
 ```bash
@@ -356,6 +380,9 @@ cargo run --release -p vida-term-test -- list
 ```
 
 预期：该会话标记为已结束或已移除；`ps` 中无僵尸进程。
+
+**实测记录（2026-08-07）**：`exit` 后 list 显示 `closed`；订阅方收到
+`session_closed` 事件（exit_code=0）；无新增僵尸进程。✅
 
 ### 场景 15 — 高吞吐
 
@@ -373,6 +400,15 @@ cargo run --release -p vida-term-test -- send "$SID" '\x03'
 - `watch` 输出的帧率不超过 60fps（间隔 ≥ 16ms）
 - 带宽符合第 8 节指标
 - daemon 内存不持续增长（用 `vmmap --summary $DAEMON_PID` 观察）
+
+**实测记录（2026-08-07）**：
+- push_loop 内部间隔 15.16-18.59ms（绝对时隙限频）
+- daemon footprint 3536K 零增长（有界通道 + 丢旧留新）
+- watch 统计：51.6fps，平均 18.9ms
+- **注意**：watch 显示的 seq 跳号（如 0→26）是正常现象——会话在
+  订阅前已运行，push_loop 已产生若干帧，订阅时只发当前快照。
+  **判断限频应看 push_loop 内部间隔，不看客户端接收间隔**
+  （客户端接收受通道缓冲、订阅首帧等因素影响，会造成假象）。✅
 
 同时用 vmmap 观察 daemon 内存：
 

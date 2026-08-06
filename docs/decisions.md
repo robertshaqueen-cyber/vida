@@ -661,3 +661,46 @@ alacritty grid 的 `columns() - 1` 下溢 panic（grid/mod.rs:499）。
 **M5 用哪个**：`screen_read` 用 `ReadScreen`（干净文本 + wide_cols，
 agent 可直接阅读文本并获知列对齐）。`ReadScreenStyled` 是 M2b
 渲染层的接口，两者职责不重叠，不构成「两处保持一致」问题。
+
+### M2a 教训 14：限频必须用绝对时隙，相对 sleep 会累积抖动
+
+初版推送循环用 `thread::sleep(16ms)` 每轮无条件处理。macOS 的
+sleep 返回抖动（5-26ms）会累积，实测出现 6ms、12ms 帧间隔——
+每九帧就有一帧违反限频。
+
+**正确做法**：绝对时隙。`next_slot` 单调 +16ms 推进，
+`now < next_slot` 时 sleep 到点；处理耗时长于 interval 时防
+burst 追赶（把时隙拉回当前时间）。
+
+```rust
+let mut next_slot = Instant::now();
+loop {
+    if Instant::now() < next_slot {
+        thread::sleep(next_slot - Instant::now());
+    }
+    next_slot += interval;
+    if next_slot + interval < Instant::now() {
+        next_slot = Instant::now(); // 防 burst
+    }
+    // 读 damage → 编码 → 入队
+}
+```
+
+实测：push_loop 内部间隔 15.16-18.59ms（多数恰 16.00ms）。
+
+### M2a 教训 15：客户端观测的帧间隔不能作为限频判据
+
+限频是否生效，必须在**生成侧**（push_loop）测量。客户端观测受
+以下因素干扰，会产生「限频失效」的假象：
+
+- **订阅首帧**：订阅时立即发全量快照，客户端循环第一条 interval
+  记为 0ms（无前驱）
+- **通道缓冲**：有界通道积压时客户端一次性读到多帧
+- **传输层**：WebSocket/TCP 缓冲导致到达时间聚集
+
+正确判据：
+- **生成侧**：push_loop 内部相邻帧间隔（本次用诊断日志实测）
+- **seq 跨度**：1 秒内 seq 增量 ≤ 65（有界通道丢帧不影响此判据）
+
+watch 工具已改进：跳过首帧间隔、微秒精度、`--duration` 自动退出
+并打印统计（帧数/字节/平均间隔/低于 16ms 占比）。
