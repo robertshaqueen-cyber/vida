@@ -377,6 +377,7 @@ pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
         let bytes: Vec<u8> = encode_frame(&inner.id, &frame);
         let frame_payload = PushPayload {
             frame_seq: seq,
+            kind: PushKind::Frame,
             bytes,
         };
         let mut subs = match inner.subscribers.lock() {
@@ -392,9 +393,19 @@ pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
     );
 }
 
+/// 推送负载类型。
+#[derive(Debug, Clone)]
+pub enum PushKind {
+    /// 普通推送帧（damage 增量）。
+    Frame,
+    /// 会话结束事件（shell 自行退出）。
+    SessionClosed { exit_code: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub struct PushPayload {
     pub frame_seq: u64,
+    pub kind: PushKind,
     pub bytes: Vec<u8>,
 }
 

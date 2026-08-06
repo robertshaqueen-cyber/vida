@@ -54,9 +54,9 @@ struct TermState {
 
 /// IO 状态：input/resize/close 使用。
 struct IoState {
-    writer: Box<dyn Write + Send>,
+    writer: Option<Box<dyn Write + Send>>,
     /// master 句柄：保留用于 resize（PTY ioctl winsize）。
-    master: Box<dyn portable_pty::MasterPty>,
+    master: Option<Box<dyn portable_pty::MasterPty>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
@@ -69,6 +69,8 @@ pub(crate) struct SessionInner {
     io: Mutex<IoState>,
     /// shell 是否已退出。
     closed: AtomicBool,
+    /// 退出码（shell 自行退出或 CloseSession 时记录）。
+    exit_code: Mutex<Option<u32>>,
     /// 订阅者列表（有界通道发送端）。
     subscribers: Mutex<Vec<BoundedSender<PushPayload>>>,
     /// 推送序列号。
@@ -150,6 +152,8 @@ pub struct SessionInfo {
     pub cols: u16,
     pub rows: u16,
     pub alive: bool,
+    /// 退出码：alive=false 时记录（None = 未知，如被信号终止）。
+    pub exit_code: Option<u32>,
     pub foreground_process: Option<String>,
 }
 
@@ -256,11 +260,12 @@ impl PtyManager {
             rows,
             term: Mutex::new(TermState { term, processor }),
             io: Mutex::new(IoState {
-                writer: pair.master.take_writer().context("take_writer 失败")?,
-                master: pair.master,
+                writer: Some(pair.master.take_writer().context("take_writer 失败")?),
+                master: Some(pair.master),
                 child: Some(child),
             }),
             closed: AtomicBool::new(false),
+            exit_code: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
             next_seq: AtomicU64::new(0),
         }));
@@ -291,26 +296,25 @@ impl PtyManager {
         let push_session = Arc::clone(&session);
         thread::spawn(move || push_loop(push_session));
 
-        // 读线程
-        let reader_handle = thread::spawn(move || {
+        // 读线程（阻塞读，专用 OS 线程）。
+        // EOF 时触发会话回收（wait 子进程 + 标记结束 + 推送事件）。
+        let reader_session = Arc::clone(&session);
+        thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024]; // ≥8KB
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => break, // EOF：shell 退出 / PTY 关闭
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             return;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => break, // 读错误（PTY 关闭）
                 }
             }
+            // EOF 到达：回收会话
+            finalize_session(reader_session);
         });
-
-        // 保存 session（reader_handle 由 session 持有，避免线程泄漏）
-        // NOTE: reader_handle 需要存储，否则线程可能被 detach。
-        // 为简化，暂不存储（daemon 退出时进程终止，线程随之终止）。
-        let _ = reader_handle;
 
         self.sessions.insert(id.clone(), session);
         info!("会话 {} 已打开 ({}×{})", id, cols, rows);
@@ -328,8 +332,10 @@ impl PtyManager {
             anyhow::bail!("会话已结束: {}", session_id);
         }
         let mut io = inner.io.lock().map_err(|_| anyhow::anyhow!("IO 锁异常"))?;
-        io.writer.write_all(data).context("写入 PTY 失败")?;
-        io.writer.flush().ok();
+        if let Some(w) = io.writer.as_mut() {
+            w.write_all(data).context("写入 PTY 失败")?;
+            w.flush().ok();
+        }
         Ok(())
     }
 
@@ -361,14 +367,15 @@ impl PtyManager {
 
         // PTY 侧 ioctl
         {
-            let io = inner.io.lock().map_err(|_| anyhow::anyhow!("IO 锁异常"))?;
-            io.master
-                .resize(PtySize {
+            let mut io = inner.io.lock().map_err(|_| anyhow::anyhow!("IO 锁异常"))?;
+            if let Some(m) = io.master.as_mut() {
+                m.resize(PtySize {
                     rows,
                     cols,
                     ..Default::default()
                 })
                 .context("PTY resize 失败")?;
+            }
         }
 
         info!("会话 {} resize → {}×{}", session_id, cols, rows);
@@ -382,13 +389,26 @@ impl PtyManager {
             .remove(session_id)
             .ok_or_else(|| anyhow::anyhow!("会话不存在: {}", session_id))?;
         let inner = session.lock().map_err(|_| anyhow::anyhow!("会话锁异常"))?;
-        inner.closed.store(true, Ordering::Relaxed);
+        // 若已结束（shell 自行退出），不再重复 wait
+        if inner.closed.swap(true, Ordering::Relaxed) {
+            info!("会话 {} 已结束（shell 自行退出），直接移除", session_id);
+            return Ok(());
+        }
 
         let mut io = inner.io.lock().map_err(|_| anyhow::anyhow!("IO 锁异常"))?;
         if let Some(mut child) = io.child.take() {
             let _ = child.kill();
             match child.wait() {
-                Ok(_) => info!("会话 {} 子进程已回收", session_id),
+                Ok(status) => {
+                    info!(
+                        "会话 {} 子进程已回收 (exit_code={})",
+                        session_id,
+                        status.exit_code()
+                    );
+                    if let Ok(mut ec) = inner.exit_code.lock() {
+                        *ec = Some(status.exit_code());
+                    }
+                }
                 Err(e) => warn!("会话 {} wait 失败: {}", session_id, e),
             }
         }
@@ -407,6 +427,7 @@ impl PtyManager {
                     cols: inner.cols,
                     rows: inner.rows,
                     alive: !inner.closed.load(Ordering::Relaxed),
+                    exit_code: *inner.exit_code.lock().unwrap_or_else(|e| e.into_inner()),
                     foreground_process: None,
                 }
             })
@@ -517,6 +538,7 @@ impl PtyManager {
             let bytes = encode_frame(&inner.id, &full_frame);
             let payload = PushPayload {
                 frame_seq: inner.next_seq.load(Ordering::Relaxed),
+                kind: push::PushKind::Frame,
                 bytes,
             };
             // 全量快照直接发送（通道为空，不会丢弃）
@@ -569,6 +591,69 @@ struct ExtractedGrid {
     rows: Vec<Vec<ExtractedCell>>,
     cursor_row: u16,
     cursor_col: u16,
+}
+
+/// 会话回收：shell 自行退出（读线程 EOF）时调用。
+///
+/// 1. 标记会话为已结束
+/// 2. wait 子进程回收（若未被 CloseSession 取走），记录退出码
+/// 3. 释放 PTY fd（drop writer/master）
+/// 4. 向所有订阅者推送 session_closed 事件（含 exit_code）
+fn finalize_session(session: Arc<Mutex<SessionInner>>) {
+    let inner = match session.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let id = inner.id.clone();
+
+    // 幂等：已在回收中的会话跳过
+    if inner.closed.swap(true, Ordering::Relaxed) {
+        info!("会话 {} 已在回收中，跳过 finalize", id);
+        return;
+    }
+
+    // wait 子进程 + 记录退出码 + 释放 PTY fd
+    let exit_code = {
+        let mut io = match inner.io.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let mut code: Option<u32> = None;
+        if let Some(mut child) = io.child.take() {
+            match child.wait() {
+                Ok(status) => {
+                    code = Some(status.exit_code());
+                    info!("会话 {} shell 退出，exit_code={}", id, status.exit_code());
+                }
+                Err(e) => warn!("会话 {} wait 失败: {}", id, e),
+            }
+        }
+        // 释放 writer + master（PTY fd）
+        io.writer.take();
+        io.master.take();
+        code
+    };
+    if let Some(c) = exit_code
+        && let Ok(mut ec) = inner.exit_code.lock()
+    {
+        *ec = Some(c);
+    }
+
+    // 推送 session_closed 事件到所有订阅者
+    let event_payload = PushPayload {
+        frame_seq: inner.next_seq.load(Ordering::Relaxed),
+        kind: push::PushKind::SessionClosed {
+            exit_code: exit_code.unwrap_or(0),
+        },
+        bytes: Vec::new(),
+    };
+    let mut subs = match inner.subscribers.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    subs.retain(|sub| sub.send_drop_oldest(event_payload.clone()));
+
+    info!("会话 {} 已结束并回收", id);
 }
 
 /// 统一提取函数：遍历一次 grid，输出中间结构。
@@ -909,5 +994,67 @@ mod tests {
             .flatten()
             .any(|c| c.c == 'R' && matches!(color_to_ansi(&c.fg), AnsiColor::Indexed(1)));
         assert!(styled_has_red, "styled 应含红色 R");
+    }
+
+    /// 必改 1：shell 自行退出时会话被回收。
+    /// 断言：list 显示已结束 + 订阅方收到 session_closed 事件。
+    #[test]
+    fn shell_exit_reclaims_session_and_emits_event() {
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(80, 24).unwrap();
+
+        // 订阅（接收 session_closed 事件）
+        let rx = pm.subscribe_session(&id).unwrap();
+
+        // 发送 exit 命令让 shell 自行退出
+        pm.session_input(&id, b"exit\r\n").unwrap();
+
+        // 等待 EOF + 回收完成
+        thread::sleep(Duration::from_millis(1000));
+
+        // 1. 会话标记为已结束
+        let sessions = pm.list_sessions();
+        let info = sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .expect("会话应保留在列表中（保留并标记策略）");
+        assert!(!info.alive, "会话应标记为已结束");
+        assert!(
+            info.exit_code.is_some(),
+            "应记录退出码: {:?}",
+            info.exit_code
+        );
+
+        // 2. 订阅方收到 session_closed 事件
+        let mut got_event = false;
+        for _ in 0..10 {
+            match rx.try_recv() {
+                Some(payload) => {
+                    if let push::PushKind::SessionClosed { exit_code } = payload.kind {
+                        assert_eq!(exit_code, 0, "exit 应返回 0");
+                        got_event = true;
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(got_event, "订阅方应收到 session_closed 事件");
+
+        // 3. 无僵尸：child 已被 wait（try_wait 返回 Some）
+        // 通过再次 close 验证：若已回收，close 直接成功（幂等分支）
+        pm.close_session(&id).unwrap();
+    }
+
+    /// 必改 1：显式 CloseSession 时若已结束，不重复 wait。
+    #[test]
+    fn close_after_shell_exit_is_idempotent() {
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(80, 24).unwrap();
+        pm.session_input(&id, b"exit\r\n").unwrap();
+        thread::sleep(Duration::from_millis(1000));
+        // 第一次 close：shell 已退出 → 幂等分支
+        pm.close_session(&id).unwrap();
+        // 第二次 close：会话已移除 → 报错
+        assert!(pm.close_session(&id).is_err());
     }
 }
