@@ -163,7 +163,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         break;
                     }
                     Some(Err(e)) => {
-                        error!("Error reading from {}: {}", addr, e);
+                        // 客户端未做关闭握手就断开（网络中断、进程被 kill）是
+                        // 常见且无害的情况，INFO 即可。ERROR 留给真正需要
+                        // 用户注意的问题。
+                        info!("Connection dropped without close handshake ({}): {}", addr, e);
                         break;
                     }
                     None => break,
@@ -179,6 +182,14 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                 }
             }
         }
+    }
+
+    // 连接断开：必须中止推送桥接任务。
+    // 否则桥接任务仍持有 push_tx（sender clone），channel 不会关闭，
+    // 它会继续从会话的 BoundedReceiver 读帧并 send 到无人接收的
+    // channel —— 死循环浪费资源。
+    if let Some(handle) = push_bridge.take() {
+        handle.abort();
     }
 
     info!("Connection dropped: {}", addr);

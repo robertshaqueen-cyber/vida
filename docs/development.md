@@ -242,11 +242,14 @@ cargo run --release --bin vida-daemon
 
 # 终端 2：执行验收命令
 export VIDA_CONFIG_DIR=/tmp/vida-m2a
-cargo run --release -p cargo run --release -p vida-term-test -- -- open
+cargo run --release -p vida-term-test -- open
 ```
 
-> **注意**：daemon 重启后所有旧 session_id 全部失效（会话属于 daemon，
-> 不属于连接）。每次重启后需重新 open 获取新 session_id。
+> **注意**：
+> - daemon 重启后所有旧 session_id 全部失效（会话属于 daemon，
+>   不属于连接）。每次重启后需重新 open 获取新 session_id。
+> - open / send / screen 等均为**一次性命令**，执行完即退出。
+>   会话由 daemon 持有，用 open 返回的 session_id 在后续命令中引用。
 > 每个 cargo run --release -p vida-term-test -- 子命令是独立进程，连接后即断，但会话保留在 daemon。
 
 常用变量：

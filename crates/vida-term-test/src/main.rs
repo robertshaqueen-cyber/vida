@@ -579,5 +579,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // 发送 WebSocket Close 帧并等待对端回应（短超时），
+    // 避免 daemon 侧记录「无关闭握手」的断开日志。
+    if let Err(e) = client.write.send(Message::Close(None)).await {
+        info!("发送 Close 帧失败（连接可能已断开）: {}", e);
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), client.read.next()).await;
+
     Ok(())
 }
