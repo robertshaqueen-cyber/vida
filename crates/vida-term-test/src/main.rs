@@ -10,7 +10,6 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::info;
 
 use vida_daemon::protocol::{PtyRequest, Request};
 
@@ -49,6 +48,9 @@ enum Commands {
         session_id: String,
         #[arg(long)]
         ansi: bool,
+        /// 用 ^ 标记 wide_cols 报告的位置（验证中文对齐）
+        #[arg(long)]
+        show_wide: bool,
     },
     /// 调整会话尺寸
     Resize {
@@ -405,11 +407,13 @@ fn render_ansi(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // tracing 输出写 stderr，保证 stdout 只有命令结果
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "vida_term_test=info".into()),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -454,10 +458,14 @@ async fn main() -> Result<()> {
                 data: bytes,
             });
             client.call(&req).await?;
-            info!("已发送 {} 字节", len);
+            eprintln!("已发送 {} 字节", len);
         }
 
-        Commands::Screen { session_id, ansi } => {
+        Commands::Screen {
+            session_id,
+            ansi,
+            show_wide,
+        } => {
             if ansi {
                 let req = Request::Pty(PtyRequest::ReadScreenStyled { session_id });
                 let resp = client.call(&req).await?;
@@ -475,11 +483,73 @@ async fn main() -> Result<()> {
                 let req = Request::Pty(PtyRequest::ReadScreen { session_id });
                 let resp = client.call(&req).await?;
                 let lines = resp["result"]["lines"].as_array().context("响应格式错误")?;
-                for line in lines {
-                    println!("{}", line.as_str().unwrap_or(""));
-                }
                 let cursor = &resp["result"]["cursor"];
+                let wide_cols = resp["result"]["wide_cols"]
+                    .as_array()
+                    .context("wide_cols 缺失")?;
+
+                // 每行：行号右对齐两位 + 内容（行尾空格裁掉）
+                let mut trimmed_any = false;
+                for (i, line) in lines.iter().enumerate() {
+                    let raw = line.as_str().unwrap_or("");
+                    let trimmed = raw.trim_end();
+                    if trimmed.len() != raw.len() {
+                        trimmed_any = true;
+                    }
+                    println!("{:2}| {}", i, trimmed);
+                }
+                if trimmed_any {
+                    eprintln!("行尾空格已省略");
+                }
+                // --show-wide：用 ^ 标记 wide_cols 报告的位置
+                // 宽度取该行内容在终端的显示宽度（宽字符算 2 列）
+                if show_wide {
+                    let mut show_any = false;
+                    for (i, wc) in wide_cols.iter().enumerate() {
+                        let cols: Vec<usize> = wc
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_u64())
+                                    .map(|v| v as usize)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if cols.is_empty() {
+                            continue;
+                        }
+                        let raw = lines[i].as_str().unwrap_or("");
+                        let disp_w = raw
+                            .chars()
+                            .map(|c| if c as u32 > 0xFF { 2 } else { 1 })
+                            .sum::<usize>();
+                        let mut marker = String::with_capacity(disp_w + 1);
+                        for c in 0..disp_w {
+                            if cols.contains(&c) {
+                                marker.push('^');
+                            } else {
+                                marker.push(' ');
+                            }
+                        }
+                        println!("{:2}| {}", i, marker);
+                        show_any = true;
+                    }
+                    if show_any {
+                        eprintln!("^ = 宽字符起始列（wide_cols）");
+                    }
+                }
                 eprintln!("cursor: row={} col={}", cursor["row"], cursor["col"]);
+                // 宽字符提示（wide_cols 报告的位置）
+                let wide_total: usize = wide_cols
+                    .iter()
+                    .map(|r| r.as_array().map(|a| a.len()).unwrap_or(0))
+                    .sum();
+                if wide_total > 0 {
+                    eprintln!(
+                        "wide_cols: 共 {} 个宽字符位置（见响应 wide_cols 字段）",
+                        wide_total
+                    );
+                }
             }
         }
 
@@ -528,7 +598,7 @@ async fn main() -> Result<()> {
                         break;
                     }
                     None => {
-                        info!("连接关闭");
+                        eprintln!("连接关闭");
                         break;
                     }
                 }
@@ -569,20 +639,20 @@ async fn main() -> Result<()> {
                 rows,
             });
             client.call(&req).await?;
-            info!("尺寸已调整为 {}×{}", cols, rows);
+            eprintln!("尺寸已调整为 {}×{}", cols, rows);
         }
 
         Commands::Close { session_id } => {
             let req = Request::Pty(PtyRequest::CloseSession { session_id });
             client.call(&req).await?;
-            info!("会话已关闭");
+            eprintln!("会话已关闭");
         }
     }
 
     // 发送 WebSocket Close 帧并等待对端回应（短超时），
     // 避免 daemon 侧记录「无关闭握手」的断开日志。
     if let Err(e) = client.write.send(Message::Close(None)).await {
-        info!("发送 Close 帧失败（连接可能已断开）: {}", e);
+        eprintln!("发送 Close 帧失败（连接可能已断开）: {}", e);
     }
     let _ = tokio::time::timeout(std::time::Duration::from_millis(200), client.read.next()).await;
 
