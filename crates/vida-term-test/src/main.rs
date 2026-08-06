@@ -24,8 +24,8 @@ struct Cli {
     #[command(subcommand)]
     cmd: Commands,
 
-    /// daemon WebSocket 地址（默认从 ~/.config/vida/daemon.port 读取）
-    #[arg(long, default_value = None)]
+    /// daemon WebSocket 地址（默认从配置目录的 daemon.port 读取）
+    #[arg(long, global = true)]
     addr: Option<String>,
 }
 
@@ -67,6 +67,22 @@ enum Commands {
 // ---------------------------------------------------------------------------
 // 转义序列解析
 // ---------------------------------------------------------------------------
+
+/// 从配置文件读取 daemon token。
+/// 与 daemon 相同的配置目录解析：优先 VIDA_CONFIG_DIR，否则平台默认。
+fn read_token() -> Result<String> {
+    let config_dir = if let Ok(dir) = std::env::var("VIDA_CONFIG_DIR") {
+        std::path::PathBuf::from(dir)
+    } else {
+        dirs::config_dir()
+            .context("无法确定配置目录路径。请设置环境变量 VIDA_CONFIG_DIR 指定配置目录。")?
+            .join("vida")
+    };
+    let token_path = config_dir.join("daemon.token");
+    let token = std::fs::read_to_string(&token_path)
+        .with_context(|| format!("读取 token 失败: {}", token_path.display()))?;
+    Ok(token.trim().to_string())
+}
 
 /// 将含转义序列的文本转为字节序列。
 ///
@@ -142,7 +158,37 @@ impl DaemonClient {
         let (ws, _) = tokio_tungstenite::connect_async(addr)
             .await
             .with_context(|| format!("连接 daemon 失败: {}", addr))?;
-        let (write, read) = ws.split();
+        let (mut write, read) = ws.split();
+
+        // 认证：读取 token 并发送 Auth，等待认证响应
+        let token = read_token()?;
+        let auth_req = serde_json::json!({
+            "method": "Auth",
+            "params": { "token": token },
+            "id": 0
+        });
+        write
+            .send(Message::Text(auth_req.to_string().into()))
+            .await
+            .context("发送认证失败")?;
+
+        // 等待认证响应
+        let mut read = read;
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let val: Value = serde_json::from_str(&text).context("解析认证响应失败")?;
+                    if val["type"] == "Error" {
+                        anyhow::bail!("认证失败: {}", val["message"]);
+                    }
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => anyhow::bail!("认证时读取错误: {}", e),
+                None => anyhow::bail!("认证时连接关闭"),
+            }
+        }
+
         Ok(Self {
             write,
             read,
@@ -371,9 +417,14 @@ async fn main() -> Result<()> {
     let addr = match cli.addr {
         Some(a) => a,
         None => {
-            let port_file = dirs::config_dir()
-                .context("无法确定配置目录")?
-                .join("vida/daemon.port");
+            let config_dir = if let Ok(dir) = std::env::var("VIDA_CONFIG_DIR") {
+                std::path::PathBuf::from(dir)
+            } else {
+                dirs::config_dir()
+                    .context("无法确定配置目录路径。请设置环境变量 VIDA_CONFIG_DIR 指定配置目录。")?
+                    .join("vida")
+            };
+            let port_file = config_dir.join("daemon.port");
             let port = tokio::fs::read_to_string(&port_file)
                 .await
                 .with_context(|| format!("读取 daemon 端口文件失败: {}", port_file.display()))?;
@@ -387,7 +438,12 @@ async fn main() -> Result<()> {
         Commands::Open { cols, rows } => {
             let req = Request::Pty(PtyRequest::OpenLocalSession { cols, rows });
             let resp = client.call(&req).await?;
-            println!("{}", resp["result"]["session_id"]);
+            println!(
+                "{}",
+                resp["result"]["session_id"]
+                    .as_str()
+                    .context("session_id 缺失")?
+            );
         }
 
         Commands::Send { session_id, text } => {

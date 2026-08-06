@@ -583,11 +583,31 @@ impl PtyManager {
 // ---------------------------------------------------------------------------
 
 fn color_to_ansi(color: &alacritty_terminal::vte::ansi::Color) -> AnsiColor {
-    use alacritty_terminal::vte::ansi::Color;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
     match color {
         Color::Spec(rgb) => AnsiColor::Rgb(rgb.r, rgb.g, rgb.b),
         Color::Indexed(idx) => AnsiColor::Indexed(*idx),
-        Color::Named(_) => AnsiColor::Default,
+        // Named 颜色映射到标准 16 色索引（Foreground/Background 保持默认）
+        Color::Named(named) => match named {
+            NamedColor::Black => AnsiColor::Indexed(0),
+            NamedColor::Red => AnsiColor::Indexed(1),
+            NamedColor::Green => AnsiColor::Indexed(2),
+            NamedColor::Yellow => AnsiColor::Indexed(3),
+            NamedColor::Blue => AnsiColor::Indexed(4),
+            NamedColor::Magenta => AnsiColor::Indexed(5),
+            NamedColor::Cyan => AnsiColor::Indexed(6),
+            NamedColor::White => AnsiColor::Indexed(7),
+            NamedColor::BrightBlack => AnsiColor::Indexed(8),
+            NamedColor::BrightRed => AnsiColor::Indexed(9),
+            NamedColor::BrightGreen => AnsiColor::Indexed(10),
+            NamedColor::BrightYellow => AnsiColor::Indexed(11),
+            NamedColor::BrightBlue => AnsiColor::Indexed(12),
+            NamedColor::BrightMagenta => AnsiColor::Indexed(13),
+            NamedColor::BrightCyan => AnsiColor::Indexed(14),
+            NamedColor::BrightWhite => AnsiColor::Indexed(15),
+            // Foreground/Background 语义色 → 默认
+            _ => AnsiColor::Default,
+        },
     }
 }
 
@@ -743,5 +763,40 @@ mod tests {
 
         pm.unsubscribe_session(&id, rx);
         pm.close_session(&id).unwrap();
+    }
+
+    /// read_screen_styled 返回带样式的 cell（Term 层测试）。
+    #[test]
+    fn read_screen_styled_returns_cells() {
+        use alacritty_terminal::vte::ansi::Processor as VteProcessor;
+        use alacritty_terminal::vte::ansi::StdSyncHandler as VteStdSync;
+
+        // 直接构造 Term + Processor，喂入 ANSI 颜色字节
+        let config = Config {
+            scrolling_history: 100,
+            ..Config::default()
+        };
+        let mut term: Term<VoidListener> =
+            Term::new(config, &GridSize { cols: 80, rows: 24 }, VoidListener);
+        let mut processor: VteProcessor<VteStdSync> = VteProcessor::new();
+
+        // \x1b[31m 红色 → RED → \x1b[0m 重置
+        processor.advance(&mut term, b"\x1b[2J\x1b[1;1H\x1b[31mRED\x1b[0m");
+
+        // 模拟 read_screen_styled 的核心逻辑：遍历 grid 提取 cell
+        use alacritty_terminal::term::cell::Flags;
+        let mut found_red = false;
+        for indexed in term.grid().display_iter() {
+            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            if indexed.cell.c == 'R' {
+                let color = color_to_ansi(&indexed.cell.fg);
+                if matches!(color, AnsiColor::Indexed(1)) {
+                    found_red = true;
+                }
+            }
+        }
+        assert!(found_red, "应找到红色 R（fg=Indexed(1)）");
     }
 }

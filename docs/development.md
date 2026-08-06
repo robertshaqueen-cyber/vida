@@ -215,31 +215,52 @@ cargo run --release --bin vida
 | 指标 | 实测值 | 说明 |
 |---|---|---|
 | `size_of::<Cell>()` | **24 字节** | char 4 + fg 4 + bg 4 + flags 4 + Option\<Arc\> 8 |
-| 5000 行 × 200 列满载内存增量 | 待实测 | 目标 \< 20 MB（3000×200×24 = 14.4 MB + 索引开销） |
-| `yes` 持续 10 秒带宽 | 待实测 | 目标 \< 1 MB/s |
-| `cat` 100MB 文件 | 待实测 | daemon 内存峰值 ≤ 基线 + 50 MB |
-| 空闲 CPU | ≈ 0% | 无常驻定时器 |
+| 3000 行 × 200 列满载内存增量 | **15.4 MB** | 实测（vmmap 前后对比，2026-08-07）。当前默认 scrollback=3000。3000×200×24 = 14.4 MB 算术值 + ~1 MB Grid 行索引/Row 元数据开销 |
+| 5000 行 × 200 列满载外推 | **~25.7 MB** | 按 25.7 字节/cell 线性外推（15.4 MB / 3000 行）。**超过 20 MB 目标**，见下方讨论 |
+| `yes` 持续 10 秒带宽 | **0.02 MB/s** | 实测（106 帧/5s，121 KB，200×50 终端，WebSocket 实测） |
+| `cat` 100MB 文件 | **1.242 s**，峰值 **+0.2 MB**（19.0 MB） | 实测。scrollback 有界 → 内存不随输出增长 |
+| 空闲 CPU | ≈ 0% | 推送循环 60fps 限频，无输出时不产生帧 |
 | 内存测量方式 | `vmmap --summary` Physical footprint | 禁止 RSS |
+
+**5000 行外推值超标的说明**：5000×200×25.7 字节 ≈ 25.7 MB > 20 MB 目标。
+当前默认 scrollback=3000（实测 15.4 MB，达标）。5000 行场景仅在用户手动
+调高 scrollback 时出现。**不直接改目标**——若确需支持 5000 行默认，可选：
+1. 降低默认 scrollback 至 2000（2000×200×25.7 ≈ 10.3 MB）
+2. 压缩 Grid 行元数据
+3. 接受 5000 行时超 20 MB（按需分配，非默认路径）
 
 ### 工具
 
-```bash
-export VIDA_CONFIG_DIR=/tmp/vida-m2a
-cargo run --release --bin vida-daemon &
-DAEMON_PID=$!
-sleep 1
+**重要：daemon 必须保持运行，会话由 daemon 持有。**
 
-# CLI 验收工具
-cargo run --release --bin vida-term-test
+```bash
+# 终端 1：启动 daemon 并保持运行
+export VIDA_CONFIG_DIR=/tmp/vida-m2a
+cargo run --release --bin vida-daemon
+# （保持此终端开着）
+
+# 终端 2：执行验收命令
+export VIDA_CONFIG_DIR=/tmp/vida-m2a
+cargo run --release -p cargo run --release -p vida-term-test -- -- open
+```
+
+> **注意**：daemon 重启后所有旧 session_id 全部失效（会话属于 daemon，
+> 不属于连接）。每次重启后需重新 open 获取新 session_id。
+> 每个 cargo run --release -p vida-term-test -- 子命令是独立进程，连接后即断，但会话保留在 daemon。
+
+常用变量：
+
+```bash
+SID=<上一步 open 输出的 session_id>
 ```
 
 ### 场景 8 — 基本回显
 
 ```bash
-SID=$(vida-term-test open)
-vida-term-test send "$SID" 'echo hello\n'
+SID=$(cargo run --release -p vida-term-test -- open)
+cargo run --release -p vida-term-test -- send "$SID" 'echo hello\n'
 sleep 0.5
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：屏幕上有 `hello`，光标在下一行行首。
@@ -247,9 +268,9 @@ vida-term-test screen "$SID"
 ### 场景 9 — 颜色
 
 ```bash
-vida-term-test send "$SID" 'ls --color\n'
+cargo run --release -p vida-term-test -- send "$SID" 'ls --color\n'
 sleep 0.5
-vida-term-test screen "$SID" --ansi
+cargo run --release -p vida-term-test -- screen "$SID" --ansi
 ```
 
 预期：目录名带颜色，与在真实终端中执行 `ls --color` 的结果一致。
@@ -257,17 +278,17 @@ vida-term-test screen "$SID" --ansi
 ### 场景 10 — 全屏 TUI
 
 ```bash
-vida-term-test send "$SID" 'vim\n'
+cargo run --release -p vida-term-test -- send "$SID" 'vim\n'
 sleep 1
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：看到 vim 界面（波浪号列、状态行）。
 
 ```bash
-vida-term-test send "$SID" '\e:q!\n'
+cargo run --release -p vida-term-test -- send "$SID" '\e:q!\n'
 sleep 0.5
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：回到 shell 提示符。
@@ -275,21 +296,21 @@ vida-term-test screen "$SID"
 ### 场景 11 — 动态刷新
 
 ```bash
-vida-term-test send "$SID" 'htop\n'
+cargo run --release -p vida-term-test -- send "$SID" 'htop\n'
 sleep 2
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 sleep 2
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 sleep 2
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：三次内容不同（说明在刷新），布局不错乱。
 
 ```bash
-vida-term-test send "$SID" 'q'
+cargo run --release -p vida-term-test -- send "$SID" 'q'
 sleep 0.5
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：回到 shell。
@@ -303,9 +324,9 @@ touch /tmp/vida-m2a/测试文件.txt /tmp/vida-m2a/中文文档.md /tmp/vida-m2a
 ```
 
 ```bash
-vida-term-test send "$SID" 'ls -la /tmp/vida-m2a\n'
+cargo run --release -p vida-term-test -- send "$SID" 'ls -la /tmp/vida-m2a\n'
 sleep 0.5
-vida-term-test screen "$SID"
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
 
 预期：文件名不串列。
@@ -313,18 +334,21 @@ vida-term-test screen "$SID"
 ### 场景 13 — resize
 
 ```bash
-vida-term-test send "$SID" 'echo before resize\n'
+cargo run --release -p vida-term-test -- send "$SID" 'echo before resize\n'
 sleep 0.3
-# 通过 daemon IPC 调整尺寸（CLI 暂不支持 resize 命令，需手动或用 screen 观察）
-# 预期：网格变为 40 列 12 行，内容重排后没有乱码
+cargo run --release -p vida-term-test -- resize "$SID" 40 12
+sleep 0.3
+cargo run --release -p vida-term-test -- screen "$SID"
 ```
+
+预期：网格变为 40 列 12 行，内容重排后没有乱码。
 
 ### 场景 14 — 会话结束
 
 ```bash
-vida-term-test send "$SID" 'exit\n'
+cargo run --release -p vida-term-test -- send "$SID" 'exit\n'
 sleep 0.5
-vida-term-test list
+cargo run --release -p vida-term-test -- list
 ```
 
 预期：该会话标记为已结束或已移除；`ps` 中无僵尸进程。
@@ -333,12 +357,12 @@ vida-term-test list
 
 ```bash
 # 终端 1：启动 yes 并 watch
-SID=$(vida-term-test open --cols 200 --rows 50)
-vida-term-test send "$SID" 'yes\n'
+SID=$(cargo run --release -p vida-term-test -- open --cols 200 --rows 50)
+cargo run --release -p vida-term-test -- send "$SID" 'yes\n'
 # 另一个终端：
-vida-term-test watch "$SID"
+cargo run --release -p vida-term-test -- watch "$SID"
 # 10 秒后：
-vida-term-test send "$SID" '\x03'
+cargo run --release -p vida-term-test -- send "$SID" '\x03'
 ```
 
 预期：

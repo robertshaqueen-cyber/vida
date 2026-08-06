@@ -632,3 +632,32 @@ Term 渲染无关。
 可能返回 0×0，直接用于 `PtySize`/`Term` 会触发
 alacritty grid 的 `columns() - 1` 下溢 panic（grid/mod.rs:499）。
 非 tty / 0 尺寸均须降级 80×24。
+
+### M2a-3 结论 13：read_screen_styled 的定位
+
+**新增的 IPC 方法**：`ReadScreenStyled`，返回 `ScreenStyled`：
+```json
+{
+  "rows": [[{"c":"h","fg":{"Rgb":[255,0,0]},"bg":"Default","flags":0}, ...], ...],
+  "cols": 200,
+  "cursor": {"row": 23, "col": 31}
+}
+```
+
+**与 ScreenData 的关系**：并列，各有定位。
+
+| 接口 | 返回 | 定位 |
+|---|---|---|
+| `ReadScreen` | `ScreenData { lines, wide_cols, cursor }` | 干净文本，M5 `screen_read` 用 |
+| `ReadScreenStyled` | `ScreenStyled { rows(cells), cols, cursor }` | 带样式渲染，M2b GUI 用 |
+
+**颜色表示**：`AnsiColor` 枚举（`Default` / `Indexed(u8)` / `Rgb(u8,u8,u8)`），
+序列化为 serde 枚举格式。
+
+**wide_cols**：`ReadScreenStyled` 不含 wide_cols —— 宽字符的 spacer cell
+被跳过（不输出），但 `flags` 含 `WIDE` 位（0x40），客户端据此判断
+该字符占两列。M5 `screen_read` 用 `ReadScreen`（含 wide_cols）。
+
+**M5 用哪个**：`screen_read` 用 `ReadScreen`（干净文本 + wide_cols，
+agent 可直接阅读文本并获知列对齐）。`ReadScreenStyled` 是 M2b
+渲染层的接口，两者职责不重叠，不构成「两处保持一致」问题。
