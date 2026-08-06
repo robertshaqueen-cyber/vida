@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-use crate::protocol::{Request, Response, ResponsePayload, SyncResponse};
+use crate::protocol::{PtyRequest, Request, Response, ResponsePayload, SyncResponse};
 use crate::state::DaemonState;
 use vida_core::sync::SyncResult;
 
@@ -247,14 +247,19 @@ async fn handle_request(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<serde_json::Value> {
     // PTY 请求：不持金库锁，只锁 state.pty（独立 RwLock）。
-    // 金库路径（vault/sync/hosts）与 PTY 路径完全隔离，互不阻塞。
-    if let Some(result) = handle_pty_request(&request, state).await? {
-        return Ok(result);
+    // PtyRequest 由 #[serde(untagged)] 在反序列化时已分流，
+    // 编译器保证 handle_pty_request 穷尽匹配所有 PtyRequest 变体。
+    if let Request::Pty(pty_req) = &request {
+        return handle_pty_request(pty_req, state).await;
     }
 
     let mut state = state.lock().await;
 
     match request {
+        // PTY 请求已在 handle_pty_request 处理（上方 if let 提前返回）；
+        // 此处不可达，但编译器需要穷尽匹配。
+        Request::Pty(_) => unreachable!("PTY 请求已在 handle_pty_request 处理"),
+
         Request::Auth { .. } => unreachable!(),
 
         // Vault
@@ -367,68 +372,57 @@ async fn handle_request(
             state.handle_remote_missing(&action)?;
             Ok(serde_json::json!({"handled": true}))
         }
-
-        // PTY 请求已在上游 handle_pty_request 处理，永不到达这里
-        Request::OpenLocalSession { .. }
-        | Request::SessionInput { .. }
-        | Request::ResizeSession { .. }
-        | Request::CloseSession { .. }
-        | Request::ListSessions
-        | Request::ReadScreen { .. } => {
-            anyhow::bail!("PTY 请求未在上游处理（内部错误）")
-        }
     }
 }
 
 /// PTY 会话请求（M2a-2）。只锁 `state.pty`（独立 RwLock），
-/// 全程不接触金库锁。非 PTY 请求返回 None，由调用方走金库路径。
+/// 全程不接触金库锁。编译器强制穷尽匹配所有 PtyRequest 变体。
 async fn handle_pty_request(
-    request: &Request,
+    request: &PtyRequest,
     state: &Arc<Mutex<DaemonState>>,
-) -> Result<Option<serde_json::Value>> {
+) -> Result<serde_json::Value> {
     // 短暂拿金库锁仅为了取出 pty 的 Arc 引用，随即释放；
     // 后续 PTY 操作只持有 pty 自己的 RwLock，不与金库锁争用。
     let pty = state.lock().await.pty.clone();
 
     match request {
-        Request::OpenLocalSession { cols, rows } => {
+        PtyRequest::OpenLocalSession { cols, rows } => {
             let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             let session_id = pty.open_session(*cols, *rows)?;
-            Ok(Some(serde_json::json!({"session_id": session_id})))
+            Ok(serde_json::json!({"session_id": session_id}))
         }
-        Request::SessionInput { session_id, data } => {
+        PtyRequest::SessionInput { session_id, data } => {
             let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             pty.session_input(session_id, data)?;
-            Ok(Some(serde_json::json!({"ok": true})))
+            Ok(serde_json::json!({"ok": true}))
         }
-        Request::ResizeSession {
+        PtyRequest::ResizeSession {
             session_id,
             cols,
             rows,
         } => {
             let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             pty.resize_session(session_id, *cols, *rows)?;
-            Ok(Some(serde_json::json!({"ok": true})))
+            Ok(serde_json::json!({"ok": true}))
         }
-        Request::CloseSession { session_id } => {
+        PtyRequest::CloseSession { session_id } => {
             let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             pty.close_session(session_id)?;
-            Ok(Some(serde_json::json!({"ok": true})))
+            Ok(serde_json::json!({"ok": true}))
         }
-        Request::ListSessions => {
+        PtyRequest::ListSessions => {
             let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             let sessions = pty.list_sessions();
-            Ok(Some(serde_json::to_value(sessions)?))
+            Ok(serde_json::to_value(sessions)?)
         }
-        Request::ReadScreen { session_id } => {
+        PtyRequest::ReadScreen { session_id } => {
             let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             let (lines, cursor) = pty.read_screen(session_id)?;
-            Ok(Some(serde_json::json!({
+            Ok(serde_json::json!({
                 "lines": lines,
                 "cursor": { "row": cursor.0, "col": cursor.1 },
-            })))
+            }))
         }
-        _ => Ok(None),
     }
 }
 

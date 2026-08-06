@@ -283,7 +283,12 @@ impl PtyManager {
     }
 
     /// 读取屏幕：全量文本快照（同步，M5 screen_read 雏形）。
+    ///
+    /// 宽字符（CJK 等占两列）处理：第一个 cell 输出字符本身，
+    /// 第二个 cell（WIDE_CHAR_SPACER）输出 `\0`（NUL sentinel）。
+    /// 客户端按此约定还原列位置——连续字符后的 NUL 表示前一字符占两列。
     pub fn read_screen(&self, session_id: &str) -> Result<(Vec<String>, (u16, u16))> {
+        use alacritty_terminal::term::cell::Flags;
         let session = self
             .sessions
             .get(session_id)
@@ -301,7 +306,12 @@ impl PtyManager {
                 }
                 current_row = point.line.0;
             }
-            line.push(indexed.cell.c);
+            // WIDE_CHAR_SPACER → NUL sentinel，保留列位置信息
+            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                line.push('\0');
+            } else {
+                line.push(indexed.cell.c);
+            }
         }
         lines.push(line);
         let cursor = inner.term.grid().cursor.point;
@@ -325,6 +335,25 @@ impl PtyManager {
 
 /// 消费 PTY 输出：收到字节立即 advance Term（处理不限频）。
 /// 推送限频在 M2a-2-2 加入（damage → 有界通道）。
+///
+// ── 持锁分析（必改 2）──
+//
+// 当前：整个 `processor.advance(term, &bytes)` 期间持有
+// SessionInner 的 Mutex。单次 advance 通常 <1ms，但 `yes` 类
+// 持续高吞吐场景下泵线程几乎持续持锁。
+//
+// 影响：
+//   a. advance 期间持锁，直到返回才释放。
+//   b. read_screen / session_input / resize 锁同一把 Mutex →
+//      高吞吐时阻塞，响应延迟不可控。
+//   c. M2a-2-2 推送循环需在同一把锁下读 damage + 遍历 grid，
+//      持锁时间随列数×行数增加。
+//
+// M2a-2-2 改进方案：SessionInner 拆为两把独立 Mutex：
+//   - `term: Mutex<(Term, Processor)>`：泵线程独占，推送循环只读。
+//   - `io: Mutex<IoState>{writer, master, child}`：input/resize/close。
+//   泵持 term 锁，输入持 io 锁 → 互不阻塞。read_screen 共享
+//   term 锁（低频，推送 60fps 限频可控）。
 fn pump_loop(
     session: Arc<Mutex<SessionInner>>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -429,6 +458,28 @@ mod tests {
         let info = pm.list_sessions();
         assert_eq!(info.len(), 1);
         assert!(info[0].alive);
+        pm.close_session(&id).unwrap();
+    }
+
+    /// 必改 3：read_screen 保留宽字符列位置（NUL sentinel）。
+    /// 中文「你好」每个字占两列：第一格是字符，第二格是 WIDE_CHAR_SPACER
+    /// 输出为 \0。客户端按 \0 还原列位置。
+    #[test]
+    fn read_screen_preserves_wide_char_columns() {
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(80, 24).unwrap();
+        // 写入中文 + 换行
+        pm.session_input(&id, "echo 你好世界\n".as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let (lines, _) = pm.read_screen(&id).unwrap();
+        let joined = lines.join("\n");
+        // 每个中文字后应有一个 NUL sentinel（占两列）
+        // 「你」→ '你' + '\0', 「好」→ '好' + '\0', 等
+        assert!(
+            joined.contains("你\0好\0世\0界"),
+            "宽字符后应有 NUL sentinel: {:?}",
+            joined
+        );
         pm.close_session(&id).unwrap();
     }
 
