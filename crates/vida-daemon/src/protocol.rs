@@ -98,6 +98,10 @@ pub enum PtyRequest {
     ListSessions,
     /// Read current screen as plain text snapshot.
     ReadScreen { session_id: String },
+    /// Subscribe to session push: immediate full snapshot, then deltas.
+    SubscribeSession { session_id: String },
+    /// Unsubscribe from session push (drop the receiver).
+    UnsubscribeSession { session_id: String },
 }
 
 // ---------------------------------------------------------------------------

@@ -1415,3 +1415,100 @@ async fn pty_session_size_validation() {
         resp
     );
 }
+
+// -----------------------------------------------------------------------
+// PTY push protocol tests (M2a-2-2)
+// -----------------------------------------------------------------------
+
+/// yes 场景：持续高吞吐，验证推送带宽有界。
+#[tokio::test]
+async fn pty_yos_bandwidth_bounded() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut ws, mut reader) = connect(addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    send_recv(&mut ws, &mut reader, &auth).await;
+
+    let resp = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":200,"rows":50},"id":2}"#,
+    )
+    .await;
+    let sid = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    // 必须先订阅才能收到推送帧
+    let sub = format!(
+        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
+        sid
+    );
+    send_recv(&mut ws, &mut reader, &sub).await;
+
+    // 启动 yes（持续输出）
+    let input_cmd = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":"{}"}},"id":4}}"#,
+        sid, "yes\r\n"
+    );
+    ws.send(Message::Text(input_cmd.into())).await.unwrap();
+
+    // 收集 5 秒内的推送帧（不依赖文本响应）
+    let start = std::time::Instant::now();
+    let mut total_bytes: usize = 0;
+    let mut frame_count: usize = 0;
+
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        total_bytes += bytes.len();
+                        frame_count += 1;
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    let bandwidth_mbps = if elapsed_secs > 0.0 {
+        (total_bytes as f64 / elapsed_secs) / 1_000_000.0
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "yes 场景: {} 帧, {} bytes, {:.2} MB/s",
+        frame_count, total_bytes, bandwidth_mbps
+    );
+
+    // 停止 yes
+    let stop_cmd = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":"\x03"}},"id":5}}"#,
+        sid
+    );
+    let _ = ws.send(Message::Text(stop_cmd.into())).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let close_cmd = format!(
+        r#"{{"method":"CloseSession","params":{{"session_id":"{}"}},"id":6}}"#,
+        sid
+    );
+    let _ = ws.send(Message::Text(close_cmd.into())).await;
+
+    // 断言：收到了推送帧（协议工作）且有界
+    assert!(frame_count > 0, "应收到至少一帧推送");
+    assert!(
+        bandwidth_mbps < 1.0,
+        "带宽过高: {:.2} MB/s（目标 < 1 MB/s）",
+        bandwidth_mbps
+    );
+}
