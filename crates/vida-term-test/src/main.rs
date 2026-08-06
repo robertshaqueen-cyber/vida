@@ -580,7 +580,7 @@ async fn main() -> Result<()> {
             let start_time = std::time::Instant::now();
             let mut frame_count: u64 = 0;
             let mut total_bytes: u64 = 0;
-            let mut intervals_ms: Vec<u128> = Vec::new();
+            let mut intervals_ms: Vec<f64> = Vec::new();
 
             // 退出信号：Ctrl+C 或 duration 到期（duration 用截止时间，不随循环重置）
             let duration_deadline =
@@ -600,24 +600,37 @@ async fn main() -> Result<()> {
                         match msg {
                             Some(Ok(Message::Binary(bytes))) => {
                                 let now = std::time::Instant::now();
-                                let interval_ms = now.duration_since(last_time).as_millis();
+                                // 首帧（订阅快照）无前驱，跳过间隔统计
+                                let has_prev = last_seq.is_some();
+                                let interval_us = if has_prev {
+                                    now.duration_since(last_time).as_micros()
+                                } else {
+                                    0
+                                };
                                 last_time = now;
-                                intervals_ms.push(interval_ms);
+                                if has_prev {
+                                    intervals_ms.push(interval_us as f64 / 1000.0);
+                                }
                                 frame_count += 1;
                                 total_bytes += bytes.len() as u64;
 
+                                let interval_str = if has_prev {
+                                    format!("{:.1}", interval_us as f64 / 1000.0)
+                                } else {
+                                    "-".to_string()
+                                };
                                 if let Some((seq, line_count)) = decode_frame(&bytes) {
                                     let expected_seq = last_seq.map(|s| s + 1).unwrap_or(seq);
                                     let seq_status = if seq == expected_seq { "OK" } else { "GAP!" };
                                     println!(
                                         "seq={:4} lines={:3} bytes={:5} interval={}ms [{}]",
-                                        seq, line_count, bytes.len(), interval_ms, seq_status
+                                        seq, line_count, bytes.len(), interval_str, seq_status
                                     );
                                     last_seq = Some(seq);
                                 } else {
                                     println!(
                                         "invalid frame: {} bytes, interval={}ms",
-                                        bytes.len(), interval_ms
+                                        bytes.len(), interval_str
                                     );
                                 }
                             }
@@ -649,13 +662,23 @@ async fn main() -> Result<()> {
             // 统计
             let elapsed = start_time.elapsed().as_secs_f64();
             let avg_interval = if !intervals_ms.is_empty() {
-                intervals_ms.iter().sum::<u128>() as f64 / intervals_ms.len() as f64
+                intervals_ms.iter().sum::<f64>() / intervals_ms.len() as f64
             } else {
                 0.0
             };
-            let min_interval = intervals_ms.iter().min().copied().unwrap_or(0);
-            let max_interval = intervals_ms.iter().max().copied().unwrap_or(0);
-            let below_16 = intervals_ms.iter().filter(|&&v| v < 16).count();
+            let min_interval = intervals_ms.iter().cloned().fold(f64::MAX, f64::min);
+            let max_interval = intervals_ms.iter().cloned().fold(f64::MIN, f64::max);
+            let min_interval = if intervals_ms.is_empty() {
+                0.0
+            } else {
+                min_interval
+            };
+            let max_interval = if intervals_ms.is_empty() {
+                0.0
+            } else {
+                max_interval
+            };
+            let below_16 = intervals_ms.iter().filter(|&&v| v < 16.0).count();
             let below_pct = if intervals_ms.is_empty() {
                 0.0
             } else {
@@ -672,8 +695,8 @@ async fn main() -> Result<()> {
                  帧数: {}（{:.1} fps）\n\
                  总字节: {}（{:.2} KB/s）\n\
                  平均间隔: {:.1} ms\n\
-                 最小间隔: {} ms\n\
-                 最大间隔: {} ms\n\
+                 最小间隔: {:.1} ms\n\
+                 最大间隔: {:.1} ms\n\
                  低于 16ms: {} 帧（{:.1}%）",
                 frame_count,
                 fps,

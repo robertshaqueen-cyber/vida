@@ -103,8 +103,10 @@ pub struct BoundedReceiver<T> {
 }
 
 impl<T> BoundedReceiver<T> {
+    /// 阻塞接收一帧。收到通知后排空通知通道，避免积压。
     pub fn recv(&self) -> Option<T> {
         self.notify.recv().ok()?;
+        while self.notify.try_recv().is_ok() {}
         self.queue.lock().ok()?.pop_front()
     }
 
@@ -351,8 +353,25 @@ fn encode_color_spec(color: &alacritty_terminal::vte::ansi::Color) -> ColorSpec 
 /// 编码与发送到有界通道在锁外进行。
 pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
     let mut seq: u64 = 0;
+    // 绝对时间戳限频：next_slot 单调推进，sleep 抖动不会累积。
+    // 距上次推送不足 16ms 时直接返回，不读 damage/不编码/不入队。
+    let interval = Duration::from_millis(PUSH_INTERVAL_MS);
+    let mut next_slot = std::time::Instant::now();
+
     loop {
-        thread::sleep(Duration::from_millis(PUSH_INTERVAL_MS));
+        // 等待到下一个时隙（绝对时间，非相对 sleep）
+        let now = std::time::Instant::now();
+        if now < next_slot {
+            thread::sleep(next_slot - now);
+        }
+        // 推进时隙：确保间隔 ≥ 16ms
+        next_slot += interval;
+        // 若处理耗时长于 interval，防止 burst：把时隙拉回不早于当前
+        // 时间的一个 interval 之前，避免追赶产生密集帧。
+        if next_slot + interval < std::time::Instant::now() {
+            next_slot = std::time::Instant::now();
+        }
+
         let inner = match session.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

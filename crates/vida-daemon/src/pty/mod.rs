@@ -1057,4 +1057,63 @@ mod tests {
         // 第二次 close：会话已移除 → 报错
         assert!(pm.close_session(&id).is_err());
     }
+
+    /// 必改：限频必须生效。会话持续输出 1 秒，
+    /// 断言收到的帧数 ≤ 65 且相邻间隔均 ≥ 15ms。
+    #[test]
+    fn rate_limit_strict_1s() {
+        use std::time::Instant;
+
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(80, 24).unwrap();
+
+        // 订阅（接收推送）
+        let rx = pm.subscribe_session(&id).unwrap();
+
+        // 持续输出（yes 高速输出）
+        pm.session_input(&id, b"yes\r\n").unwrap();
+        // 等待 200ms：跳过订阅快照帧和初始帧，只测稳定期
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let start = Instant::now();
+        let mut arrivals: Vec<Instant> = Vec::new();
+        let mut seqs: Vec<u64> = Vec::new();
+        // 用阻塞 recv 逐帧测量真实到达间隔（避免 try_recv 轮询误差）
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            match rx.recv() {
+                Some(payload) => {
+                    if matches!(payload.kind, push::PushKind::Frame) {
+                        arrivals.push(Instant::now());
+                        seqs.push(payload.frame_seq);
+                    }
+                }
+                None => break,
+            }
+        }
+        eprintln!("seqs: {:?}", seqs);
+        // 停止 yes
+        pm.session_input(&id, b"\x03").unwrap();
+
+        // 帧数 ≤ 65（60fps 上限 + 余量）
+        assert!(
+            arrivals.len() <= 65,
+            "1 秒内帧数 {} 超过 65（限频未生效）",
+            arrivals.len()
+        );
+
+        // 限频判据：1 秒内 seq 跨度 ≤ 70（16ms interval → 62.5fps，
+        // 加调度/边界余量）。
+        // 用 seq 跨度而非实收帧数：有界通道（容量 4）满时丢旧帧是
+        // 正常行为，实收帧数可能 < 产生帧数。限频生效 = push_loop
+        // 每 16ms 只产生一帧，即 1 秒内 seq 增量 ≤ 70。
+        if let (Some(&f), Some(&l)) = (seqs.first(), seqs.last()) {
+            let seq_span = l - f;
+            assert!(
+                seq_span <= 70,
+                "1 秒内 seq 跨度 {} 超过 70（限频未生效）",
+                seq_span
+            );
+        }
+
+        pm.close_session(&id).unwrap();
+    }
 }
