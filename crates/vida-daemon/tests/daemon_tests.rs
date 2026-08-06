@@ -102,12 +102,22 @@ async fn send_recv(
     >,
     msg: &str,
 ) -> serde_json::Value {
+    use tokio_tungstenite::tungstenite::Message;
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .unwrap();
-    match reader.next().await {
-        Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected Text, got {:?}", other),
+    // 跳过二进制推送帧，返回第一个文本响应。
+    // 订阅后二进制帧可能与文本响应交织到达。
+    loop {
+        match reader.next().await {
+            Some(Ok(Message::Text(text))) => {
+                return serde_json::from_str(&text).unwrap();
+            }
+            Some(Ok(Message::Binary(_))) => continue, // 跳过推送帧
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => panic!("read error: {:?}", e),
+            None => panic!("connection closed"),
+        }
     }
 }
 
@@ -1421,41 +1431,52 @@ async fn pty_session_size_validation() {
 // -----------------------------------------------------------------------
 
 /// yes 场景：持续高吞吐，验证推送带宽有界。
+///
+/// 注意：SessionInput.data 是 Vec<u8>，JSON 中必须编码为字节数组。
+/// yes → [121,101,115,13,10]（y e s \r \n）
+/// Ctrl+C → [3]
 #[tokio::test]
 async fn pty_yos_bandwidth_bounded() {
     use tokio_tungstenite::tungstenite::Message;
 
     let (addr, token, _dir) = start_daemon().await;
     let (mut ws, mut reader) = connect(addr).await;
+
+    macro_rules! call_ok {
+        ($w:expr, $r:expr, $json:expr) => {{
+            let resp = send_recv($w, $r, $json).await;
+            assert_eq!(resp["type"], "Ok", "IPC 失败: {} → {}", $json, resp);
+            resp
+        }};
+    }
+
     let auth = format!(
         r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
         token
     );
-    send_recv(&mut ws, &mut reader, &auth).await;
+    call_ok!(&mut ws, &mut reader, &auth);
 
-    let resp = send_recv(
+    let resp = call_ok!(
         &mut ws,
         &mut reader,
-        r#"{"method":"OpenLocalSession","params":{"cols":200,"rows":50},"id":2}"#,
-    )
-    .await;
+        r#"{"method":"OpenLocalSession","params":{"cols":200,"rows":50},"id":2}"#
+    );
     let sid = resp["result"]["session_id"].as_str().unwrap().to_string();
 
-    // 必须先订阅才能收到推送帧
     let sub = format!(
         r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
         sid
     );
-    send_recv(&mut ws, &mut reader, &sub).await;
+    call_ok!(&mut ws, &mut reader, &sub);
 
-    // 启动 yes（持续输出）
-    let input_cmd = format!(
-        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":"{}"}},"id":4}}"#,
-        sid, "yes\r\n"
+    // 启动 yes（data 为字节数组）。不等待文本响应，避免与二进制帧竞争。
+    let yes_data = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":[121,101,115,13,10]}},"id":4}}"#,
+        sid
     );
-    ws.send(Message::Text(input_cmd.into())).await.unwrap();
+    ws.send(Message::Text(yes_data.into())).await.unwrap();
 
-    // 收集 5 秒内的推送帧（不依赖文本响应）
+    // 收集 5 秒内的推送帧
     let start = std::time::Instant::now();
     let mut total_bytes: usize = 0;
     let mut frame_count: usize = 0;
@@ -1490,25 +1511,30 @@ async fn pty_yos_bandwidth_bounded() {
         frame_count, total_bytes, bandwidth_mbps
     );
 
-    // 停止 yes
-    let stop_cmd = format!(
-        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":"\x03"}},"id":5}}"#,
+    // 停止 yes（Ctrl+C = 字节 [3]）
+    let stop_data = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":[3]}},"id":5}}"#,
         sid
     );
-    let _ = ws.send(Message::Text(stop_cmd.into())).await;
+    ws.send(Message::Text(stop_data.into())).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let close_cmd = format!(
+    // 关闭会话
+    let close = format!(
         r#"{{"method":"CloseSession","params":{{"session_id":"{}"}},"id":6}}"#,
         sid
     );
-    let _ = ws.send(Message::Text(close_cmd.into())).await;
+    call_ok!(&mut ws, &mut reader, &close);
 
-    // 断言：收到了推送帧（协议工作）且有界
     assert!(frame_count > 0, "应收到至少一帧推送");
     assert!(
         bandwidth_mbps < 1.0,
         "带宽过高: {:.2} MB/s（目标 < 1 MB/s）",
         bandwidth_mbps
+    );
+    assert!(
+        total_bytes > 1000,
+        "收到的数据太少: {} bytes（yes 应产生大量输出）",
+        total_bytes
     );
 }
