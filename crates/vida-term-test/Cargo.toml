@@ -1,0 +1,22 @@
+[package]
+name = "vida-term-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vida-term-test"
+path = "src/main.rs"
+
+[dependencies]
+vida-daemon = { path = "../vida-daemon" }
+tokio.workspace = true
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+futures-util = "0.3"

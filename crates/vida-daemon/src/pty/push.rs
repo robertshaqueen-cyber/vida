@@ -103,8 +103,10 @@ pub struct BoundedReceiver<T> {
 }
 
 impl<T> BoundedReceiver<T> {
+    /// 阻塞接收一帧。收到通知后排空通知通道，避免积压。
     pub fn recv(&self) -> Option<T> {
         self.notify.recv().ok()?;
+        while self.notify.try_recv().is_ok() {}
         self.queue.lock().ok()?.pop_front()
     }
 
@@ -207,7 +209,14 @@ pub fn build_partial_frame(
     damage: &[(usize, usize, usize)],
 ) -> Frame {
     let mut lines: Vec<DirtyLine> = Vec::new();
+    let rows: usize = term.grid().screen_lines();
     for &(line, left, right) in damage {
+        // 只发送可见屏幕内的脏行。
+        // damage 行号是 grid 绝对坐标（含 scrollback 偏移），
+        // 超出屏幕的行是滚动历史，客户端不渲染（跳过避免 row>rows 异常）。
+        if line >= rows {
+            continue;
+        }
         if let Some(dirty_line) =
             build_dirty_line_range(term, line as u16, left as u16, right as u16)
         {
@@ -299,7 +308,7 @@ fn build_dirty_line_range(
     })
 }
 
-fn encode_flags(cell_flags: &Flags) -> u8 {
+pub(crate) fn encode_flags(cell_flags: &Flags) -> u8 {
     let mut flags: u8 = 0;
     if cell_flags.contains(Flags::BOLD) {
         flags |= FLAG_BOLD;
@@ -344,8 +353,25 @@ fn encode_color_spec(color: &alacritty_terminal::vte::ansi::Color) -> ColorSpec 
 /// 编码与发送到有界通道在锁外进行。
 pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
     let mut seq: u64 = 0;
+    // 绝对时间戳限频：next_slot 单调推进，sleep 抖动不会累积。
+    // 距上次推送不足 16ms 时直接返回，不读 damage/不编码/不入队。
+    let interval = Duration::from_millis(PUSH_INTERVAL_MS);
+    let mut next_slot = std::time::Instant::now();
+
     loop {
-        thread::sleep(Duration::from_millis(PUSH_INTERVAL_MS));
+        // 等待到下一个时隙（绝对时间，非相对 sleep）
+        let now = std::time::Instant::now();
+        if now < next_slot {
+            thread::sleep(next_slot - now);
+        }
+        // 推进时隙：确保间隔 ≥ 16ms
+        next_slot += interval;
+        // 若处理耗时长于 interval，防止 burst：把时隙拉回不早于当前
+        // 时间的一个 interval 之前，避免追赶产生密集帧。
+        if next_slot + interval < std::time::Instant::now() {
+            next_slot = std::time::Instant::now();
+        }
+
         let inner = match session.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -377,6 +403,7 @@ pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
         let bytes: Vec<u8> = encode_frame(&inner.id, &frame);
         let frame_payload = PushPayload {
             frame_seq: seq,
+            kind: PushKind::Frame,
             bytes,
         };
         let mut subs = match inner.subscribers.lock() {
@@ -392,9 +419,19 @@ pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
     );
 }
 
+/// 推送负载类型。
+#[derive(Debug, Clone)]
+pub enum PushKind {
+    /// 普通推送帧（damage 增量）。
+    Frame,
+    /// 会话结束事件（shell 自行退出）。
+    SessionClosed { exit_code: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub struct PushPayload {
     pub frame_seq: u64,
+    pub kind: PushKind,
     pub bytes: Vec<u8>,
 }
 

@@ -6,11 +6,11 @@ use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::PushPayload;
 use crate::protocol::{PtyRequest, Request, Response, ResponsePayload, SyncResponse};
-use crate::pty::push::BoundedReceiver;
+use crate::pty::push::{BoundedReceiver, PushKind};
 use crate::state::DaemonState;
 use vida_core::sync::SyncResult;
 
@@ -106,8 +106,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
     let mut authenticated = false;
 
     // 推送通道：PTY 推送循环 → 桥接任务 → tokio channel → 此处
-    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<PushPayload>(8);
     let mut push_bridge: Option<tokio::task::JoinHandle<()>> = None;
+    // 当前订阅的会话（session_closed 事件需要 session_id）
+    let mut current_session_id: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -123,7 +125,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         // 处理推送相关命令（订阅/取消订阅）
                         if let Some(cmd) = push_cmd_arc.lock().await.take() {
                             match cmd {
-                                PushCommand::Subscribe(rx) => {
+                                PushCommand::Subscribe(rx, sid) => {
+                                    current_session_id = Some(sid);
                                     let tx = push_tx.clone();
                                     // 桥接任务：轮询 std BoundedReceiver（try_recv），
                                     // 避免阻塞 tokio runtime 线程。
@@ -131,7 +134,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                                         loop {
                                             match rx.try_recv() {
                                                 Some(payload) => {
-                                                    if tx.send(payload.bytes).await.is_err() {
+                                                    // 直接传递 payload，由连接层区分
+                                                    // 二进制帧 vs session_closed 事件
+                                                    if tx.send(payload).await.is_err() {
                                                         break;
                                                     }
                                                 }
@@ -163,7 +168,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         break;
                     }
                     Some(Err(e)) => {
-                        error!("Error reading from {}: {}", addr, e);
+                        // 客户端未做关闭握手就断开（网络中断、进程被 kill）是
+                        // 常见且无害的情况，DEBUG 即可。ERROR 留给真正需要
+                        // 用户注意的问题。
+                        debug!("Connection dropped without close handshake ({}): {}", addr, e);
                         break;
                     }
                     None => break,
@@ -171,14 +179,42 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                 }
             }
 
-            // PTY 推送输出
-            Some(bytes) = push_rx.recv() => {
-                if let Err(e) = write.send(Message::Binary(tokio_tungstenite::tungstenite::Bytes::from(bytes))).await {
-                    error!("Failed to push binary frame to {}: {}", addr, e);
-                    break;
+            // PTY 推送输出：二进制帧 或 session_closed 事件
+            Some(payload) = push_rx.recv() => {
+                match payload.kind {
+                    PushKind::Frame => {
+                        if let Err(e) = write.send(Message::Binary(tokio_tungstenite::tungstenite::Bytes::from(payload.bytes))).await {
+                            error!("Failed to push binary frame to {}: {}", addr, e);
+                            break;
+                        }
+                    }
+                    PushKind::SessionClosed { exit_code } => {
+                        // 规格 5.3：shell 退出时推送事件
+                        let sid = current_session_id.as_deref().unwrap_or("");
+                        let event = serde_json::json!({
+                            "type": "Event",
+                            "event": "session_closed",
+                            "data": {
+                                "session_id": sid,
+                                "exit_code": exit_code,
+                            },
+                        });
+                        if let Err(e) = write.send(Message::Text(event.to_string().into())).await {
+                            error!("Failed to push session_closed event to {}: {}", addr, e);
+                            break;
+                        }
+                    }
                 }
             }
         }
+    }
+
+    // 连接断开：必须中止推送桥接任务。
+    // 否则桥接任务仍持有 push_tx（sender clone），channel 不会关闭，
+    // 它会继续从会话的 BoundedReceiver 读帧并 send 到无人接收的
+    // channel —— 死循环浪费资源。
+    if let Some(handle) = push_bridge.take() {
+        handle.abort();
     }
 
     info!("Connection dropped: {}", addr);
@@ -186,8 +222,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
 
 /// 推送控制命令：handle_message 返回给连接层，用于管理订阅桥接。
 enum PushCommand {
-    /// 订阅推送：携带 BoundedReceiver，由连接层启动桥接任务。
-    Subscribe(BoundedReceiver<PushPayload>),
+    /// 订阅推送：携带 BoundedReceiver + session_id，由连接层启动桥接任务。
+    Subscribe(BoundedReceiver<PushPayload>, String),
     /// 取消订阅：中止桥接任务。
     Unsubscribe,
 }
@@ -320,7 +356,7 @@ async fn handle_message(
         push_cmd_out
             .lock()
             .await
-            .replace(PushCommand::Subscribe(rx));
+            .replace(PushCommand::Subscribe(rx, session_id.clone()));
         return serde_json::to_string(&Response {
             id,
             payload: ResponsePayload::Ok {
@@ -575,6 +611,11 @@ async fn handle_pty_request(
         PtyRequest::ReadScreen { session_id } => {
             let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             let screen = pty.read_screen(session_id)?;
+            Ok(serde_json::to_value(screen)?)
+        }
+        PtyRequest::ReadScreenStyled { session_id } => {
+            let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let screen = pty.read_screen_styled(session_id)?;
             Ok(serde_json::to_value(screen)?)
         }
         // SubscribeSession / UnsubscribeSession 已在 handle_message 层面处理

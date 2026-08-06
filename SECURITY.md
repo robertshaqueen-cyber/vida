@@ -60,3 +60,8 @@
 - 敏感字段使用 zeroize 在 drop 时清零。
 - 金库写入采用原子写入 + fsync，避免半写状态。
 - `daemon.token`（WebSocket 认证令牌）权限为 0600，仅限本机读取。
+- **终端会话能力**：daemon 可启动本地 shell 进程（`OpenLocalSession`
+  固定使用 `$SHELL`，不接受客户端指定命令）。因此 `daemon.token`
+  保护的不再只是金库，**还包括本机 shell 执行能力**——持有 token
+  即可通过 WebSocket 在会话中执行任意 shell 命令。token 必须严格
+  保密，泄露等于本机 shell 访问权泄露。

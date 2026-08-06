@@ -203,3 +203,216 @@ cargo run --release --bin vida
 5. 切换回「不同步」→ 预期路径清空，保存后同步按钮显示「未配置同步」
 6. **关键断言（回归）**：点击同步按钮 → 无论当前显示什么状态，请求都会发出 —— daemon 日志出现 `Sync upload/download/decision` 记录；未配置同步时按钮点击也发出请求，由 daemon 返回 `sync_not_configured`，界面显示「未配置同步」而非跳转设置
 7. 保存路径后点同步 → daemon 日志出现 `Sync upload OK: <路径> (<字节> bytes)`，远端 `vault.age` 存在
+
+---
+
+## M2a 终端核心 — 验收清单
+
+> 全部使用 `VIDA_CONFIG_DIR=/tmp/vida-m2a` 隔离，不触碰真实配置。
+
+### 指标（M2a-spec 第 8 节，实测）
+
+| 指标 | 实测值 | 说明 |
+|---|---|---|
+| `size_of::<Cell>()` | **24 字节** | char 4 + fg 4 + bg 4 + flags 4 + Option\<Arc\> 8 |
+| 3000 行 × 200 列满载内存增量 | **15.4 MB** | 实测（vmmap 前后对比，2026-08-07）。当前默认 scrollback=3000。3000×200×24 = 14.4 MB 算术值 + ~1 MB Grid 行索引/Row 元数据开销 |
+| 5000 行 × 200 列满载外推 | **~25.7 MB** | 按 25.7 字节/cell 线性外推（15.4 MB / 3000 行）。**超过 20 MB 目标**，见下方讨论 |
+| `yes` 持续 10 秒带宽 | **0.03 MB/s** | 实测（watch 3s：155 帧，90 KB，51.6fps，200×50 终端，WebSocket 实测） |
+| yes 场景 daemon footprint | **3536K 零增长** | 有界通道 + 丢旧留新生效。yes 持续输出、seq 累积到 7764 时多次采样 footprint 稳定（2026-08-07） |
+| `cat` 100MB 文件 | **1.242 s**，峰值 **+0.2 MB**（19.0 MB） | 实测。scrollback 有界 → 内存不随输出增长 |
+| 限频实测 | **15.16-18.59 ms** | push_loop 内部间隔（诊断日志实测，多数恰 16.00ms）。绝对时隙基准 |
+| 空闲 CPU | ≈ 0% | 推送循环 60fps 限频，无输出时不产生帧 |
+| 内存测量方式 | `vmmap --summary` Physical footprint | 禁止 RSS |
+
+**5000 行外推值超标的说明**：5000×200×25.7 字节 ≈ 25.7 MB > 20 MB 目标。
+**决定（2026-08-07）**：不改任何默认值和上限。默认 scrollback=3000 实测
+15.4 MB 达标；5000 行仅出现在用户主动调高时，属用户的知情选择。
+
+**换算关系（实测）**：**约 5.1 MB / 1000 行**（3000 行实测 15.4 MB）。
+高于算术值 14.4 MB（3000×200×24 字节）约 7%，差额为 Grid 行索引与
+Row 元数据开销。设置页「回滚行数」下方已注明「每 1000 行约占用 5 MB 内存」。
+
+### 工具
+
+**重要：daemon 必须保持运行，会话由 daemon 持有。**
+
+```bash
+# 终端 1：启动 daemon 并保持运行
+export VIDA_CONFIG_DIR=/tmp/vida-m2a
+cargo run --release --bin vida-daemon
+# （保持此终端开着）
+
+# 终端 2：执行验收命令
+export VIDA_CONFIG_DIR=/tmp/vida-m2a
+cargo run --release -p vida-term-test -- open
+```
+
+> **注意**：
+> - daemon 重启后所有旧 session_id 全部失效（会话属于 daemon，
+>   不属于连接）。每次重启后需重新 open 获取新 session_id。
+> - open / send / screen 等均为**一次性命令**，执行完即退出。
+>   会话由 daemon 持有，用 open 返回的 session_id 在后续命令中引用。
+> 每个 cargo run --release -p vida-term-test -- 子命令是独立进程，连接后即断，但会话保留在 daemon。
+
+常用变量：
+
+```bash
+SID=<上一步 open 输出的 session_id>
+```
+
+### 场景 8 — 基本回显
+
+```bash
+SID=$(cargo run --release -p vida-term-test -- open)
+cargo run --release -p vida-term-test -- send "$SID" 'echo hello\n'
+sleep 0.5
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：屏幕上有 `hello`，光标在下一行行首。
+
+**实测记录（2026-08-07）**：`echo hello` 后 screen 显示第 2 行 `hello`，
+光标在第 3 行行首。✅
+
+### 场景 9 — 颜色
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'ls --color\n'
+sleep 0.5
+cargo run --release -p vida-term-test -- screen "$SID" --ansi
+```
+
+预期：目录名带颜色，与在真实终端中执行 `ls --color` 的结果一致。
+
+**实测记录（2026-08-07）**：`screen --ansi` 目录名带颜色，与真实终端
+一致。✅
+
+### 场景 10 — 全屏 TUI
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'vim\n'
+sleep 1
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：看到 vim 界面（波浪号列、状态行）。
+
+**实测记录（2026-08-07）**：vim 界面正确显示（波浪号列）。注意 vim
+默认 laststatus=1 单窗口无状态栏，这是正确行为。✅
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" '\e:q!\n'
+sleep 0.5
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：回到 shell 提示符。
+
+**实测记录（2026-08-07）**：`\e:q!` 退出 vim 回到 shell 提示符。✅
+
+### 场景 11 — 动态刷新
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'htop\n'
+sleep 2
+cargo run --release -p vida-term-test -- screen "$SID"
+sleep 2
+cargo run --release -p vida-term-test -- screen "$SID"
+sleep 2
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：三次内容不同（说明在刷新），布局不错乱。
+
+**实测记录（2026-08-07）**：三次 screen 内容不同（top 动态刷新），
+布局不错乱。✅
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'q'
+sleep 0.5
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：回到 shell。
+
+**实测记录（2026-08-07）**：`q` 退出 top 回到 shell。✅
+
+### 场景 12 — 中文对齐
+
+先创建中文名文件：
+
+```bash
+touch /tmp/vida-m2a/测试文件.txt /tmp/vida-m2a/中文文档.md /tmp/vida-m2a/数据.csv
+```
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'ls -la /tmp/vida-m2a\n'
+sleep 0.5
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：文件名不串列。
+
+**实测记录（2026-08-07）**：中文文件名（测试文件.txt 等）正确对齐，
+不串列。`screen --show-wide` 显示 `^` 标记的宽字符起始列。✅
+
+### 场景 13 — resize
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'echo before resize\n'
+sleep 0.3
+cargo run --release -p vida-term-test -- resize "$SID" 40 12
+sleep 0.3
+cargo run --release -p vida-term-test -- screen "$SID"
+```
+
+预期：网格变为 40 列 12 行，内容重排后没有乱码。
+
+**实测记录（2026-08-07）**：resize 到 40×12 后网格正确，宽字符
+reflow 特别正确——40 列折行时「测试」没有被劈开。✅
+
+### 场景 14 — 会话结束
+
+```bash
+cargo run --release -p vida-term-test -- send "$SID" 'exit\n'
+sleep 0.5
+cargo run --release -p vida-term-test -- list
+```
+
+预期：该会话标记为已结束或已移除；`ps` 中无僵尸进程。
+
+**实测记录（2026-08-07）**：`exit` 后 list 显示 `closed`；订阅方收到
+`session_closed` 事件（exit_code=0）；无新增僵尸进程。✅
+
+### 场景 15 — 高吞吐
+
+```bash
+# 终端 1：启动 yes 并 watch
+SID=$(cargo run --release -p vida-term-test -- open --cols 200 --rows 50)
+cargo run --release -p vida-term-test -- send "$SID" 'yes\n'
+# 另一个终端：
+cargo run --release -p vida-term-test -- watch "$SID"
+# 10 秒后：
+cargo run --release -p vida-term-test -- send "$SID" '\x03'
+```
+
+预期：
+- `watch` 输出的帧率不超过 60fps（间隔 ≥ 16ms）
+- 带宽符合第 8 节指标
+- daemon 内存不持续增长（用 `vmmap --summary $DAEMON_PID` 观察）
+
+**实测记录（2026-08-07）**：
+- push_loop 内部间隔 15.16-18.59ms（绝对时隙限频）
+- daemon footprint 3536K 零增长（有界通道 + 丢旧留新）
+- watch 统计：51.6fps，平均 18.9ms
+- **注意**：watch 显示的 seq 跳号（如 0→26）是正常现象——会话在
+  订阅前已运行，push_loop 已产生若干帧，订阅时只发当前快照。
+  **判断限频应看 push_loop 内部间隔，不看客户端接收间隔**
+  （客户端接收受通道缓冲、订阅首帧等因素影响，会造成假象）。✅
+
+同时用 vmmap 观察 daemon 内存：
+
+```bash
+vmmap --summary $DAEMON_PID | grep "Physical footprint"
+```
+

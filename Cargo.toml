@@ -5,6 +5,7 @@ members = [
     "crates/vida-daemon",
     "crates/vida-gui",
     "crates/vida-mcp-cli",
+    "crates/vida-term-test",
 ]
 
 [workspace.package]
