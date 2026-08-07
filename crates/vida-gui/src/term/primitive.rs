@@ -118,32 +118,12 @@ impl IcedPrimitive for TermPrimitive {
             None => return,
         };
 
-        // 上传图集新增字形区域
-        for (x, y, w, h) in &geometry.dirty_regions {
-            let region_data = extract_region(&geometry.atlas, *x, *y, *w, *h);
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &pipeline.atlas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: *x,
-                        y: *y,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &region_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some((*w * 4).max(256)),
-                    rows_per_image: Some(*h),
-                },
-                wgpu::Extent3d {
-                    width: *w,
-                    height: *h,
-                    depth_or_array_layers: 1,
-                },
-            );
+        // 上传图集新增字形区域：按【行区间】上传，行距恒为图集全宽
+        // （ATLAS*4 = 2048，满足 wgpu 的 256 字节对齐要求）。
+        // 禁止逐字形上传——字形宽度远小于 256 时 bytes_per_row 无法对齐，
+        // 且源缓冲行距与目标纹理行距不一致会导致校验失败 panic。
+        for (y, h) in merge_row_ranges(&geometry.dirty_regions) {
+            upload_atlas_rows(&pipeline.atlas_texture, &queue, &geometry.atlas, y, h);
         }
 
         // 上传 screen size 到 uniform（物理像素）
@@ -160,16 +140,32 @@ impl IcedPrimitive for TermPrimitive {
             pipeline.built_version.store(version, Ordering::Relaxed);
             return;
         }
+        // 索引用 u16：quads 超过上限（65535/4≈16383 个 quad）时截断并告警，
+        // 防止索引截断后 draw 越界触发 wgpu 校验 panic（连锁 abort）。
+        // 正常终端（200×50）远低于此，截断仅作防御。
+        let quad_limit = (u16::MAX as usize / 4) * 4;
+        let quad_count = geometry.quads.len().min(quad_limit);
+        if quad_count < geometry.quads.len() {
+            tracing::warn!(
+                "终端 quads 超出 u16 索引上限：{} → 截断为 {}",
+                geometry.quads.len(),
+                quad_count
+            );
+        }
         let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("term quads"),
-            size: (geometry.quads.len() * std::mem::size_of::<Vertex>()) as u64,
+            size: (quad_count * std::mem::size_of::<Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&geometry.quads));
+        queue.write_buffer(
+            &vbuf,
+            0,
+            bytemuck::cast_slice(&geometry.quads[..quad_count]),
+        );
         pipeline.vertex_buffer = vbuf;
 
-        let idx: Vec<u16> = (0..geometry.quads.len() as u16)
+        let idx: Vec<u16> = (0..quad_count as u16)
             .flat_map(|i| [i * 4, i * 4 + 1, i * 4 + 2, i * 4, i * 4 + 2, i * 4 + 3])
             .collect();
         let ibuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -206,14 +202,80 @@ impl IcedPrimitive for TermPrimitive {
     }
 }
 
-fn extract_region(atlas: &[u8], x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
-    const ATLAS: u32 = 512;
-    let mut out = Vec::with_capacity((w * h * 4) as usize);
+/// 图集尺寸（行距 512×4=2048 字节，天然满足 wgpu 256 字节对齐）。
+pub const ATLAS_SIZE: u32 = 512;
+
+/// 上传图集的一批连续行（[y, y+h)）到 GPU 纹理。
+/// 源缓冲为 CPU 完整图集（每行 ATLAS_SIZE*4 字节），bytes_per_row 恒为
+/// 2048 —— 与源数据实际布局一致，且满足 COPY_BYTES_PER_ROW_ALIGNMENT。
+/// 参数错误会在 wgpu 校验层 panic（启动自检依赖此行为，见 Pipeline::new）。
+pub fn upload_atlas_rows(
+    texture: &wgpu::Texture,
+    queue: &wgpu::Queue,
+    atlas: &[u8],
+    y: u32,
+    h: u32,
+) {
+    let rows_data = extract_rows(atlas, y, h);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rows_data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(ATLAS_SIZE * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: ATLAS_SIZE,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+/// 从 CPU 完整图集提取 [0, ATLAS_SIZE) × [y, y+h) 的数据（行距 2048）。
+fn extract_rows(atlas: &[u8], y: u32, h: u32) -> Vec<u8> {
+    const STRIDE: usize = ATLAS_SIZE as usize * 4;
+    let mut out = Vec::with_capacity(STRIDE * h as usize);
     for py in 0..h {
-        let row_start = (((y + py) * ATLAS + x) as usize) * 4;
-        out.extend_from_slice(&atlas[row_start..row_start + (w as usize) * 4]);
+        let row_start = ((y + py) as usize) * STRIDE;
+        let end = (row_start + STRIDE).min(atlas.len());
+        out.extend_from_slice(&atlas[row_start..end]);
+        // 图集数据不足时补零（防御，正常不会发生）
+        out.resize(out.len() + (STRIDE - (end - row_start)), 0);
     }
     out
+}
+
+/// 把字形级脏区域（x,y,w,h）合并成行区间（y, h），重叠/相邻的合并。
+fn merge_row_ranges(dirty: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32)> {
+    if dirty.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges: Vec<(u32, u32)> = dirty
+        .iter()
+        .map(|(_, y, _, h)| (*y, *y + *h))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => {
+                *last_end = (*last_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged.into_iter().map(|(y, end)| (y, end - y)).collect()
 }
 
 impl TermPrimitive {
@@ -689,6 +751,17 @@ fn build_pipeline(
         },
     );
 
+    // 启动自检：模拟一次「字形级增量上传」——把 (0,0) 的 1×1 区域所在行
+    // 通过 upload_atlas_rows 再传一次。若 write_texture 的 layout 参数有误
+    // （行距/对齐/源缓冲大小不匹配），wgpu 校验层会立即 panic——
+    // 在启动时暴露，而不是等用户点击终端时崩溃。
+    // 注意：这依赖 wgpu 校验错误的 panic 行为（非 Result），见 commit 说明。
+    {
+        let mut probe = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
+        probe[3] = 255; // (0,0) 白像素 alpha（与初始图集一致）
+        upload_atlas_rows(&atlas_texture, queue, &probe, 0, 1);
+    }
+
     TermPipeline {
         font_system: Mutex::new(font_system),
         metrics,
@@ -727,5 +800,81 @@ fn measure_font(font_system: &mut FontSystem) -> FontMetrics {
         cell_width: layout.line_w,
         cell_height: metrics.line_height,
         ascent: layout.line_y - layout.line_top,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证 upload_atlas_rows 的 layout 参数（行距 2048、对齐、源缓冲大小）
+    /// 在真实 wgpu 校验层可通过。参数错误会 panic，测试失败即暴露。
+    /// 用 headless 实例（无窗口），与 GUI 用同一 wgpu 版本（27）。
+    #[test]
+    fn atlas_row_upload_passes_validation() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("应能获取 adapter（headless）");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("atlas upload test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("应能获取 device");
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test atlas"),
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
+        atlas[3] = 255;
+
+        // 单行区间（自检路径）
+        upload_atlas_rows(&texture, &queue, &atlas, 0, 1);
+        // 多行区间（首帧字形打包后通常跨多行）
+        upload_atlas_rows(&texture, &queue, &atlas, 3, 7);
+        queue.submit([]);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(2)),
+            })
+            .expect("提交应成功");
+    }
+
+    /// 合并逻辑：重叠/相邻的脏区域应合并为同一行区间。
+    #[test]
+    fn merge_row_ranges_merges_overlap_and_adjacent() {
+        let dirty = vec![(1u32, 4u32, 8u32, 2u32), (5, 5, 8, 1), (9, 10, 8, 1)];
+        let merged = merge_row_ranges(&dirty);
+        // [4,6) 与 [5,6) 合并 → [4,6)；[10,11) 独立
+        assert_eq!(merged, vec![(4, 2), (10, 1)]);
+    }
+
+    /// 空输入返回空。
+    #[test]
+    fn merge_row_ranges_empty() {
+        assert!(merge_row_ranges(&[]).is_empty());
     }
 }
