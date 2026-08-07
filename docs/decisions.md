@@ -712,8 +712,26 @@ watch 工具已改进：跳过首帧间隔、微秒精度、`--duration` 自动�
 
 | 指标 | 实测值 | 测量方式 |
 |---|---|---|
-| `cell_width` | **9.63 px** | 排单个 'M'，取 layout `line_w` |
+| `cell_width` | **9.60 px** | 排单个 'M'，取 layout `line_w`（移除位图字体后主字体为 Menlo） |
 | `cell_height` | **20.0 px** | Metrics 的 line_height（ascent+descent+line_gap 由字体计算） |
+| `ascent` | **14.26 px** | `line_y - line_top`（主字体 Menlo 的基线到行顶距离），全局统一基线 |
+
+**统一基线**（M2b-0 必改 3）：所有字符（含 fallback 字体）用主字体 ascent 对齐：
+`glyph_y = row_y + ascent - placement.top`。不用各字体自己的度量——
+中英文基线不一致是「中文偏下/abc 上标」的成因。
+
+**反色**（M2b-0 必改 2）：前景/背景对调，背景 quad 条件为
+`bg.is_some() || reverse`，reverse 时背景取 run 前景色。
+
+**宽字符判定**（M2b-0 必改 1）：用 unicode-width crate 按 East Asian Width
+判定（`U+00FF` 以上不算宽，é ü α β → ✓ ● 都是单列）。
+这是 example 临时方案——M2b-1 后宽字符由 daemon 推送协议 flags 的
+WIDE 位提供，客户端不再自行判定，两处判定必须一致。
+
+**教训：macOS 'GB18030 Bitmap' 纯位图中文字体**（无 glyf/cff 矢量轮廓表）：
+cosmic-text 的 swash 光栅化对它会静默失败（get_image 返回 None），
+中文 fallback 选中它导致字形缺失。构造 FontSystem 时必须用自定义 fontdb
+移除 post_script_name 含 'Bitmap' 的字体，fallback 才会选中有轮廓的字体。
 
 **逐 cell 定位的实现**（term_grid example）：
 - 每个 cell 的 x = `col * cell_width`，显式计算

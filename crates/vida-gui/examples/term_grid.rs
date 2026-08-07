@@ -142,6 +142,9 @@ struct Vertex {
 struct FontMetrics {
     cell_width: f32,
     cell_height: f32,
+    /// 主字体 ascent（基线到顶部距离）。所有字符（含 fallback 字体）
+    /// 用同一基线：glyph_y = baseline_y - placement.top。
+    ascent: f32,
 }
 
 /// 用 cosmic-text 实测 'M' 的 advance width 和行高。
@@ -154,9 +157,11 @@ fn measure_font(font_system: &mut FontSystem) -> FontMetrics {
     let layout = buf.layout_runs().next().unwrap();
     // line_w = 'M' 的 advance width
     // line_height = 行高（metrics 设定）
+    // ascent = line_y - line_top = 基线到行顶的距离（主字体，全局统一）
     FontMetrics {
         cell_width: layout.line_w,
         cell_height: metrics.line_height,
+        ascent: layout.line_y - layout.line_top,
     }
 }
 
@@ -169,8 +174,8 @@ struct App {
     renderer: Option<Renderer>,
     font_system: FontSystem,
     metrics: FontMetrics,
-    /// 字形缓存：(字符, 粗体) → 位图在图集中的位置
-    glyph_cache: std::collections::HashMap<(char, bool), (u32, u32, f32, f32, f32, f32, f32)>,
+    /// 字形缓存：(字符, 粗体) → (宽, 高, u0, v0, u1, v1, baseline偏移, placement.top)
+    glyph_cache: std::collections::HashMap<(char, bool), (u32, u32, f32, f32, f32, f32, f32, f32)>,
 }
 
 struct Renderer {
@@ -207,8 +212,8 @@ impl App {
         let mut font_system = FontSystem::new_with_locale_and_db("zh-Hans".into(), db);
         let metrics = measure_font(&mut font_system);
         eprintln!(
-            "cell_width={:.2}px cell_height={:.2}px",
-            metrics.cell_width, metrics.cell_height
+            "cell_width={:.2}px cell_height={:.2}px ascent={:.2}px",
+            metrics.cell_width, metrics.cell_height, metrics.ascent
         );
         Self {
             window: None,
@@ -243,8 +248,9 @@ impl App {
         for (row_idx, row) in rows().iter().enumerate() {
             let row_y = row_idx as f32 * ch;
             for r in row {
-                // 背景 quad
-                if let Some(bg) = r.bg {
+                // 背景 quad：显式 bg 或反色（反色时背景 = 前景色，实现前景/背景对调）
+                if r.bg.is_some() || r.reverse {
+                    let bg = r.bg.unwrap_or(r.fg);
                     let x0 = r.start_col as f32 * cw;
                     let x1 = (r.start_col as f32 + r.run_len as f32) * cw;
                     let c = [
@@ -267,7 +273,7 @@ impl App {
                 for _ in 0..r.run_len {
                     let cell_x = col as f32 * cw;
                     let glyph = self.rasterize_char(r.ch, r.bold, &mut cache, &mut atlas, &mut next_x, &mut next_y, &mut row_h, ATLAS);
-                    if let Some((gw, gh, u0, v0, u1, v1, gy)) = glyph {
+                    if let Some((gw, gh, u0, v0, u1, v1, _, top)) = glyph {
                         let fg = if r.reverse {
                             [0.0, 0.0, 0.0, 1.0]
                         } else {
@@ -278,8 +284,11 @@ impl App {
                                 1.0,
                             ]
                         };
+                        // 统一基线：所有字符（含 fallback 字体）对齐同一基线。
+                        // baseline_y = row_y + ascent（主字体 ascent，全局固定）
+                        // glyph_y = baseline_y - placement.top
                         let (tw, th) = (gw as f32, gh as f32);
-                        let y = row_y + gy;
+                        let y = row_y + self.metrics.ascent - top;
                         quads.push(Vertex { xy: [cell_x, y], uv: [u0, v0], color: fg });
                         quads.push(Vertex { xy: [cell_x + tw, y], uv: [u1, v0], color: fg });
                         quads.push(Vertex {
@@ -293,18 +302,23 @@ impl App {
                             color: fg,
                         });
                     }
-                    // 推进列：普通 1，宽 2
-                    let advance = if r.ch as u32 > 0xFF { 2 } else { 1 };
+                    // 列宽按 Unicode East Asian Width 判定（unicode-width）。
+                    // 注意：这是 example 的临时方案。M2b-1 之后宽字符信息由
+                    // daemon 推送协议 flags 的 WIDE 位提供，客户端不再自行判定——
+                    // 两处判定不一致会导致列错位，必须以协议为准。
+                    let advance = if unicode_width::UnicodeWidthChar::width(r.ch) == Some(2) {
+                        2
+                    } else {
+                        1
+                    };
                     col += advance;
-
-}
-                let _ = col;
+                }
 
                 // 下划线：run 级一次绘制（整 run 宽度下方 1px 线）
                 if r.underline {
                     let ux0 = r.start_col as f32 * cw;
                     let ux1 = (r.start_col as f32 + r.run_len as f32) * cw;
-                    let uy = row_y + ch - 2.0; // 近底部的细线
+                    let uy = row_y + self.metrics.ascent + 2.0; // 基线下方 2px
                     let lh = 1.5;
                     let lc = if r.reverse {
                         [0.0, 0.0, 0.0, 1.0]
@@ -328,7 +342,7 @@ impl App {
     }
 
     /// 光栅化单个字符到图集（带缓存：同字符+同粗体只光栅化一次）。
-    /// 返回 (位图宽, 高, u0, v0, u1, v1, 垂直位置)。
+    /// 返回 (位图宽, 高, u0, v0, u1, v1, baseline偏移, placement.top)。
     /// 不使用文本引擎的 glyph.x——位置由调用方显式计算。
     fn rasterize_char(
         &mut self,
@@ -340,7 +354,7 @@ impl App {
         next_y: &mut u32,
         row_h: &mut u32,
         atlas_size: u32,
-    ) -> Option<(u32, u32, f32, f32, f32, f32, f32)> {
+    ) -> Option<(u32, u32, f32, f32, f32, f32, f32, f32)> {
         let key = (ch, bold);
         // 用 self 内的字形缓存
         if let Some(cached) = self.glyph_cache.get(&key) {
@@ -399,7 +413,10 @@ impl App {
                 let v1 = (*next_y + gh) as f32 / atlas_size as f32;
                 *next_x += gw;
                 *row_h = (*row_h).max(gh);
-                result = Some((gw, gh, u0, v0, u1, v1, physical.y as f32));
+                result = Some((
+                    gw, gh, u0, v0, u1, v1,
+                    physical.y as f32, img.placement.top as f32,
+                ));
                 break;
             }
             if result.is_some() {

@@ -33,6 +33,7 @@ objc = "0.2"
 cosmic-text = "0.15"
 fontdb = "0.23"
 bytemuck = { version = "1", features = ["derive"] }
+unicode-width = "0.2.2"
 
 [[example]]
 name = "wgpu_baseline"

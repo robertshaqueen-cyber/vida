@@ -5039,6 +5039,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "vida-core",
  "wgpu",
  "winit",
