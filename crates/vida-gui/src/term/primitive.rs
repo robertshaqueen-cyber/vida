@@ -534,16 +534,72 @@ fn rasterize_char(
                 tracing::warn!("图集溢出: ch={:?} w={} h={}", ch, gw, gh);
                 continue;
             }
-            for py in 0..gh {
-                for px in 0..gw {
-                    let src = (py * gw + px) as usize;
-                    let a = img.data[src.min(img.data.len().saturating_sub(1))];
-                    let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
-                    atlas[idx] = 255;
-                    atlas[idx + 1] = 255;
-                    atlas[idx + 2] = 255;
-                    atlas[idx + 3] = a;
+            // 按 img.content 分支处理像素格式（不再假定单通道）：
+            // - Mask: 1 字节/像素（cosmic_text 硬编码 Format::Alpha，主路径）
+            // - SubpixelMask: 4 字节/像素 RGBA 子像素抗锯齿，取 RGB 均值作
+            //   alpha（终端灰度渲染即可，不做子像素）
+            // - Color: 彩色字形（emoji），本轮不支持 → warn + 跳过
+            // 显式长度校验，不用钳位——钳位会把越界变成「重复读最后一字节」，
+            // 让错误信号消失、只表现为画错。
+            let mut incomplete = false;
+            match img.content {
+                cosmic_text::SwashContent::Mask => {
+                    for py in 0..gh {
+                        for px in 0..gw {
+                            let src = (py * gw + px) as usize;
+                            let Some(&a) = img.data.get(src) else {
+                                tracing::warn!(
+                                    "Mask 字形数据不完整: ch={:?} w={} h={} len={}",
+                                    ch,
+                                    gw,
+                                    gh,
+                                    img.data.len()
+                                );
+                                incomplete = true;
+                                break;
+                            };
+                            let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                            atlas[idx] = 255;
+                            atlas[idx + 1] = 255;
+                            atlas[idx + 2] = 255;
+                            atlas[idx + 3] = a;
+                        }
+                    }
                 }
+                cosmic_text::SwashContent::SubpixelMask => {
+                    for py in 0..gh {
+                        for px in 0..gw {
+                            let src = (py * gw + px) as usize * 4;
+                            let Some(slice) = img.data.get(src..src + 4) else {
+                                tracing::warn!(
+                                    "SubpixelMask 字形数据不完整: ch={:?} w={} h={} len={}",
+                                    ch,
+                                    gw,
+                                    gh,
+                                    img.data.len()
+                                );
+                                incomplete = true;
+                                break;
+                            };
+                            let a = (slice[0] as u32 + slice[1] as u32 + slice[2] as u32) / 3;
+                            let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                            atlas[idx] = 255;
+                            atlas[idx + 1] = 255;
+                            atlas[idx + 2] = 255;
+                            atlas[idx + 3] = a as u8;
+                        }
+                    }
+                }
+                cosmic_text::SwashContent::Color => {
+                    // 彩色字形（如 emoji）：本轮不支持，跳过该字形（背景照画）。
+                    // decisions.md 已记录已知限制。
+                    tracing::warn!("彩色字形暂不支持，跳过: ch={:?}", ch);
+                    continue;
+                }
+            }
+            if incomplete {
+                // 数据不完整：跳过该字形，不推进 cursor、不记录 dirty
+                continue;
             }
             let u0 = *next_x as f32 / atlas_size as f32;
             let v0 = *next_y as f32 / atlas_size as f32;

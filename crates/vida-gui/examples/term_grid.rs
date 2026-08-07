@@ -496,16 +496,48 @@ impl App {
                     eprintln!("atlas overflow: ch={:?} w={} h={}", ch, gw, gh);
                     continue;
                 }
-                // 复制位图（Mask 单通道 alpha → RGBA 白字）
-                for py in 0..gh {
-                    for px in 0..gw {
-                        let src = (py * gw + px) as usize;
-                        let a = img.data[src.min(img.data.len() - 1)];
-                        let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
-                        atlas[idx] = 255;
-                        atlas[idx + 1] = 255;
-                        atlas[idx + 2] = 255;
-                        atlas[idx + 3] = a;
+                // 按 img.content 分支处理像素格式（与 M2b-1 primitive.rs 同步）：
+                // Mask 1 字节；SubpixelMask 4 字节取 RGB 均值；Color 跳过。
+                // 显式长度校验，不用钳位（钳位掩盖越界错误）。
+                match img.content {
+                    cosmic_text::SwashContent::Mask => {
+                        for py in 0..gh {
+                            for px in 0..gw {
+                                let src = (py * gw + px) as usize;
+                                let Some(&a) = img.data.get(src) else {
+                                    eprintln!("Mask 字形数据不完整: ch={:?}", ch);
+                                    continue;
+                                };
+                                let idx =
+                                    (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                                atlas[idx] = 255;
+                                atlas[idx + 1] = 255;
+                                atlas[idx + 2] = 255;
+                                atlas[idx + 3] = a;
+                            }
+                        }
+                    }
+                    cosmic_text::SwashContent::SubpixelMask => {
+                        for py in 0..gh {
+                            for px in 0..gw {
+                                let src = (py * gw + px) as usize * 4;
+                                let Some(slice) = img.data.get(src..src + 4) else {
+                                    eprintln!("SubpixelMask 字形数据不完整: ch={:?}", ch);
+                                    continue;
+                                };
+                                let a = (slice[0] as u32 + slice[1] as u32 + slice[2] as u32) / 3;
+                                let idx =
+                                    (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                                atlas[idx] = 255;
+                                atlas[idx + 1] = 255;
+                                atlas[idx + 2] = 255;
+                                atlas[idx + 3] = a as u8;
+                            }
+                        }
+                    }
+                    cosmic_text::SwashContent::Color => {
+                        eprintln!("彩色字形暂不支持，跳过: ch={:?}", ch);
+                        continue;
                     }
                 }
                 let u0 = *next_x as f32 / atlas_size as f32;
