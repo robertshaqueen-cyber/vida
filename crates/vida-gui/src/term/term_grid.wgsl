@@ -41,9 +41,10 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).a;
-    // A/B 版本 B：不做 gamma 校正，直接输出 sRGB 值。
-    // 文字抗锯齿在线性空间混合会让深色背景上的字更细（已知现象），
-    // 大多数文字渲染器直接在 sRGB 空间混合。对比 A（pow 2.2）后定。
+    let sampled_alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).a;
+    // 深色背景上的灰度字形若直接在线性空间混合，低 DPI 下边缘覆盖会显得
+    // 断裂、偏细。轻微提升中间覆盖率，模拟原生终端光栅器的 stem darkening；
+    // 0 与 1 保持不变，所以实心背景、光标和完整笔画不会被改色。
+    let alpha = pow(sampled_alpha, 0.72);
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }

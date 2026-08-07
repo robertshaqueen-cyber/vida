@@ -487,3 +487,11 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
 | 单终端增量 | **16.7M** |
 
 唯一内存指标仍为 `vmmap --summary <pid>` 的 `Physical footprint`，禁止用 RSS。
+
+### 所有者视觉验收修正
+
+- 默认字体与密度改为本机 Ghostty 默认值：Menlo 13，scale=1 实测 cell **8×16**、
+  ascent **13**；前景 `#ffffff`、终端背景 `#282c34`。
+- 增加不闪烁的实心方块光标；不使用常驻 timer，因此不改变上表的空闲 CPU 模型。
+- WIDE 字形铺满两个 cell，并对低 DPI 灰度字形做轻微覆盖补偿。
+- 自动 GUI 首轮已看到提示符处方块光标；最终字体视觉观感仍以所有者截图验收为准。

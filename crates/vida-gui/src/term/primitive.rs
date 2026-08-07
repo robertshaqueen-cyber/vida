@@ -45,13 +45,15 @@ struct FontMetrics {
     ascent: f32,
     /// 光栅化缩放因子（= viewport scale_factor）。
     scale: f32,
-    /// 逻辑字号（em 单位）。默认 16，可用 VIDA_FONT_SIZE 覆盖。
+    /// 逻辑字号（em 单位）。默认 13（与 Ghostty macOS 默认值一致），
+    /// 可用 VIDA_FONT_SIZE 覆盖。
     font_size: f32,
 }
 
 /// 终端默认配色（主题色）。
-const DEFAULT_FG: (u8, u8, u8) = (200, 200, 200);
-const DEFAULT_BG: (u8, u8, u8) = (13, 13, 20);
+const DEFAULT_FG: (u8, u8, u8) = (255, 255, 255);
+const DEFAULT_BG: (u8, u8, u8) = (40, 44, 52);
+const DEFAULT_FONT_SIZE: f32 = 13.0;
 
 /// 字形缓存条目：(宽, 高, u0, v0, u1, v1, placement.left, placement.top)。
 /// left/top 都是整数（物理像素），glyph_x = cell_x + left、
@@ -131,7 +133,7 @@ impl ViewportMetrics {
             .ok()
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| *value >= 8.0 && *value <= 48.0)
-            .unwrap_or(16.0);
+            .unwrap_or(DEFAULT_FONT_SIZE);
         (
             (font_size * 0.6 * scale).round().max(1.0),
             (font_size * 1.25 * scale).round().max(1.0),
@@ -491,18 +493,30 @@ impl TermPrimitive {
                 // 列宽一律由协议 WIDE 位决定（宽=2，普通=1），不自行判定
                 let col_width: u16 = if is_wide { 2 } else { 1 };
                 let cell_x = origin_x + col as f32 * cw;
+                let is_cursor =
+                    grid.cursor_visible && row == grid.cursor_row && col == grid.cursor_col;
 
-                // 背景 quad：非默认背景或反色（反色时背景 = 前景色）
-                let bg = resolve_bg(cell);
-                if cell.bg != ColorSpec::Default || cell.flags & frame::flag::REVERSE != 0 {
+                // Ghostty 风格实心方块光标：用当前有效前景作为块色，块内字形
+                // 使用当前有效背景色，实现真正反色而不是覆盖掉光标下的字符。
+                let effective_bg = resolve_bg(cell);
+                let effective_fg = resolve_text_fg(cell);
+                let painted_bg = if is_cursor {
+                    effective_fg
+                } else {
+                    effective_bg
+                };
+                if is_cursor
+                    || cell.bg != ColorSpec::Default
+                    || cell.flags & frame::flag::REVERSE != 0
+                {
                     push_quad(
                         &mut quads,
                         [cell_x, row_y, cell_x + cw * col_width as f32, row_y + ch],
                         [0.0, 0.0, 0.0, 0.0],
                         [
-                            bg.0 as f32 / 255.0,
-                            bg.1 as f32 / 255.0,
-                            bg.2 as f32 / 255.0,
+                            painted_bg.0 as f32 / 255.0,
+                            painted_bg.1 as f32 / 255.0,
+                            painted_bg.2 as f32 / 255.0,
                             1.0,
                         ],
                     );
@@ -521,25 +535,31 @@ impl TermPrimitive {
                         bold,
                     );
                     if let Some((gw, gh, u0, v0, u1, v1, left, top)) = glyph {
-                        let fg = if cell.flags & frame::flag::REVERSE != 0 {
-                            [0.0, 0.0, 0.0, 1.0]
+                        let glyph_color = if is_cursor {
+                            effective_bg
                         } else {
-                            let c = resolve_fg(cell);
-                            [
-                                c.0 as f32 / 255.0,
-                                c.1 as f32 / 255.0,
-                                c.2 as f32 / 255.0,
-                                1.0,
-                            ]
+                            effective_fg
                         };
+                        let fg = [
+                            glyph_color.0 as f32 / 255.0,
+                            glyph_color.1 as f32 / 255.0,
+                            glyph_color.2 as f32 / 255.0,
+                            1.0,
+                        ];
                         // 整数像素对齐：glyph_x = cell_x + placement.left
                         // （left 是整数）；基线取整后 - top（top 是整数）。
                         // 三处全是整数 → 字形 quad 落在整数像素边界。
-                        let gx = cell_x + left;
+                        let mut gx = cell_x + left;
                         let y = (row_y + metrics.ascent).round() - top;
+                        let mut rendered_width = gw as f32;
+                        if is_wide {
+                            // CJK 字形占满协议指定的两个 cell，消除逐字累积的空隙。
+                            gx = cell_x;
+                            rendered_width = cw * 2.0;
+                        }
                         push_quad(
                             &mut quads,
-                            [gx, y, gx + gw as f32, y + gh as f32],
+                            [gx, y, gx + rendered_width, y + gh as f32],
                             [u0, v0, u1, v1],
                             fg,
                         );
@@ -550,17 +570,17 @@ impl TermPrimitive {
                 // 高度必须取整像素（1px）——1.5px 会落在非整数像素边界。
                 if cell.flags & frame::flag::UNDERLINE != 0 {
                     let uy = (row_y + metrics.ascent + 2.0).round();
-                    let lc = if cell.flags & frame::flag::REVERSE != 0 {
-                        [0.0, 0.0, 0.0, 1.0]
+                    let c = if is_cursor {
+                        effective_bg
                     } else {
-                        let c = resolve_fg(cell);
-                        [
-                            c.0 as f32 / 255.0,
-                            c.1 as f32 / 255.0,
-                            c.2 as f32 / 255.0,
-                            1.0,
-                        ]
+                        effective_fg
                     };
+                    let lc = [
+                        c.0 as f32 / 255.0,
+                        c.1 as f32 / 255.0,
+                        c.2 as f32 / 255.0,
+                        1.0,
+                    ];
                     push_quad(
                         &mut quads,
                         [cell_x, uy, cell_x + cw * col_width as f32, uy + 1.0],
@@ -601,6 +621,18 @@ fn resolve_fg(cell: &super::client_grid::ClientCell) -> (u8, u8, u8) {
 /// 解析背景色：显式 bg 优先；反色时用前景色（前景/背景对调）。
 fn resolve_bg(cell: &super::client_grid::ClientCell) -> (u8, u8, u8) {
     if cell.flags & frame::flag::REVERSE != 0 {
+        return resolve_fg(cell);
+    }
+    match cell.bg {
+        ColorSpec::Default => DEFAULT_BG,
+        ColorSpec::Indexed(i) => super::client_grid::indexed_color(i),
+        ColorSpec::Rgb(r, g, b) => (r, g, b),
+    }
+}
+
+/// 解析反色后的实际文字颜色。
+fn resolve_text_fg(cell: &super::client_grid::ClientCell) -> (u8, u8, u8) {
+    if cell.flags & frame::flag::REVERSE == 0 {
         return resolve_fg(cell);
     }
     match cell.bg {
@@ -852,7 +884,7 @@ fn build_pipeline(
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
         .filter(|v| *v >= 8.0 && *v <= 48.0)
-        .unwrap_or(16.0);
+        .unwrap_or(DEFAULT_FONT_SIZE);
     if family != requested {
         tracing::warn!(
             "字体 {} 不可用，回落为 {}（候选: Menlo → SF Mono → Monaco → 默认）",
@@ -1244,17 +1276,16 @@ mod tests {
             Rectangle::default(),
             Arc::new(ViewportMetrics::default()),
         );
-        let _ = p1.build_geometry(&mut pipeline, 0.0, 0.0);
-        // 'A' 从 (1,0) 写入，宽度约 10px → 占 bytes [4, 44)
-        let first_a = pipeline
+        let first_geometry = p1
+            .build_geometry(&mut pipeline, 0.0, 0.0)
+            .expect("首帧几何应成功");
+        let &(a_x, a_y, a_w, a_h) = first_geometry.dirty_regions.first().expect("A 应写入图集");
+        let first_atlas = pipeline
             .atlas_data
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .into_iter()
-            .skip(4)
-            .take(40)
-            .collect::<Vec<u8>>();
+            .clone();
+        let first_a = atlas_region(&first_atlas, a_x, a_y, a_w, a_h);
 
         // 快照 2：新字符 '你'（第二帧）
         let mut grid_b = ClientGrid::new(1, 1);
@@ -1265,20 +1296,27 @@ mod tests {
             Arc::new(ViewportMetrics::default()),
         );
         let _ = p2.build_geometry(&mut pipeline, 0.0, 0.0);
-        let after = pipeline
+        let after_atlas = pipeline
             .atlas_data
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .into_iter()
-            .skip(4)
-            .take(40)
-            .collect::<Vec<u8>>();
+            .clone();
+        let after = atlas_region(&after_atlas, a_x, a_y, a_w, a_h);
 
         assert_eq!(
             first_a, after,
             "'A' 的图集区域被第二帧的新字形覆盖（cursor 未跨帧持久）"
         );
+    }
+
+    fn atlas_region(atlas: &[u8], x: u32, y: u32, width: u32, height: u32) -> Vec<u8> {
+        let mut region = Vec::with_capacity((width * height * 4) as usize);
+        for row in y..y + height {
+            let start = ((row * ATLAS_SIZE + x) * 4) as usize;
+            let end = start + (width * 4) as usize;
+            region.extend_from_slice(&atlas[start..end]);
+        }
+        region
     }
 
     /// 构造一个全量帧：单行单列放指定字符。
@@ -1301,6 +1339,40 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// 可见光标必须真的进入渲染几何；协议字段存在但 primitive 不消费时，
+    /// 所有输入虽正常，用户却完全看不到当前位置。
+    #[test]
+    fn visible_cursor_draws_ghostty_style_block() {
+        let (device, queue) = headless_device();
+        let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut grid = ClientGrid::new(2, 3);
+        grid.cursor_row = 1;
+        grid.cursor_col = 2;
+        grid.cursor_visible = true;
+        let primitive = TermPrimitive::new(
+            Arc::new(grid),
+            Rectangle::default(),
+            Arc::new(ViewportMetrics::default()),
+        );
+
+        let geometry = primitive
+            .build_geometry(&mut pipeline, 0.0, 0.0)
+            .expect("光标几何应成功");
+        assert_eq!(geometry.quads.len(), 4, "空白屏应只绘制一个光标 quad");
+
+        let vertices = &geometry.quads;
+        let metrics = pipeline.metrics;
+        assert_eq!(
+            vertices[0].xy,
+            [metrics.cell_width * 2.0, metrics.cell_height]
+        );
+        assert_eq!(
+            vertices[2].xy,
+            [metrics.cell_width * 3.0, metrics.cell_height * 2.0]
+        );
+        assert_eq!(vertices[0].color, [1.0, 1.0, 1.0, 1.0]);
     }
 
     /// 字号对照实验：16/18/20/22 下 cell 尺寸与 'A' 实际字体名。
@@ -1567,6 +1639,11 @@ mod tests {
             .build_geometry(&mut pipeline, 10.7, 5.3)
             .expect("build_geometry 应成功");
         assert!(!geom.quads.is_empty(), "应有 quads");
+        assert_eq!(
+            geom.quads[1].xy[0] - geom.quads[0].xy[0],
+            pipeline.metrics.cell_width * 2.0,
+            "WIDE 字形应横向铺满两个 cell"
+        );
 
         for v in &geom.quads {
             for coord in v.xy {

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use iced::widget::{button, column, container, text};
-use iced::{Element, Length};
+use iced::{Background, Color, Element, Length};
 
 use crate::app::AppMessage;
 use crate::term::client_grid::ClientGrid;
@@ -66,13 +66,19 @@ impl TerminalSession {
         } else {
             text(format!("会话 {}", self.session_id)).size(12)
         };
-        let canvas = widget::canvas(
+        let canvas = container(widget::canvas(
             self.snapshot(),
             self.viewport_metrics.clone(),
             AppMessage::TerminalInput,
             AppMessage::TerminalPaste,
             terminal_resize_message,
-        );
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgb8(40, 44, 52))),
+            ..Default::default()
+        });
         let back = button("返回").on_press(AppMessage::CloseDebugTerminal);
         let content = column![notice_el, status, canvas, back]
             .spacing(8)

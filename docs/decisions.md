@@ -821,14 +821,20 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
   package 名（"vida_gui"）——module_path! 以 bin 名为前缀；
   RUST_LOG 被 shell 设置时可能吞掉全部 GUI 日志（改用 VIDA_LOG）
 
-**已知渲染差异（不在 M2b-1 处理，M2b-3 或后续）**：
-1. **CJK 字距被撑开**：cell_width=10（Menlo 16px advance 取整），
-   宽字符分配 2×10=20px，但 PingFang 16px 字形实际宽约 16px，
-   靠左绘制右侧空 4px → 中文字间有空隙。Ghostty/Alacritty 的做法：
-   CJK 字形缩放填满 2 cell，或选 advance=2×ASCII 的 CJK 字体
-2. **笔画偏细，缺 stem darkening**：16px Menlo 在 1080p 非 HiDPI
-   下笔画偏细。Ghostty/Alacritty 在低 DPI 对字形 alpha 做轻微膨胀
-   补偿视觉重量。我们未做
+**M2b-2 所有者视觉验收修正（2026-08-08）**：初次验收确认 Menlo 16、
+灰色前景与 CJK 字距在 scale=1 下无法接受。读取本机 Ghostty 默认配置后，
+默认值改为 Menlo 13、前景 `#ffffff`、背景 `#282c34`；WIDE 字形横向铺满协议
+指定的两个 cell，避免 PingFang 实际字形宽度小于双 cell 时形成明显空隙。
+`VIDA_FONT_SIZE` / `VIDA_FONT_FAMILY` 覆盖仍保留。
+
+scale=1 的真实 GUI 截图仍显示灰度抗锯齿边缘偏碎、偏细，因此 shader 对字形
+alpha 使用 `pow(alpha, 0.72)` 提升中间覆盖率，模拟低 DPI stem darkening；0/1
+端点不变，不影响实心背景和光标。终端 canvas 自身设为 `#282c34`，不再透出
+iced 页面背景。
+
+光标协议此前已完整传递 `row/col/visible`，但 primitive 没有消费这些字段，
+因此画面完全没有光标。现在按 Ghostty 默认绘制不闪烁的实心方块，并反转块内
+字形颜色。保持不闪烁是刻意选择：不引入常驻 timer，空闲 CPU 仍应为零。
 
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
