@@ -11,6 +11,8 @@
 //! cell_height = ascent + descent + line_gap（实测）
 
 #![allow(unexpected_cfgs)]
+// 历史验证工具（M2b-0）：保留原实现语义，clippy 不强制重构
+#![allow(clippy::type_complexity, clippy::too_many_arguments, clippy::ptr_arg)]
 
 use std::sync::Arc;
 

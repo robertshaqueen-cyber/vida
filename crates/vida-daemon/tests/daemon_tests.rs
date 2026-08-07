@@ -1812,7 +1812,6 @@ async fn reconnect_resubscribe_gets_full_frame() {
             Some(Ok(_)) => continue,
             Some(Err(e)) => panic!("read error: {:?}", e),
             None => panic!("connection closed while waiting for marker"),
-            _ => {}
         }
     }
     assert!(marker_on_a, "断线前 marker 应出现在连接 A 的帧中");
@@ -1864,7 +1863,6 @@ async fn reconnect_resubscribe_gets_full_frame() {
             Some(Ok(_)) => continue,
             Some(Err(e)) => panic!("read error: {:?}", e),
             None => panic!("connection closed before full frame"),
-            _ => {}
         }
     }
     assert!(
@@ -1923,7 +1921,7 @@ fn config_dir_unwritable_gives_clear_error() {
     std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
     unsafe { std::env::set_var("VIDA_CONFIG_DIR", &readonly) };
 
-    let err = vida_core::config::ensure_dirs().err().expect("应返回错误");
+    let err = vida_core::config::ensure_dirs().expect_err("应返回错误");
     let msg = format!("{:#}", err);
     assert!(
         (msg.contains("无法创建配置目录") || msg.contains("无法创建备份目录"))

@@ -405,31 +405,32 @@ fn forward_text_push(text: &str, registry: &PushRegistry) {
     if event.event_type != "Event" {
         return;
     }
-    match event.event.as_str() {
-        "session_closed" => {
-            // session_id 缺失/类型错误：记 warn 并丢弃，不构造空串——
-            // 否则 reg.get("") 查不到订阅者，事件被静默吞掉。
-            let Some(session_id) = event.data.get("session_id").and_then(|v| v.as_str()) else {
-                tracing::warn!(
-                    "session_closed 事件缺少有效的 session_id: {}",
-                    event.data
-                );
-                return;
-            };
-            // exit_code 缺失 → None（未知退出码），不伪造 0。
-            let exit_code = event.data.get("exit_code").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let reg = match registry.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(tx) = reg.get(session_id) {
-                let _ = tx.send(PushMsg::SessionClosed {
-                    session_id: session_id.to_string(),
-                    exit_code,
-                });
-            }
+    if event.event.as_str() == "session_closed" {
+        // session_id 缺失/类型错误：记 warn 并丢弃，不构造空串——
+        // 否则 reg.get("") 查不到订阅者，事件被静默吞掉。
+        let Some(session_id) = event.data.get("session_id").and_then(|v| v.as_str()) else {
+            tracing::warn!(
+                "session_closed 事件缺少有效的 session_id: {}",
+                event.data
+            );
+            return;
+        };
+        // exit_code 缺失 → None（未知退出码），不伪造 0。
+        let exit_code = event
+            .data
+            .get("exit_code")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let reg = match registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(tx) = reg.get(session_id) {
+            let _ = tx.send(PushMsg::SessionClosed {
+                session_id: session_id.to_string(),
+                exit_code,
+            });
         }
-        _ => {}
     }
 }
 

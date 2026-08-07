@@ -94,14 +94,14 @@ impl ClientGrid {
     /// 应用一帧（全量帧由调用方先 reset 再 apply_line；增量帧直接 apply_line）。
     pub fn apply_frame(&mut self, frame: &crate::term::frame::TerminalFrame) {
         // 丢帧检测：seq 不连续时记录一次（状态栏/日志），直接应用最新帧。
-        if let Some(last) = self.last_seq {
-            if frame.seq.wrapping_sub(last) > 1 {
-                tracing::warn!(
-                    "终端推送丢帧: last_seq={} new_seq={}",
-                    last,
-                    frame.seq
-                );
-            }
+        if let Some(last) = self.last_seq
+            && frame.seq.wrapping_sub(last) > 1
+        {
+            tracing::warn!(
+                "终端推送丢帧: last_seq={} new_seq={}",
+                last,
+                frame.seq
+            );
         }
         self.last_seq = Some(frame.seq);
         self.cursor_row = frame.cursor_row;
@@ -138,13 +138,9 @@ impl ClientGrid {
         for run in &line.runs {
             crate::term::frame::expand_run(run, &mut buf, self.cols);
         }
-        let mut col = line.start_col as usize;
-        for cell in buf {
-            if col > end {
-                break;
-            }
-            self.cells[row_base + col] = cell;
-            col += 1;
+        let col = line.start_col as usize;
+        for (i, cell) in buf.into_iter().take(end.saturating_sub(col) + 1).enumerate() {
+            self.cells[row_base + col + i] = cell;
         }
     }
 }
@@ -175,9 +171,9 @@ pub fn indexed_color(idx: u8) -> (u8, u8, u8) {
     }
     if idx < 232 {
         let n = idx - 16;
-        let r = (n / 36) as u8;
-        let g = ((n / 6) % 6) as u8;
-        let b = (n % 6) as u8;
+        let r = n / 36;
+        let g = (n / 6) % 6;
+        let b = n % 6;
         let cube = |v: u8| -> u8 {
             if v == 0 {
                 0

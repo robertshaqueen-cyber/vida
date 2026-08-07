@@ -90,6 +90,9 @@ pub struct TermPipeline {
     built_version: AtomicU64,
     /// 图集持久数据（增量上传用）。
     atlas_data: Mutex<Vec<u8>>,
+    /// 图集打包 cursor (next_x, next_y, row_h)——必须跨帧持久：
+    /// 每帧重置会让新字形覆盖已写入的字形（ASCII 靠前最易被覆盖）。
+    atlas_cursor: Mutex<(u32, u32, u32)>,
 }
 
 impl IcedPrimitive for TermPrimitive {
@@ -109,7 +112,7 @@ impl IcedPrimitive for TermPrimitive {
             return;
         }
 
-        let scale = viewport.scale_factor() as f32;
+        let scale = viewport.scale_factor();
         let origin_x = self.bounds.x * scale;
         let origin_y = self.bounds.y * scale;
 
@@ -123,7 +126,7 @@ impl IcedPrimitive for TermPrimitive {
         // 禁止逐字形上传——字形宽度远小于 256 时 bytes_per_row 无法对齐，
         // 且源缓冲行距与目标纹理行距不一致会导致校验失败 panic。
         for (y, h) in merge_row_ranges(&geometry.dirty_regions) {
-            upload_atlas_rows(&pipeline.atlas_texture, &queue, &geometry.atlas, y, h);
+            upload_atlas_rows(&pipeline.atlas_texture, queue, &geometry.atlas, y, h);
         }
 
         // 上传 screen size 到 uniform（物理像素）
@@ -304,10 +307,18 @@ impl TermPrimitive {
             atlas[2] = 255;
             atlas[3] = 255;
         }
-        let mut next_x: u32 = 1;
-        let mut next_y: u32 = 0;
-        let mut row_h: u32 = 0;
-        let mut dirty_regions: Vec<(u32, u32, u32, u32)> = Vec::new();
+        // 打包 cursor 从 pipeline 取（跨帧持久），结束时写回
+        let (next_x, next_y, row_h) = match pipeline.atlas_cursor.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        let mut atlas_state = AtlasState {
+            data: atlas,
+            next_x,
+            next_y,
+            row_h,
+            dirty: Vec::new(),
+        };
 
         let mut font_system = match pipeline.font_system.lock() {
             Ok(guard) => guard,
@@ -356,14 +367,10 @@ impl TermPrimitive {
                         &mut font_system,
                         &mut cache,
                         &mut glyph_cache,
-                        &mut atlas,
-                        &mut next_x,
-                        &mut next_y,
-                        &mut row_h,
+                        &mut atlas_state,
                         ATLAS,
                         cell.ch,
                         bold,
-                        &mut dirty_regions,
                     );
                     if let Some((gw, gh, u0, v0, u1, v1, _, top)) = glyph {
                         let fg = if cell.flags & frame::flag::REVERSE != 0 {
@@ -414,14 +421,17 @@ impl TermPrimitive {
             }
         }
 
-        // 持久化图集（下次 build 基于此继续累加字形）
+        // 持久化图集与打包 cursor（下次 build 继续累加，不覆盖已有字形）
         if let Ok(mut guard) = pipeline.atlas_data.lock() {
-            *guard = atlas.clone();
+            *guard = atlas_state.data.clone();
+        }
+        if let Ok(mut guard) = pipeline.atlas_cursor.lock() {
+            *guard = (atlas_state.next_x, atlas_state.next_y, atlas_state.row_h);
         }
 
         Some(BuiltGeometry {
-            atlas,
-            dirty_regions,
+            atlas: atlas_state.data,
+            dirty_regions: atlas_state.dirty,
             quads,
         })
     }
@@ -463,24 +473,35 @@ fn push_quad(
     quads.push(Vertex { xy: [x0, y1], uv: [u0, v1], color });
 }
 
+/// 图集打包状态（跨帧持久的部分由调用方保存/恢复）。
+struct AtlasState {
+    data: Vec<u8>,
+    next_x: u32,
+    next_y: u32,
+    row_h: u32,
+    /// 本帧新增字形区域（字形级，上传前合并为行区间）。
+    dirty: Vec<(u32, u32, u32, u32)>,
+}
+
 /// 光栅化单个字符到图集（带缓存）。返回 (宽, 高, u0, v0, u1, v1, baseline, top)。
 fn rasterize_char(
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
     glyph_cache: &mut std::collections::HashMap<(char, bool), GlyphEntry>,
-    atlas: &mut Vec<u8>,
-    next_x: &mut u32,
-    next_y: &mut u32,
-    row_h: &mut u32,
+    state: &mut AtlasState,
     atlas_size: u32,
     ch: char,
     bold: bool,
-    dirty: &mut Vec<(u32, u32, u32, u32)>,
 ) -> Option<GlyphEntry> {
     let key = (ch, bold);
     if let Some(cached) = glyph_cache.get(&key) {
         return Some(*cached);
     }
+    let atlas = &mut state.data;
+    let next_x = &mut state.next_x;
+    let next_y = &mut state.next_y;
+    let row_h = &mut state.row_h;
+    let dirty = &mut state.dirty;
 
     let mut buf = Buffer::new_empty(Metrics::new(16.0, 20.0));
     buf.set_size(font_system, Some(100.0), None);
@@ -776,6 +797,7 @@ fn build_pipeline(
         glyph_cache: Mutex::new(std::collections::HashMap::new()),
         built_version: AtomicU64::new(u64::MAX),
         atlas_data: Mutex::new(atlas_data),
+        atlas_cursor: Mutex::new((1, 0, 0)),
     }
 }
 
@@ -876,5 +898,93 @@ mod tests {
     #[test]
     fn merge_row_ranges_empty() {
         assert!(merge_row_ranges(&[]).is_empty());
+    }
+
+    /// 图集 cursor 跨帧持久：两次 build_geometry（第二帧含新字符）后，
+    /// 第一帧写入的字形不得被覆盖。
+    #[test]
+    fn atlas_cursor_must_persist_across_frames() {
+        let (device, queue) = headless_device();
+        let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        // 快照 1：'A'
+        let mut grid_a = ClientGrid::new(1, 1);
+        grid_a.apply_frame(&frame_with('A'));
+        let p1 = TermPrimitive::new(Arc::new(grid_a), Rectangle::default());
+        let _ = p1.build_geometry(&mut pipeline, 0.0, 0.0);
+        // 'A' 从 (1,0) 写入，宽度约 10px → 占 bytes [4, 44)
+        let first_a = pipeline
+            .atlas_data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .into_iter()
+            .skip(4)
+            .take(40)
+            .collect::<Vec<u8>>();
+
+        // 快照 2：新字符 '你'（第二帧）
+        let mut grid_b = ClientGrid::new(1, 1);
+        grid_b.apply_frame(&frame_with('你'));
+        let p2 = TermPrimitive::new(Arc::new(grid_b), Rectangle::default());
+        let _ = p2.build_geometry(&mut pipeline, 0.0, 0.0);
+        let after = pipeline
+            .atlas_data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .into_iter()
+            .skip(4)
+            .take(40)
+            .collect::<Vec<u8>>();
+
+        assert_eq!(
+            first_a, after,
+            "'A' 的图集区域被第二帧的新字形覆盖（cursor 未跨帧持久）"
+        );
+    }
+
+    /// 构造一个全量帧：单行单列放指定字符。
+    fn frame_with(ch: char) -> crate::term::frame::TerminalFrame {
+        crate::term::frame::TerminalFrame {
+            seq: 1,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            lines: vec![crate::term::frame::LineUpdate {
+                row: 0,
+                start_col: 0,
+                end_col: 0,
+                runs: vec![crate::term::frame::Run {
+                    len: 1,
+                    flags: 0,
+                    fg: ColorSpec::Default,
+                    bg: ColorSpec::Default,
+                    ch,
+                }],
+            }],
+        }
+    }
+
+    fn headless_device() -> (wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("adapter");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("atlas cursor test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("device")
     }
 }
