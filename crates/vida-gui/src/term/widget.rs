@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use iced::advanced::layout::{self, Layout};
+use iced::advanced::mouse;
 use iced::advanced::renderer;
 use iced::advanced::widget::{Tree, Widget};
-use iced::advanced::mouse;
 use iced::{Element, Length, Rectangle, Size};
 
 use super::client_grid::ClientGrid;
@@ -74,9 +74,7 @@ where
 }
 
 /// 把 TermCanvas 变成 Element 的辅助函数。
-pub fn canvas<'a, Message>(
-    snapshot: Arc<ClientGrid>,
-) -> Element<'a, Message>
+pub fn canvas<'a, Message>(snapshot: Arc<ClientGrid>) -> Element<'a, Message>
 where
     Message: 'a,
 {

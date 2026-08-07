@@ -71,7 +71,8 @@ impl ClientGrid {
         if row >= self.rows || col >= self.cols {
             return None;
         }
-        self.cells.get(row as usize * self.cols as usize + col as usize)
+        self.cells
+            .get(row as usize * self.cols as usize + col as usize)
     }
 
     /// 全量帧：重置整个 grid。
@@ -97,11 +98,7 @@ impl ClientGrid {
         if let Some(last) = self.last_seq
             && frame.seq.wrapping_sub(last) > 1
         {
-            tracing::warn!(
-                "终端推送丢帧: last_seq={} new_seq={}",
-                last,
-                frame.seq
-            );
+            tracing::warn!("终端推送丢帧: last_seq={} new_seq={}", last, frame.seq);
         }
         self.last_seq = Some(frame.seq);
         self.cursor_row = frame.cursor_row;
@@ -139,7 +136,11 @@ impl ClientGrid {
             crate::term::frame::expand_run(run, &mut buf, self.cols);
         }
         let col = line.start_col as usize;
-        for (i, cell) in buf.into_iter().take(end.saturating_sub(col) + 1).enumerate() {
+        for (i, cell) in buf
+            .into_iter()
+            .take(end.saturating_sub(col) + 1)
+            .enumerate()
+        {
             self.cells[row_base + col + i] = cell;
         }
     }
@@ -174,13 +175,7 @@ pub fn indexed_color(idx: u8) -> (u8, u8, u8) {
         let r = n / 36;
         let g = (n / 6) % 6;
         let b = n % 6;
-        let cube = |v: u8| -> u8 {
-            if v == 0 {
-                0
-            } else {
-                55 + v * 40
-            }
-        };
+        let cube = |v: u8| -> u8 { if v == 0 { 0 } else { 55 + v * 40 } };
         return (cube(r), cube(g), cube(b));
     }
     let gray = 8 + (idx - 232) * 10;

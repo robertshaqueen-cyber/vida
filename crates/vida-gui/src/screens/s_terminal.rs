@@ -68,6 +68,9 @@ impl TerminalSession {
             .spacing(8)
             .padding(8)
             .height(Length::Fill);
-        container(content).height(Length::Fill).width(Length::Fill).into()
+        container(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
     }
 }

@@ -2,8 +2,8 @@ use iced::{Element, Task, Theme};
 use vida_core::i18n::{self, I18n};
 
 use crate::screens::{
-    Screen, Tab, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential, s5_settings,
-    s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup, s_terminal,
+    Screen, Tab, s_terminal, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential,
+    s5_settings, s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
 };
 use crate::term::frame;
 use crate::ws_client::{PushMsg, WsClient};
@@ -111,7 +111,9 @@ pub enum AppMessage {
     CloseDebugTerminal,
     TerminalPush(PushMsg),
     /// 订阅建立完成。
-    TerminalOpened { session_id: String },
+    TerminalOpened {
+        session_id: String,
+    },
     /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
     TerminalDisconnected,
     /// 自动重连完成：新连接 + 会话已就绪。notice 为可选提示（如
@@ -122,7 +124,9 @@ pub enum AppMessage {
         notice: Option<String>,
     },
     /// 原会话已不存在：需要提示用户并新开会话。
-    TerminalSessionLost { client: WsClient },
+    TerminalSessionLost {
+        client: WsClient,
+    },
     /// 自动重连失败（等待冷却后由用户手动重试）。
     TerminalReconnectFailed(String),
     TerminalSetupError(String),
@@ -131,7 +135,10 @@ pub enum AppMessage {
     WsConnected(WsClient),
     WsError(String),
     RetryConnection,
-    DaemonChecked { locked: bool, vault_exists: bool },
+    DaemonChecked {
+        locked: bool,
+        vault_exists: bool,
+    },
 
     // Tab management
     SwitchTab(String), // tab id
@@ -311,7 +318,11 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
         // unfold 状态 = (ws, sid, rx)：全部随状态传递，闭包零捕获。
         // 首次迭代 rx=None → 注册订阅；无推送时 rx.recv().await 挂起 → CPU ≈ 0%。
         futures_util::stream::unfold(
-            Some((ws, sid, None::<tokio::sync::mpsc::UnboundedReceiver<PushMsg>>)),
+            Some((
+                ws,
+                sid,
+                None::<tokio::sync::mpsc::UnboundedReceiver<PushMsg>>,
+            )),
             |state| async move {
                 let (ws, sid, rx_opt) = state?;
                 let mut rx = match rx_opt {
@@ -350,7 +361,10 @@ fn old_cols_or_default(app: &VidaApp) -> u16 {
 /// 首次打开与「原会话已结束」兜底路径共用（重连后必须重新订阅拿全量帧）。
 async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
     let resp = client
-        .send("OpenLocalSession", serde_json::json!({"cols": 100, "rows": 40}))
+        .send(
+            "OpenLocalSession",
+            serde_json::json!({"cols": 100, "rows": 40}),
+        )
         .await
         .map_err(|e| format!("打开会话失败: {}", e.message))?;
     let sid = resp
@@ -1520,10 +1534,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             tracing::warn!("终端推送连接断开，尝试自动重连");
             // 冷却：10 秒内最多触发一次重连，防止 daemon 未恢复时空转
             let now = std::time::Instant::now();
-            if app
-                .terminal_reconnect_cooldown
-                .is_some_and(|t| now < t)
-            {
+            if app.terminal_reconnect_cooldown.is_some_and(|t| now < t) {
                 return Task::none();
             }
             app.terminal_reconnect_cooldown = Some(now + std::time::Duration::from_secs(10));
@@ -1576,9 +1587,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                                             // 提示用户后新开，不静默替换
                                             AppMessage::TerminalSessionLost { client }
                                         }
-                                        Err(e) => {
-                                            AppMessage::TerminalReconnectFailed(e.message)
-                                        }
+                                        Err(e) => AppMessage::TerminalReconnectFailed(e.message),
                                     }
                                 }
                                 None => {
@@ -1609,8 +1618,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             // 重启推送 stream → 首次迭代订阅 → 收到全量帧。
             app.ws_client = Some(client);
             app.debug_terminal_sid = Some(session_id.clone());
-            let mut session =
-                s_terminal::TerminalSession::new(session_id, old_rows_or_default(app), old_cols_or_default(app));
+            let mut session = s_terminal::TerminalSession::new(
+                session_id,
+                old_rows_or_default(app),
+                old_cols_or_default(app),
+            );
             if let Some(n) = notice {
                 session.notice = Some(n);
             }
@@ -1666,7 +1678,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
-        AppMessage::TerminalPush(PushMsg::SessionClosed { session_id, exit_code }) => {
+        AppMessage::TerminalPush(PushMsg::SessionClosed {
+            session_id,
+            exit_code,
+        }) => {
             let Screen::Terminal(session) = &mut app.screen else {
                 return Task::none();
             };
@@ -1674,7 +1689,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 session.closed = true;
                 session.exit_code = exit_code;
                 match exit_code {
-                    Some(code) => tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code),
+                    Some(code) => {
+                        tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code)
+                    }
                     None => tracing::info!("终端会话 {} 结束, 退出码未知", session_id),
                 }
             }

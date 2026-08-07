@@ -387,7 +387,9 @@ async fn handle_message(
                     .unwrap();
                 }
             };
-            pty.list_sessions().iter().any(|s| s.session_id == *session_id)
+            pty.list_sessions()
+                .iter()
+                .any(|s| s.session_id == *session_id)
         };
         if !exists {
             return serde_json::to_string(&Response {

@@ -1656,14 +1656,16 @@ async fn single_connection_multi_subscribe() {
 
     // 向两个会话各发一条 echo，触发增量帧
     for (i, sid) in sids.iter().enumerate() {
-        // "echo subN\r" = e c h o _ s u b N 
+        // "echo subN\r" = e c h o _ s u b N
         let mut data = b"echo sub".to_vec();
         data.push(b'0' + i as u8);
         data.push(0x0D);
         let input = format!(
             r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{:?}}},
                "id":{}}}"#,
-            sid, data, 6 + i
+            sid,
+            data,
+            6 + i
         );
         // 不等待响应（二进制帧会抢先），直接发送
         ws.send(Message::Text(input.into())).await.unwrap();
@@ -1764,7 +1766,10 @@ async fn reconnect_resubscribe_gets_full_frame() {
     let (addr, token, _dir) = start_daemon().await;
     // 连接 A
     let (mut ws_a, mut reader_a) = connect(addr).await;
-    let auth_a = format!(r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token);
+    let auth_a = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
     let resp = send_recv(&mut ws_a, &mut reader_a, &auth_a).await;
     assert_eq!(resp["type"], "Ok");
 
@@ -1822,7 +1827,10 @@ async fn reconnect_resubscribe_gets_full_frame() {
 
     // 连接 B：同一会话重新订阅
     let (mut ws_b, mut reader_b) = connect(addr).await;
-    let auth_b = format!(r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token);
+    let auth_b = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
     let resp = send_recv(&mut ws_b, &mut reader_b, &auth_b).await;
     assert_eq!(resp["type"], "Ok");
 
@@ -1833,10 +1841,7 @@ async fn reconnect_resubscribe_gets_full_frame() {
         r#"{"method":"ListSessions","params":{},"id":2}"#,
     )
     .await;
-    let sessions_before = resp["result"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let sessions_before = resp["result"].as_array().map(|a| a.len()).unwrap_or(0);
 
     let sub_b = format!(
         r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
@@ -1902,7 +1907,10 @@ fn config_dir_created_if_missing() {
     vida_core::config::ensure_dirs().unwrap();
     let token = vida_daemon::ws_server::load_or_create_token().unwrap();
     assert_eq!(token.len(), 64);
-    assert!(missing.join("daemon.token").exists(), "token 应写入新创建的目录");
+    assert!(
+        missing.join("daemon.token").exists(),
+        "token 应写入新创建的目录"
+    );
     assert!(missing.join("backups").is_dir(), "backups 子目录应被创建");
 
     unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };

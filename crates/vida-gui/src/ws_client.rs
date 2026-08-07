@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -409,10 +409,7 @@ fn forward_text_push(text: &str, registry: &PushRegistry) {
         // session_id 缺失/类型错误：记 warn 并丢弃，不构造空串——
         // 否则 reg.get("") 查不到订阅者，事件被静默吞掉。
         let Some(session_id) = event.data.get("session_id").and_then(|v| v.as_str()) else {
-            tracing::warn!(
-                "session_closed 事件缺少有效的 session_id: {}",
-                event.data
-            );
+            tracing::warn!("session_closed 事件缺少有效的 session_id: {}", event.data);
             return;
         };
         // exit_code 缺失 → None（未知退出码），不伪造 0。

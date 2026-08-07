@@ -15,14 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
-use cosmic_text::{
-    Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache,
-};
+use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
 use iced::Rectangle;
 use iced_graphics::Viewport;
 use iced_wgpu::Primitive as IcedPrimitive;
 
-use super::client_grid::{cell_flags, ClientGrid, ColorSpec};
+use super::client_grid::{ClientGrid, ColorSpec, cell_flags};
 use super::frame;
 
 /// 顶点：xy = 物理像素坐标，uv = 图集归一化坐标，color = RGBA。
@@ -184,11 +182,7 @@ impl IcedPrimitive for TermPrimitive {
         pipeline.built_version.store(version, Ordering::Relaxed);
     }
 
-    fn draw(
-        &self,
-        pipeline: &Self::Pipeline,
-        render_pass: &mut wgpu::RenderPass<'_>,
-    ) -> bool {
+    fn draw(&self, pipeline: &Self::Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
         if pipeline.vertex_count == 0 {
             return true;
         }
@@ -196,10 +190,7 @@ impl IcedPrimitive for TermPrimitive {
         render_pass.set_bind_group(0, &pipeline.uniform_bind_group, &[]);
         render_pass.set_bind_group(1, &pipeline.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, pipeline.vertex_buffer.slice(..));
-        render_pass.set_index_buffer(
-            pipeline.index_buffer.slice(..),
-            wgpu::IndexFormat::Uint16,
-        );
+        render_pass.set_index_buffer(pipeline.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         render_pass.draw_indexed(0..pipeline.vertex_count, 0, 0..1);
         true
     }
@@ -224,11 +215,7 @@ pub fn upload_atlas_rows(
         wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y,
-                z: 0,
-            },
+            origin: wgpu::Origin3d { x: 0, y, z: 0 },
             aspect: wgpu::TextureAspect::All,
         },
         &rows_data,
@@ -264,10 +251,7 @@ fn merge_row_ranges(dirty: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32)> {
     if dirty.is_empty() {
         return Vec::new();
     }
-    let mut ranges: Vec<(u32, u32)> = dirty
-        .iter()
-        .map(|(_, y, _, h)| (*y, *y + *h))
-        .collect();
+    let mut ranges: Vec<(u32, u32)> = dirty.iter().map(|(_, y, _, h)| (*y, *y + *h)).collect();
     ranges.sort_unstable();
     let mut merged: Vec<(u32, u32)> = Vec::new();
     for (start, end) in ranges {
@@ -467,10 +451,26 @@ fn push_quad(
 ) {
     let (x0, y0, x1, y1) = (xy[0], xy[1], xy[2], xy[3]);
     let (u0, v0, u1, v1) = (uv[0], uv[1], uv[2], uv[3]);
-    quads.push(Vertex { xy: [x0, y0], uv: [u0, v0], color });
-    quads.push(Vertex { xy: [x1, y0], uv: [u1, v0], color });
-    quads.push(Vertex { xy: [x1, y1], uv: [u1, v1], color });
-    quads.push(Vertex { xy: [x0, y1], uv: [u0, v1], color });
+    quads.push(Vertex {
+        xy: [x0, y0],
+        uv: [u0, v0],
+        color,
+    });
+    quads.push(Vertex {
+        xy: [x1, y0],
+        uv: [u1, v0],
+        color,
+    });
+    quads.push(Vertex {
+        xy: [x1, y1],
+        uv: [u1, v1],
+        color,
+    });
+    quads.push(Vertex {
+        xy: [x0, y1],
+        uv: [u0, v1],
+        color,
+    });
 }
 
 /// 图集打包状态（跨帧持久的部分由调用方保存/恢复）。
@@ -550,8 +550,14 @@ fn rasterize_char(
             let u1 = (*next_x + gw) as f32 / atlas_size as f32;
             let v1 = (*next_y + gh) as f32 / atlas_size as f32;
             let entry = (
-                gw, gh, u0, v0, u1, v1,
-                physical.y as f32, img.placement.top as f32,
+                gw,
+                gh,
+                u0,
+                v0,
+                u1,
+                v1,
+                physical.y as f32,
+                img.placement.top as f32,
             );
             dirty.push((*next_x, *next_y, gw, gh));
             *next_x += gw;
@@ -571,11 +577,7 @@ fn rasterize_char(
 }
 
 impl iced_wgpu::primitive::Pipeline for TermPipeline {
-    fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-    ) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         build_pipeline(device, queue, format)
     }
 

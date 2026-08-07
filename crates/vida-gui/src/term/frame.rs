@@ -14,7 +14,7 @@
 //!         [bg_tag: u8][bg payload][char_len: u8][char bytes]
 //! ```
 
-use crate::term::client_grid::{cell_flags, ClientCell, ColorSpec};
+use crate::term::client_grid::{ClientCell, ColorSpec, cell_flags};
 
 /// 属性标志位（与 daemon FLAG_* 一致）。
 /// italic/hidden/strike 目前只在 grid 里保留标志（渲染尚未实现），

@@ -1,5 +1,4 @@
 pub mod s0_connection;
-pub mod s_terminal;
 pub mod s1_setup;
 pub mod s2_unlock;
 pub mod s3_main;
@@ -9,6 +8,7 @@ pub mod s6_conflict;
 pub mod s7_conflict_file;
 pub mod s8_remote_missing;
 pub mod s9_backup;
+pub mod s_terminal;
 
 use iced::Element;
 use iced::widget::text;
