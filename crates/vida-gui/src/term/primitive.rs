@@ -103,6 +103,8 @@ pub struct TermPipeline {
     atlas_cursor: Mutex<(u32, u32, u32)>,
     /// surface 是否为 sRGB 格式（决定 fs_main 是否做 linear 转换）。
     is_srgb: bool,
+    /// 一次性诊断打印标记（测量用）。
+    diag_printed: std::sync::atomic::AtomicU8,
 }
 
 impl IcedPrimitive for TermPrimitive {
@@ -113,10 +115,21 @@ impl IcedPrimitive for TermPrimitive {
         pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _bounds: &Rectangle,
+        bounds: &Rectangle,
         viewport: &Viewport,
     ) {
         let scale = viewport.scale_factor();
+        // [测量] 一次性打印 iced 传入的 bounds/viewport 实况
+        if pipeline.diag_printed.load(Ordering::Relaxed) == 0 {
+            pipeline
+                .diag_printed
+                .store(1, Ordering::Relaxed);
+            tracing::info!(
+                "term diag: iced_bounds={:?} self_bounds={:?} physical_size={:?} scale={} metrics={}x{} asc={}",
+                bounds, self.bounds, viewport.physical_size(), scale,
+                pipeline.metrics.cell_width, pipeline.metrics.cell_height, pipeline.metrics.ascent
+            );
+        }
         // scale 变化（窗口拖到不同 DPI 显示器）：旧字形（按旧 scale 光栅化）
         // 必须全部失效——重置字形缓存/图集/cursor 并强制全量重建。
         // 注意 built_version 比较在 scale 检查之后：scale 变了即使 version
@@ -946,6 +959,7 @@ fn build_pipeline(
         atlas_data: Mutex::new(atlas_data),
         atlas_cursor: Mutex::new((1, 0, 0)),
         is_srgb: format.is_srgb(),
+        diag_printed: std::sync::atomic::AtomicU8::new(0),
     }
 }
 
@@ -1123,6 +1137,49 @@ mod tests {
                     ch,
                 }],
             }],
+        }
+    }
+
+    /// 测量第一步：'A' 在 scale=1 与 scale=2 下的实际位图尺寸。
+    /// gw≈18-20 表示 2x 光栅化生效；gw≈9-10 表示仍是 1x。
+    #[test]
+    fn diagnostic_glyph_a_size() {
+        let (device, queue) = headless_device();
+        let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for scale in [1.0f32, 2.0f32] {
+            pipeline.metrics = measure_font_at(&pipeline, scale);
+            let metrics = pipeline.metrics;
+            let mut font_system =
+                pipeline.font_system.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = SwashCache::new();
+            let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
+                std::collections::HashMap::new();
+            let mut state = AtlasState {
+                data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+                next_x: 1,
+                next_y: 0,
+                row_h: 0,
+                dirty: Vec::new(),
+                scale,
+            };
+            let r = rasterize_char(
+                &mut font_system,
+                &mut cache,
+                &mut glyph_cache,
+                &mut state,
+                ATLAS_SIZE,
+                'A',
+                false,
+            );
+            match r {
+                Some((gw, gh, ..)) => {
+                    eprintln!(
+                        "[diag] 'A' scale={}: gw={} gh={} cell={}x{} ascent={}",
+                        scale, gw, gh, metrics.cell_width, metrics.cell_height, metrics.ascent
+                    );
+                }
+                None => eprintln!("[diag] 'A' scale={}: 光栅化失败", scale),
+            }
         }
     }
 

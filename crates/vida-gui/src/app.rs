@@ -9,11 +9,14 @@ use crate::term::frame;
 use crate::ws_client::{PushMsg, WsClient};
 
 pub fn run() -> Result<(), iced::Error> {
+    // 默认 filter 用 bin 名 "vida"（module_path! 以 bin 名为前缀，
+    // 不是 package 名 "vida_gui"——用错会静默吞掉全部 GUI 日志）。
+    // VIDA_LOG 可覆盖；输出到 stderr（stdout 在管道下是块缓冲）。
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "vida_gui=info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            std::env::var("VIDA_LOG").unwrap_or_else(|_| "vida=info".to_string()),
+        ))
+        .with_writer(std::io::stderr)
         .init();
 
     iced::application(new, update, view)

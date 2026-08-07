@@ -42,10 +42,8 @@ fn vs_main(
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).a;
-    var color = vec4<f32>(in.color.rgb, in.color.a * alpha);
-    if screen.gamma > 0.5 {
-        // sRGB → linear（近似 2.2；alpha 不参与 gamma）
-        color = vec4<f32>(pow(color.rgb, vec3<f32>(2.2)), color.a);
-    }
-    return color;
+    // A/B 版本 B：不做 gamma 校正，直接输出 sRGB 值。
+    // 文字抗锯齿在线性空间混合会让深色背景上的字更细（已知现象），
+    // 大多数文字渲染器直接在 sRGB 空间混合。对比 A（pow 2.2）后定。
+    return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
