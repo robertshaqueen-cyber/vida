@@ -66,44 +66,44 @@ fn rows() -> Vec<Vec<Run>> {
         // row 1: 中文对齐测试 你好世界abc你好（abc 起始第 8+8=16 列）
         vec![
             run(0, ' ', 8),
-            run(8, '你', 2),
-            run(10, '好', 2),
-            run(12, '世', 2),
-            run(14, '界', 2),
+            run(8, '你', 1),
+            run(10, '好', 1),
+            run(12, '世', 1),
+            run(14, '界', 1),
             run(16, 'a', 3),
-            run(19, '你', 2),
-            run(21, '好', 2),
+            run(19, '你', 1),
+            run(21, '好', 1),
         ],
         // row 2: 属性
         vec![
             run(0, ' ', 4),
-            run(4, '正', 2),
-            run(6, '常', 2),
+            run(4, '正', 1),
+            run(6, '常', 1),
             run(8, ' ', 2),
-            Run { bold: true, ..run(10, '粗', 2) },
-            Run { bold: true, ..run(12, '体', 2) },
+            Run { bold: true, ..run(10, '粗', 1) },
+            Run { bold: true, ..run(12, '体', 1) },
             run(14, ' ', 2),
-            Run { underline: true, ..run(16, '下', 2) },
-            Run { underline: true, ..run(18, '划', 2) },
-            Run { underline: true, ..run(20, '线', 2) },
+            Run { underline: true, ..run(16, '下', 1) },
+            Run { underline: true, ..run(18, '划', 1) },
+            Run { underline: true, ..run(20, '线', 1) },
             run(22, ' ', 2),
-            Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(24, '反', 2) },
-            Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(26, '色', 2) },
+            Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(24, '反', 1) },
+            Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(26, '色', 1) },
         ],
         // row 3: 颜色
         vec![
             run(0, ' ', 4),
-            Run { fg: (255, 60, 60), ..run(4, '红', 2) },
+            Run { fg: (255, 60, 60), ..run(4, '红', 1) },
             run(6, ' ', 2),
-            Run { fg: (60, 255, 60), ..run(8, '绿', 2) },
+            Run { fg: (60, 255, 60), ..run(8, '绿', 1) },
             run(10, ' ', 2),
-            Run { fg: (60, 60, 255), ..run(12, '蓝', 2) },
+            Run { fg: (60, 60, 255), ..run(12, '蓝', 1) },
             run(14, ' ', 2),
-            run(16, '默', 2),
-            run(18, '认', 2),
+            run(16, '默', 1),
+            run(18, '认', 1),
             run(20, ' ', 2),
-            Run { bg: Some((80, 80, 160)), ..run(22, '背', 2) },
-            Run { bg: Some((80, 80, 160)), ..run(24, '景', 2) },
+            Run { bg: Some((80, 80, 160)), ..run(22, '背', 1) },
+            Run { bg: Some((80, 80, 160)), ..run(24, '景', 1) },
         ],
         // row 4: 边界
         vec![
@@ -251,8 +251,8 @@ impl App {
                 // advance_before_i = 前 i 个字符的列宽之和（普通 1，宽 2）。
                 // 不使用 glyph.x（文本引擎的推进结果）。
                 let mut col = r.start_col;
-                for i in 0..r.run_len {
-                    let cell_x = (r.start_col + i) as f32 * cw;
+                for _ in 0..r.run_len {
+                    let cell_x = col as f32 * cw;
                     let glyph = self.rasterize_char(r.ch, r.bold, &mut cache, &mut atlas, &mut next_x, &mut next_y, &mut row_h, ATLAS);
                     if let Some((gw, gh, u0, v0, u1, v1, gy)) = glyph {
                         let fg = if r.reverse {
