@@ -760,5 +760,5 @@ cosmic-text 的 swash 光栅化对它会静默失败（get_image 返回 None）�
 图集（灰度 alpha）→ wgpu 纹理 quad 逐 glyph 绘制。属性（粗体用
 Weight::BOLD，下划线画 1.5px 线，反色用黑字+白底）。
 
-**验证要点**：row1 的 `你好世界abc你好`，4 个中文 = 8 列，
+**验证要点**：row 2 的 `你好世界abc你好`，4 个中文 = 8 列，
 `abc` 起始应在第 16 列——所有者截图确认对齐。

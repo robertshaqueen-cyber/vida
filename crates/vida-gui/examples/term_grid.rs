@@ -59,13 +59,13 @@ fn rows() -> Vec<Vec<Run>> {
     vec![
         // row 0: 尺子行——每列一个 '|'，验证背景/下划线/字形的列对齐
         vec![run(0, '|', 80)],
-        // row 1: ASCII 基准线
+        // row 1: ASCII 基准线（与 row 2 同从第 8 列开始）
         vec![
-            run(0, ' ', 7),
-            run(7, 'A', 26),
-            run(33, '0', 10),
+            run(0, ' ', 8),
+            run(8, 'A', 26),
+            run(34, '0', 10),
         ],
-        // row 1: 中文对齐测试 你好世界abc你好（abc 起始第 8+8=16 列）
+        // row 2: 中文对齐测试 你好世界abc你好（abc 起始第 8+8=16 列）
         vec![
             run(0, ' ', 8),
             run(8, '你', 1),
@@ -76,7 +76,7 @@ fn rows() -> Vec<Vec<Run>> {
             run(19, '你', 1),
             run(21, '好', 1),
         ],
-        // row 2: 属性
+        // row 3: 属性
         vec![
             run(0, ' ', 4),
             run(4, '正', 1),
@@ -92,7 +92,7 @@ fn rows() -> Vec<Vec<Run>> {
             Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(24, '反', 1) },
             Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(26, '色', 1) },
         ],
-        // row 3: 颜色
+        // row 4: 颜色
         vec![
             run(0, ' ', 4),
             Run { fg: (255, 60, 60), ..run(4, '红', 1) },
@@ -107,13 +107,13 @@ fn rows() -> Vec<Vec<Run>> {
             Run { bg: Some((80, 80, 160)), ..run(22, '背', 1) },
             Run { bg: Some((80, 80, 160)), ..run(24, '景', 1) },
         ],
-        // row 4: 边界
+        // row 5: 边界
         vec![
             run(0, '|', 1),
             run(1, ' ', 78),
             run(79, '|', 1),
         ],
-        // row 5: 光标（块状，位于 5,10）
+        // row 6: 光标（块状，位于 6,10）
         vec![
             run(0, ' ', 10),
             Run { reverse: true, fg: (0, 0, 0), bg: Some((240, 240, 240)), ..run(10, '█', 1) },
@@ -250,14 +250,12 @@ impl App {
         for (row_idx, row) in rows().iter().enumerate() {
             let row_y = row_idx as f32 * ch;
             for r in row {
-                // run 的显示列宽 = 各字符列宽之和（宽字符 2，普通 1）。
+                // run 的显示列宽（宽字符 2，普通 1）。RLE run 内字符恒相同，
+                // 故列宽 = run_len * width(ch)，直接相乘即可。
                 // 终端渲染中「字符数」与「列数」是两个量：位置/宽度一律用列数，
                 // 只有遍历字符时才用字符数。背景/下划线/字形必须同用列数。
-                let run_cols: u16 = (0..r.run_len)
-                    .map(|_| {
-                        unicode_width::UnicodeWidthChar::width(r.ch).unwrap_or(1) as u16
-                    })
-                    .sum();
+                let col_w = unicode_width::UnicodeWidthChar::width(r.ch).unwrap_or(1) as u16;
+                let run_cols: u16 = r.run_len * col_w;
 
                 // 背景 quad：显式 bg 或反色（反色时背景 = 前景色，实现前景/背景对调）
                 if r.bg.is_some() || r.reverse {
