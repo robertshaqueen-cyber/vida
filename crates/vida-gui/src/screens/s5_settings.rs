@@ -7,6 +7,46 @@ use crate::app::AppMessage;
 use crate::screens::s3_main::HostItem;
 use crate::term::primitive::TerminalAppearance;
 
+const TERMINAL_FONT_SIZES: &[u16] = &[10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32];
+
+/// 只展示系统实际安装的等宽字体。比例字体会破坏终端固定 cell 布局，
+/// 因此即使已安装也不进入这个选择器。
+fn installed_terminal_fonts() -> Vec<String> {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+
+    let mut families: Vec<String> = database
+        .faces()
+        .filter(|face| face.monospaced && !face.post_script_name.contains("Bitmap"))
+        .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+        .collect();
+    families.sort_by_key(|name| name.to_lowercase());
+    families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    families
+}
+
+fn selected_terminal_font(configured: &str, installed: &[String]) -> String {
+    installed
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(configured))
+        .or_else(|| installed.iter().find(|name| name.as_str() == "Menlo"))
+        .or_else(|| installed.first())
+        .cloned()
+        .unwrap_or_else(|| "Menlo".to_string())
+}
+
+fn selected_terminal_font_size(configured: f32) -> u16 {
+    TERMINAL_FONT_SIZES
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (*a as f32 - configured)
+                .abs()
+                .total_cmp(&(*b as f32 - configured).abs())
+        })
+        .unwrap_or(13)
+}
+
 // ---------------------------------------------------------------------------
 // Sync mode
 // ---------------------------------------------------------------------------
@@ -163,8 +203,9 @@ pub struct State {
     pub sync_local_path: String,
     // Terminal
     pub scrollback_lines: String,
+    pub terminal_font_families: Vec<String>,
     pub terminal_font_family: String,
-    pub terminal_font_size: String,
+    pub terminal_font_size: u16,
     pub terminal_cursor_blink: bool,
     /// 保存时以 daemon 返回的完整 Settings 为底，避免覆盖未在当前页面展示的字段。
     pub vault_settings: Settings,
@@ -189,14 +230,22 @@ impl State {
             _ => LangChoice::System,
         };
 
+        let terminal_font_families = installed_terminal_fonts();
+        let terminal_font_family = selected_terminal_font(
+            &vault_settings.terminal_font_family,
+            &terminal_font_families,
+        );
+        let terminal_font_size = selected_terminal_font_size(vault_settings.terminal_font_size);
+
         Self {
             active_section: SettingsSection::Application,
             language,
             sync_mode,
             sync_local_path,
             scrollback_lines,
-            terminal_font_family: vault_settings.terminal_font_family.clone(),
-            terminal_font_size: vault_settings.terminal_font_size.to_string(),
+            terminal_font_families,
+            terminal_font_family,
+            terminal_font_size,
             terminal_cursor_blink: vault_settings.terminal_cursor_blink,
             vault_settings,
             saving: false,
@@ -208,7 +257,7 @@ impl State {
     pub fn terminal_appearance(&self) -> TerminalAppearance {
         TerminalAppearance {
             font_family: self.terminal_font_family.clone(),
-            font_size: self.terminal_font_size.parse().unwrap_or(13.0),
+            font_size: self.terminal_font_size as f32,
             cursor_blink: self.terminal_cursor_blink,
         }
     }
@@ -483,15 +532,21 @@ impl State {
         let scroll_hint = text(i18n.tr("settings_scrollback_hint")).size(11);
 
         let font_family_label = text(i18n.tr("settings_terminal_font_family")).size(14);
-        let font_family_input = text_input("Menlo", &self.terminal_font_family)
-            .on_input(AppMessage::SettingsTerminalFontFamilyChanged)
-            .width(Length::Fill);
+        let font_family_input = pick_list(
+            self.terminal_font_families.as_slice(),
+            Some(&self.terminal_font_family),
+            AppMessage::SettingsTerminalFontFamilyChanged,
+        )
+        .width(Length::Fill);
         let font_family_hint = text(i18n.tr("settings_terminal_font_family_hint")).size(11);
 
         let font_size_label = text(i18n.tr("settings_terminal_font_size")).size(14);
-        let font_size_input = text_input("13", &self.terminal_font_size)
-            .on_input(AppMessage::SettingsTerminalFontSizeChanged)
-            .width(Length::Fill);
+        let font_size_input = pick_list(
+            TERMINAL_FONT_SIZES,
+            Some(self.terminal_font_size),
+            AppMessage::SettingsTerminalFontSizeChanged,
+        )
+        .width(Length::Fill);
         let font_size_hint = text(i18n.tr("settings_terminal_font_size_hint")).size(11);
 
         let cursor_blink = iced::widget::checkbox(self.terminal_cursor_blink)
@@ -562,6 +617,8 @@ mod tests {
 
     #[test]
     fn settings_json_populates_terminal_appearance_and_preserves_full_settings() {
+        let installed = installed_terminal_fonts();
+        let configured_font = installed.first().cloned().unwrap_or_else(|| "Menlo".into());
         let value = serde_json::json!({
             "s3_endpoint": "https://example.invalid",
             "s3_bucket": null,
@@ -569,7 +626,7 @@ mod tests {
             "s3_secret_key": null,
             "sync_local_path": null,
             "scrollback_lines": 4096,
-            "terminal_font_family": "SF Mono",
+            "terminal_font_family": configured_font.clone(),
             "terminal_font_size": 15.0,
             "terminal_cursor_blink": false
         });
@@ -577,12 +634,44 @@ mod tests {
         let state = State::from_json(&value, &i18n);
 
         let appearance = state.terminal_appearance();
-        assert_eq!(appearance.font_family, "SF Mono");
+        assert_eq!(appearance.font_family, configured_font);
         assert_eq!(appearance.font_size, 15.0);
         assert!(!appearance.cursor_blink);
         assert_eq!(
             state.vault_settings.s3_endpoint.as_deref(),
             Some("https://example.invalid")
         );
+        assert!(
+            state
+                .terminal_font_families
+                .contains(&state.terminal_font_family),
+            "当前字体必须来自下拉选项"
+        );
+    }
+
+    #[test]
+    fn terminal_font_selection_falls_back_to_installed_menlo() {
+        let installed = vec!["JetBrains Mono".to_string(), "Menlo".to_string()];
+        assert_eq!(selected_terminal_font("not installed", &installed), "Menlo");
+        assert_eq!(
+            selected_terminal_font("jetbrains mono", &installed),
+            "JetBrains Mono"
+        );
+    }
+
+    #[test]
+    fn terminal_font_list_excludes_unrenderable_bitmap_faces() {
+        assert!(
+            installed_terminal_fonts()
+                .iter()
+                .all(|name| !name.contains("Bitmap"))
+        );
+    }
+
+    #[test]
+    fn terminal_font_size_uses_nearest_available_choice() {
+        assert_eq!(selected_terminal_font_size(13.0), 13);
+        assert_eq!(selected_terminal_font_size(17.0), 16);
+        assert_eq!(selected_terminal_font_size(31.0), 32);
     }
 }

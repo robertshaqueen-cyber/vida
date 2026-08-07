@@ -211,10 +211,10 @@ pub struct TermPipeline {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     vertex_count: u32,
-    /// 字形缓存：跨帧复用，同字符同粗体同 scale 只光栅化一次。
-    /// key = (char, bold, scale.to_bits())——scale 变化（跨 DPI 拖动）
+    /// 字形缓存：跨帧复用，同字符同字重同 scale 只光栅化一次。
+    /// key = (char, weight, scale.to_bits())——scale 变化（跨 DPI 拖动）
     /// 时旧字形必须失效重新光栅化。
-    glyph_cache: Mutex<std::collections::HashMap<(char, bool, u32), GlyphEntry>>,
+    glyph_cache: Mutex<std::collections::HashMap<(char, u16, u32), GlyphEntry>>,
     /// 已构建的 grid 版本号：prepare 里 O(1) 跳过未变化的帧。
     built_version: AtomicU64,
     /// 图集持久数据（增量上传用）。
@@ -603,7 +603,7 @@ impl TermPrimitive {
                         &mut atlas_state,
                         ATLAS_SIZE,
                         cell.ch,
-                        bold,
+                        glyph_weight(bold, is_wide),
                     )
                 } else {
                     None
@@ -792,14 +792,14 @@ struct AtlasState {
 fn rasterize_char(
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
-    glyph_cache: &mut std::collections::HashMap<(char, bool, u32), GlyphEntry>,
+    glyph_cache: &mut std::collections::HashMap<(char, u16, u32), GlyphEntry>,
     state: &mut AtlasState,
     atlas_size: u32,
     ch: char,
-    bold: bool,
+    weight: cosmic_text::Weight,
 ) -> Option<GlyphEntry> {
     let scale = state.scale;
-    let key = (ch, bold, scale.to_bits());
+    let key = (ch, weight.0, scale.to_bits());
     if let Some(cached) = glyph_cache.get(&key) {
         return Some(*cached);
     }
@@ -818,9 +818,7 @@ fn rasterize_char(
     ));
     buf.set_size(font_system, Some(100.0), None);
     let mut attrs = Attrs::new().family(cosmic_text::Family::Name(&state.font_family));
-    if bold {
-        attrs = attrs.weight(cosmic_text::Weight::BOLD);
-    }
+    attrs = attrs.weight(weight);
     let text: String = ch.to_string();
     buf.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
 
@@ -942,6 +940,19 @@ fn rasterize_char(
         glyph_cache.insert(key, r);
     }
     result
+}
+
+/// zsh 的输入行通常带 bold，而普通命令输出不带；中文回退字体在小字号
+/// Regular 下笔画明显收窄，造成“输入正常、输出被压扁”的观感。宽字符的
+/// 普通字重使用 Medium，英文仍保持所选等宽字体的原始 Regular。
+fn glyph_weight(bold: bool, wide: bool) -> cosmic_text::Weight {
+    if bold {
+        cosmic_text::Weight::BOLD
+    } else if wide {
+        cosmic_text::Weight::MEDIUM
+    } else {
+        cosmic_text::Weight::NORMAL
+    }
 }
 
 /// 低 DPI stem darkening 在字形首次进入 CPU 图集时完成，避免把 `pow`
@@ -1240,7 +1251,9 @@ fn log_face_names(font_system: &mut FontSystem, font_size: f32, family: &str) {
         let metrics = Metrics::new(font_size, font_size * 1.25);
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
-        let attrs = Attrs::new().family(cosmic_text::Family::Name(family));
+        let attrs = Attrs::new()
+            .family(cosmic_text::Family::Name(family))
+            .weight(glyph_weight(false, ch == '你'));
         let text: String = ch.to_string();
         buf.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
         for line in buf.layout_runs() {
@@ -1383,6 +1396,13 @@ mod tests {
         assert_eq!(darken_glyph_alpha(255), 255);
         assert!(darken_glyph_alpha(64) > 64);
         assert!(darken_glyph_alpha(128) > 128);
+    }
+
+    #[test]
+    fn regular_wide_glyph_uses_medium_weight() {
+        assert_eq!(glyph_weight(false, false), cosmic_text::Weight::NORMAL);
+        assert_eq!(glyph_weight(false, true), cosmic_text::Weight::MEDIUM);
+        assert_eq!(glyph_weight(true, true), cosmic_text::Weight::BOLD);
     }
 
     #[test]
@@ -1534,7 +1554,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let mut cache = SwashCache::new();
-            let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
+            let mut glyph_cache: std::collections::HashMap<(char, u16, u32), GlyphEntry> =
                 std::collections::HashMap::new();
             let mut state = AtlasState {
                 data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
@@ -1546,31 +1566,41 @@ mod tests {
                 font_size: size,
                 font_family: pipeline.font_family.clone(),
             };
-            let r = rasterize_char(
-                &mut font_system,
-                &mut cache,
-                &mut glyph_cache,
-                &mut state,
-                ATLAS_SIZE,
-                'A',
-                false,
-            );
-            // 字体名：从 cache_key 的 font_id 查
-            let face_name = rasterize_face_name(&mut font_system, 'A', false, size);
-            match r {
-                Some((gw, gh, ..)) => {
-                    eprintln!(
-                        "[diag] 字号 {}: cell={}x{} asc={} 'A'位图={}x{} 字体={}",
-                        size,
-                        metrics.cell_width,
-                        metrics.cell_height,
-                        metrics.ascent,
-                        gw,
-                        gh,
-                        face_name
-                    );
+            for ch in ['A', '你'] {
+                let r = rasterize_char(
+                    &mut font_system,
+                    &mut cache,
+                    &mut glyph_cache,
+                    &mut state,
+                    ATLAS_SIZE,
+                    ch,
+                    glyph_weight(false, ch == '你'),
+                );
+                // 字体名：从 cache_key 的 font_id 查
+                let face_name = rasterize_face_name(
+                    &mut font_system,
+                    ch,
+                    false,
+                    ch == '你',
+                    size,
+                    &pipeline.font_family,
+                );
+                match r {
+                    Some((gw, gh, ..)) => {
+                        eprintln!(
+                            "[diag] 字号 {}: cell={}x{} asc={} '{}'位图={}x{} 字体={}",
+                            size,
+                            metrics.cell_width,
+                            metrics.cell_height,
+                            metrics.ascent,
+                            ch,
+                            gw,
+                            gh,
+                            face_name
+                        );
+                    }
+                    None => eprintln!("[diag] 字号 {}: '{}' 光栅化失败", size, ch),
                 }
-                None => eprintln!("[diag] 字号 {}: 光栅化失败", size),
             }
         }
     }
@@ -1580,15 +1610,15 @@ mod tests {
         font_system: &mut FontSystem,
         ch: char,
         bold: bool,
+        wide: bool,
         font_size: f32,
+        family: &str,
     ) -> String {
         let metrics = Metrics::new(font_size, font_size * 1.25);
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
-        let mut attrs = Attrs::new().family(cosmic_text::Family::Monospace);
-        if bold {
-            attrs = attrs.weight(cosmic_text::Weight::BOLD);
-        }
+        let mut attrs = Attrs::new().family(cosmic_text::Family::Name(family));
+        attrs = attrs.weight(glyph_weight(bold, wide));
         let text: String = ch.to_string();
         buf.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
         let mut name = String::new();
@@ -1628,7 +1658,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let mut cache = SwashCache::new();
-            let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
+            let mut glyph_cache: std::collections::HashMap<(char, u16, u32), GlyphEntry> =
                 std::collections::HashMap::new();
             let mut state = AtlasState {
                 data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
@@ -1647,7 +1677,7 @@ mod tests {
                 &mut state,
                 ATLAS_SIZE,
                 'A',
-                false,
+                glyph_weight(false, false),
             );
             match r {
                 Some((gw, gh, ..)) => {
@@ -1675,7 +1705,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut cache = SwashCache::new();
-        let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
+        let mut glyph_cache: std::collections::HashMap<(char, u16, u32), GlyphEntry> =
             std::collections::HashMap::new();
         let mut state = AtlasState {
             data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
@@ -1696,7 +1726,8 @@ mod tests {
 
         let mut skipped = 0usize;
         for ch in &chars {
-            let key = (*ch, false, scale.to_bits());
+            let weight = glyph_weight(false, !ch.is_ascii());
+            let key = (*ch, weight.0, scale.to_bits());
             if glyph_cache.contains_key(&key) {
                 continue;
             }
@@ -1707,7 +1738,7 @@ mod tests {
                 &mut state,
                 ATLAS_SIZE,
                 *ch,
-                false,
+                weight,
             );
             if r.is_none() {
                 skipped += 1;

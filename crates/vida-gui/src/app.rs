@@ -221,7 +221,7 @@ pub enum AppMessage {
     SettingsSyncQuickLocation(crate::screens::s5_settings::QuickLocation),
     SettingsScrollbackChanged(String),
     SettingsTerminalFontFamilyChanged(String),
-    SettingsTerminalFontSizeChanged(String),
+    SettingsTerminalFontSizeChanged(u16),
     SettingsTerminalCursorBlinkChanged(bool),
     SettingsLanguageChanged(crate::screens::s5_settings::LangChoice),
     SettingsSectionChanged(crate::screens::s5_settings::SettingsSection),
@@ -1332,19 +1332,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             if let Some(s) = &mut app.settings_state {
                 s.error = None;
                 let scrollback = s.scrollback_lines.parse::<usize>().unwrap_or(3000);
-                let font_family = s.terminal_font_family.trim().to_string();
-                if font_family.is_empty() {
-                    s.error = Some(app.i18n.tr("settings_terminal_font_family_required").into());
-                    return Task::none();
-                }
-                let Ok(font_size) = s.terminal_font_size.parse::<f32>() else {
-                    s.error = Some(app.i18n.tr("settings_terminal_font_size_invalid").into());
-                    return Task::none();
-                };
-                if !font_size.is_finite() || !(8.0..=48.0).contains(&font_size) {
-                    s.error = Some(app.i18n.tr("settings_terminal_font_size_invalid").into());
-                    return Task::none();
-                }
+                let font_family = s.terminal_font_family.clone();
+                let font_size = s.terminal_font_size as f32;
                 s.saving = true;
                 let sync_path = if s.sync_local_path.is_empty() {
                     None
