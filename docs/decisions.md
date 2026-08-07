@@ -800,6 +800,36 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
 - Menlo 16px 实测（scale=1）：cell_width=10、cell_height=20、
   ascent=14（decisions.md 本轮记录）
 
+**排查记录与教训（M2b-1 完整链路）**：
+- **删除 Bitmap 字体的副作用**：为绕开 GB18030 Bitmap（无矢量轮廓）
+  删除所有含 "Bitmap" 的字体，副作用是改变了 monospace fallback 顺序，
+  ASCII 落到 Courier New（旧式打字机衬线体，笔画细/x-height 低）。
+  **教训：终端字体必须显式指定 family，不能依赖 fallback 顺序；
+  排查字体问题时第一步就该打印实际使用的字体名**（log_face_names）
+- **图集 cursor 必须跨帧持久**：每帧重置 next_x/next_y 会让新字形
+  覆盖已写入的字形（ASCII 先写入靠前最易被覆盖）。测试
+  atlas_cursor_must_persist_across_frames 覆盖
+- **write_texture 的 layout 必须匹配源缓冲布局**：bytes_per_row 需
+  256 对齐且与源数据行距一致，因此不能逐字形上传（字形宽 < 256
+  无法对齐）；方案为维护 CPU 完整图集 + 按行区间上传（行距恒
+  ATLAS*4=4096）。测试 atlas_row_upload_passes_validation 覆盖
+- **环境假设必须先测量再推理**：本机 1920×1080 非 HiDPI、scale=1。
+  此前多轮基于「Retina 2x」的推断（glyph.physical scale、整数
+  cell、gamma）均不成立或无关——scale=1 时字形 1:1 光栅化本无
+  模糊。字体观感问题的真正根因是字体选择（Courier New）
+- **GUI 日志排查**：tracing filter 必须用 bin 名（"vida"）而非
+  package 名（"vida_gui"）——module_path! 以 bin 名为前缀；
+  RUST_LOG 被 shell 设置时可能吞掉全部 GUI 日志（改用 VIDA_LOG）
+
+**已知渲染差异（不在 M2b-1 处理，M2b-3 或后续）**：
+1. **CJK 字距被撑开**：cell_width=10（Menlo 16px advance 取整），
+   宽字符分配 2×10=20px，但 PingFang 16px 字形实际宽约 16px，
+   靠左绘制右侧空 4px → 中文字间有空隙。Ghostty/Alacritty 的做法：
+   CJK 字形缩放填满 2 cell，或选 advance=2×ASCII 的 CJK 字体
+2. **笔画偏细，缺 stem darkening**：16px Menlo 在 1080p 非 HiDPI
+   下笔画偏细。Ghostty/Alacritty 在低 DPI 对字形 alpha 做轻微膨胀
+   补偿视觉重量。我们未做
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；

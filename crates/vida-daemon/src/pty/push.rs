@@ -37,7 +37,7 @@ enum DamageInfo {
     Partial(Vec<(usize, usize, usize)>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DirtyLine {
     pub row: u16,
     pub start_col: u16,
@@ -45,7 +45,7 @@ pub struct DirtyLine {
     pub runs: Vec<Run>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub len: u16,
     pub flags: u8,
@@ -357,6 +357,11 @@ pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
     // 距上次推送不足 16ms 时直接返回，不读 damage/不编码/不入队。
     let interval = Duration::from_millis(PUSH_INTERVAL_MS);
     let mut next_slot = std::time::Instant::now();
+    // 上次推送的帧内容：alacritty_terminal 的 damage() 每帧无条件标记
+    // 光标行（为 cursor blink 设计）。内容未变的帧（仅光标行）对
+    // 客户端无意义——跳过不推，否则客户端每帧重绘空转（实测 62fps、
+    // GUI CPU ~49%）。
+    let mut last_lines: Vec<DirtyLine> = Vec::new();
 
     loop {
         // 等待到下一个时隙（绝对时间，非相对 sleep）
@@ -400,6 +405,12 @@ pub(crate) fn push_loop(session: Arc<Mutex<SessionInner>>) {
             term.term.reset_damage();
             frame
         };
+        // 内容未变（仅 alacritty 的光标行 damage）：跳过，不推帧。
+        // DirtyLine 含行内容与属性，PartialEq 可判定内容是否变化。
+        if frame.lines == last_lines {
+            continue;
+        }
+        last_lines = frame.lines.clone();
         let bytes: Vec<u8> = encode_frame(&inner.id, &frame);
         let frame_payload = PushPayload {
             frame_seq: seq,

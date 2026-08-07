@@ -61,6 +61,8 @@ pub struct VidaApp {
     debug_terminal_sid: Option<String>,
     /// 终端重连冷却（10 秒内最多重连一次，防止 daemon 未恢复时空转）。
     terminal_reconnect_cooldown: Option<std::time::Instant>,
+    /// 终端帧计数（诊断用）。
+    term_diag_count: u64,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -254,6 +256,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         clipboard_token: 0,
         debug_terminal_sid: None,
         terminal_reconnect_cooldown: None,
+        term_diag_count: 0,
     };
 
     let connect = Task::perform(
@@ -306,6 +309,13 @@ impl VidaApp {
 /// 帧到达 → TerminalPush；无推送时 recv().await 挂起 → 空闲 CPU ≈ 0%。
 /// 连接断开（sender drop）→ recv 返回 None → TerminalDisconnected。
 fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
+    // [diag] subscription 调用计数：iced 每次 update 后重新求值。
+    // 若每秒 60 次 → subscription 每次重建（身份比较失败）。
+    static SUB_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SUB_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 5 || n.is_multiple_of(100) {
+        tracing::info!("[diag] subscription() 调用 #{}", n);
+    }
     let Some(ws) = app.ws_client.as_ref() else {
         return iced::Subscription::none();
     };
@@ -1660,6 +1670,16 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let Screen::Terminal(session) = &mut app.screen else {
                 return Task::none();
             };
+            // [diag] 帧计数 + version：判断「daemon 每帧推」vs「grid 每帧变」
+            app.term_diag_count += 1;
+            if app.term_diag_count <= 5 || app.term_diag_count.is_multiple_of(100) {
+                tracing::info!(
+                    "[diag] 帧 #{} version={} bytes={}",
+                    app.term_diag_count,
+                    session.grid.version,
+                    bytes.len()
+                );
+            }
             if session.session_id != session_id {
                 return Task::none();
             }
