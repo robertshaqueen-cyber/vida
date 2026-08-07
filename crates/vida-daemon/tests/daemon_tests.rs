@@ -1551,6 +1551,70 @@ fn decode_frame_header(bytes: &[u8]) -> (String, &[u8]) {
     (id, &bytes[3 + id_len..])
 }
 
+/// 解码帧 payload 为行文本（测试用，宽松解析：任何越界即停止）。
+/// 格式：[seq:8][cursor_row:2][cursor_col:2][cursor_visible:1][line_count:2]
+/// 每行：[row:2][start:2][end:2][run_count:2]
+/// 每 run：[len:2][flags:1][fg tag:1(+payload)][bg tag:1(+payload)][char_len:1][chars]
+fn decode_frame_lines(payload: &[u8]) -> Vec<String> {
+    let mut pos = 15usize; // seq(8) + cursor(4) + visible(1) + line_count(2)
+    if payload.len() < pos {
+        return Vec::new();
+    }
+    let line_count = u16::from_be_bytes([payload[13], payload[14]]) as usize;
+    let mut rows: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    for _ in 0..line_count {
+        if pos + 8 > payload.len() {
+            break;
+        }
+        let row = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        pos += 8; // row + start + end + run_count
+        let run_count = u16::from_be_bytes([payload[pos - 2], payload[pos - 1]]) as usize;
+        let mut line = String::new();
+        for _ in 0..run_count {
+            if pos + 3 > payload.len() {
+                break;
+            }
+            // run_len = 该 run 覆盖的列数：字符需重复 run_len 次渲染
+            let run_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+            pos += 3; // len(2) + flags(1)
+            // fg tag
+            let fg_tag = payload[pos];
+            pos += 1;
+            match fg_tag {
+                0x00 => {}
+                0x01 => pos += 1,
+                0x02 => pos += 3,
+                _ => return Vec::new(),
+            }
+            // bg tag
+            let bg_tag = payload[pos];
+            pos += 1;
+            match bg_tag {
+                0x00 => {}
+                0x01 => pos += 1,
+                0x02 => pos += 3,
+                _ => return Vec::new(),
+            }
+            if pos + 1 > payload.len() {
+                break;
+            }
+            let char_len = payload[pos] as usize;
+            pos += 1;
+            if pos + char_len > payload.len() {
+                break;
+            }
+            if let Ok(s) = std::str::from_utf8(&payload[pos..pos + char_len]) {
+                for _ in 0..run_len {
+                    line.push_str(s);
+                }
+            }
+            pos += char_len;
+        }
+        rows.insert(row, line);
+    }
+    rows.into_values().collect()
+}
+
 /// 同一连接订阅两个会话：两个会话的帧都能收到，session_id 各自正确；
 /// Unsubscribe 其中一个后，另一个仍正常推送。
 #[tokio::test]
@@ -1687,10 +1751,12 @@ async fn single_connection_multi_subscribe() {
     assert!(b_after > 0, "取消订阅 A 后会话 B 应继续推送");
 }
 
-/// 断开重连后重新订阅必须拿全量帧（规格 4.3）：
-/// 1. 连接 A 订阅会话，用 for 循环填满屏幕
-/// 2. 断开连接 A（会话仍属 daemon，保留）
-/// 3. 新连接 B 重新订阅同一会话 → 首帧应覆盖全部可见行（全量帧特征）
+/// 断开重连后重新订阅必须拿全量帧且画面恢复到断线前（规格 4.3）：
+/// 1. 打开会话，发送 'echo RECONNECT_MARKER\n' 并等待输出
+/// 2. 断开连接（会话属于 daemon，保留）
+/// 3. 新连接，用【同一个 session_id】SubscribeSession
+/// 4. 断言全量帧中包含 RECONNECT_MARKER（画面恢复到断线前）
+/// 5. 断言 ListSessions 数量未增加（没有偷偷新开会话）
 #[tokio::test]
 async fn reconnect_resubscribe_gets_full_frame() {
     use tokio_tungstenite::tungstenite::Message;
@@ -1717,8 +1783,8 @@ async fn reconnect_resubscribe_gets_full_frame() {
     let resp = send_recv(&mut ws_a, &mut reader_a, &sub_a).await;
     assert_eq!(resp["type"], "Ok");
 
-    // 填满屏幕：echo 24 行（ 结尾触发命令执行）
-    let mut data: Vec<u8> = b"for i in $(seq 1 24); do echo fill$i; done".to_vec();
+    // 在会话中留下可见标记（画面恢复的判据）
+    let mut data: Vec<u8> = b"echo RECONNECT_MARKER".to_vec();
     data.push(0x0D);
     let input = format!(
         r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{:?}}},"id":4}}"#,
@@ -1726,38 +1792,72 @@ async fn reconnect_resubscribe_gets_full_frame() {
     );
     ws_a.send(Message::Text(input.into())).await.unwrap();
 
-    // 等输出完成（约 1.5 秒）
+    // 等 shell 完全就绪再发送（排除输入过早进入 PTY 队列的时序问题）
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // 断开连接 A
+    // 等待标记确实出现在连接 A 的帧里（确保 echo 已执行且未滚动出屏）
+    let deadline_a = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut marker_on_a = false;
+    while tokio::time::Instant::now() < deadline_a {
+        match reader_a.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let (_, payload) = decode_frame_header(&bytes);
+                let lines = decode_frame_lines(payload);
+                let text: String = lines.join("\n");
+                if text.contains("RECONNECT_MARKER") {
+                    marker_on_a = true;
+                    break;
+                }
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => panic!("read error: {:?}", e),
+            None => panic!("connection closed while waiting for marker"),
+            _ => {}
+        }
+    }
+    assert!(marker_on_a, "断线前 marker 应出现在连接 A 的帧中");
+
+    // 断开连接 A（会话属于 daemon，保留）
     drop(ws_a);
     drop(reader_a);
 
-    // 连接 B：重新订阅同一会话
+    // 连接 B：同一会话重新订阅
     let (mut ws_b, mut reader_b) = connect(addr).await;
     let auth_b = format!(r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token);
     let resp = send_recv(&mut ws_b, &mut reader_b, &auth_b).await;
     assert_eq!(resp["type"], "Ok");
 
+    // 记录断线前的会话数量
+    let resp = send_recv(
+        &mut ws_b,
+        &mut reader_b,
+        r#"{"method":"ListSessions","params":{},"id":2}"#,
+    )
+    .await;
+    let sessions_before = resp["result"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+
     let sub_b = format!(
-        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":2}}"#,
+        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
         sid
     );
     let resp = send_recv(&mut ws_b, &mut reader_b, &sub_b).await;
-    assert_eq!(resp["type"], "Ok", "重新订阅失败: {}", resp);
+    assert_eq!(resp["type"], "Ok", "重新订阅同一会话失败: {}", resp);
 
-    // 收到的第一帧必须是全量帧：lines 覆盖全部 24 个可见行（fill1..24 占满）
+    // 断言收到的帧包含 RECONNECT_MARKER（画面恢复到断线前）
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut full_line_count: Option<usize> = None;
+    let mut marker_found = false;
     while tokio::time::Instant::now() < deadline {
         match reader_b.next().await {
             Some(Ok(Message::Binary(bytes))) => {
                 let (sid_b, payload) = decode_frame_header(&bytes);
                 assert_eq!(sid_b, sid, "帧的 session_id 应正确");
-                // payload: [seq:8][cursor_row:2][cursor_col:2][cursor_visible:1][line_count:2]
-                if payload.len() >= 15 {
-                    let line_count = u16::from_be_bytes([payload[13], payload[14]]) as usize;
-                    full_line_count = Some(line_count);
+                let lines = decode_frame_lines(payload);
+                let text: String = lines.join("\n");
+                if text.contains("RECONNECT_MARKER") {
+                    marker_found = true;
                     break;
                 }
             }
@@ -1767,10 +1867,21 @@ async fn reconnect_resubscribe_gets_full_frame() {
             _ => {}
         }
     }
-    let line_count = full_line_count.expect("应收到全量帧");
     assert!(
-        line_count >= 20,
-        "重新订阅后的首帧应覆盖大部分可见行（全量帧特征），实际 {} 行",
-        line_count
+        marker_found,
+        "重新订阅后的全量帧应包含断线前的输出（RECONNECT_MARKER）"
+    );
+
+    // 断言没有偷偷新开会话
+    let resp = send_recv(
+        &mut ws_b,
+        &mut reader_b,
+        r#"{"method":"ListSessions","params":{},"id":4}"#,
+    )
+    .await;
+    let sessions_after = resp["result"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        sessions_after, sessions_before,
+        "重连不应新增会话（旧会话应被复用）"
     );
 }

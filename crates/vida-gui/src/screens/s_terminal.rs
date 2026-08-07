@@ -21,6 +21,8 @@ pub struct TerminalSession {
     pub closed: bool,
     /// 退出码（None = 未知，如被信号终止）。
     pub exit_code: Option<u32>,
+    /// 需要向用户展示的提示（如「原会话已结束，已为你打开新终端」）。
+    pub notice: Option<String>,
 }
 
 impl TerminalSession {
@@ -30,6 +32,7 @@ impl TerminalSession {
             grid: ClientGrid::new(rows, cols),
             closed: false,
             exit_code: None,
+            notice: None,
         }
     }
 
@@ -46,6 +49,10 @@ impl TerminalSession {
 impl TerminalSession {
     /// 渲染终端画面 + 会话状态栏。
     pub fn view(&self) -> Element<'_, AppMessage> {
+        let notice_el = match &self.notice {
+            Some(n) => text(n).size(12),
+            None => text("").size(12),
+        };
         let status = if self.closed {
             let code_text = match self.exit_code {
                 Some(code) => format!("会话已结束（shell 退出，exit_code={}）", code),
@@ -57,7 +64,7 @@ impl TerminalSession {
         };
         let canvas = widget::canvas(self.snapshot());
         let back = button("返回").on_press(AppMessage::CloseDebugTerminal);
-        let content = column![status, canvas, back]
+        let content = column![notice_el, status, canvas, back]
             .spacing(8)
             .padding(8)
             .height(Length::Fill);

@@ -114,11 +114,15 @@ pub enum AppMessage {
     TerminalOpened { session_id: String },
     /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
     TerminalDisconnected,
-    /// 自动重连完成：新连接 + 新会话已就绪。
+    /// 自动重连完成：新连接 + 会话已就绪。notice 为可选提示（如
+    /// 「原会话已结束，已为你打开新终端」）。
     TerminalReconnected {
         client: WsClient,
         session_id: String,
+        notice: Option<String>,
     },
+    /// 原会话已不存在：需要提示用户并新开会话。
+    TerminalSessionLost { client: WsClient },
     /// 自动重连失败（等待冷却后由用户手动重试）。
     TerminalReconnectFailed(String),
     TerminalSetupError(String),
@@ -327,8 +331,23 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     })
 }
 
+/// 重连成功后恢复会话尺寸（从断线前的 grid 快照）。
+fn old_rows_or_default(app: &VidaApp) -> u16 {
+    match &app.screen {
+        Screen::Terminal(s) => s.grid.rows,
+        _ => 40,
+    }
+}
+
+fn old_cols_or_default(app: &VidaApp) -> u16 {
+    match &app.screen {
+        Screen::Terminal(s) => s.grid.cols,
+        _ => 100,
+    }
+}
+
 /// 打开本地会话并订阅推送，返回 session_id。
-/// 重连路径与首次打开共用（重连后必须重新订阅拿全量帧）。
+/// 首次打开与「原会话已结束」兜底路径共用（重连后必须重新订阅拿全量帧）。
 async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
     let resp = client
         .send("OpenLocalSession", serde_json::json!({"cols": 100, "rows": 40}))
@@ -1508,19 +1527,71 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             }
             app.terminal_reconnect_cooldown = Some(now + std::time::Duration::from_secs(10));
+            // 断线前的会话 id 与尺寸（重连后复用原会话）
+            let old_sid = app.debug_terminal_sid.clone();
+            let (old_rows, old_cols) = match &app.screen {
+                Screen::Terminal(s) => (s.grid.rows, s.grid.cols),
+                _ => (40, 100),
+            };
             Task::perform(
-                async {
+                async move {
                     // 先等 5 秒让 daemon 有时间恢复
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     match WsClient::connect().await {
                         Ok(client) => {
-                            // 新连接 → 必须重新 OpenLocalSession + SubscribeSession
-                            // 拿全量帧（规格 4.3：不能沿用旧 grid 打增量）。
-                            match open_and_subscribe(&client).await {
-                                Ok(sid) => {
-                                    AppMessage::TerminalReconnected { client, session_id: sid }
+                            // 优先复用原会话：会话属于 daemon 不属于连接，
+                            // 断开后旧会话仍在运行（编译/命令历史/vim 未保存
+                            // 内容都在），重连只需重新订阅拿全量帧恢复画面。
+                            match old_sid.as_ref() {
+                                Some(sid) => {
+                                    match client
+                                        .send(
+                                            "SubscribeSession",
+                                            serde_json::json!({"session_id": sid}),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            // 尺寸同步：断线期间窗口可能变化过
+                                            // （M2b-2 起真实发生），订阅成功后主动
+                                            // 发一次 ResizeSession。
+                                            let _ = client
+                                                .send(
+                                                    "ResizeSession",
+                                                    serde_json::json!({
+                                                        "session_id": sid,
+                                                        "cols": old_cols,
+                                                        "rows": old_rows,
+                                                    }),
+                                                )
+                                                .await;
+                                            AppMessage::TerminalReconnected {
+                                                client,
+                                                session_id: sid.clone(),
+                                                notice: None,
+                                            }
+                                        }
+                                        Err(e) if e.message.contains("会话不存在") => {
+                                            // 原会话已结束（daemon 重启等）：
+                                            // 提示用户后新开，不静默替换
+                                            AppMessage::TerminalSessionLost { client }
+                                        }
+                                        Err(e) => {
+                                            AppMessage::TerminalReconnectFailed(e.message)
+                                        }
+                                    }
                                 }
-                                Err(e) => AppMessage::TerminalReconnectFailed(e),
+                                None => {
+                                    // 无旧会话（理论不可达：断线必有会话），安全兜底
+                                    match open_and_subscribe(&client).await {
+                                        Ok(sid) => AppMessage::TerminalReconnected {
+                                            client,
+                                            session_id: sid,
+                                            notice: None,
+                                        },
+                                        Err(e) => AppMessage::TerminalReconnectFailed(e),
+                                    }
+                                }
                             }
                         }
                         Err(e) => AppMessage::TerminalReconnectFailed(e.to_string()),
@@ -1529,13 +1600,38 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 |msg| msg,
             )
         }
-        AppMessage::TerminalReconnected { client, session_id } => {
+        AppMessage::TerminalReconnected {
+            client,
+            session_id,
+            notice,
+        } => {
             // 新 WsClient（新 Arc 指针）→ subscription identity 变化 → iced
-            // 重启推送 stream → 首次迭代订阅新会话 → 收到全量帧。
+            // 重启推送 stream → 首次迭代订阅 → 收到全量帧。
             app.ws_client = Some(client);
             app.debug_terminal_sid = Some(session_id.clone());
-            app.screen = Screen::Terminal(s_terminal::TerminalSession::new(session_id, 40, 100));
+            let mut session =
+                s_terminal::TerminalSession::new(session_id, old_rows_or_default(app), old_cols_or_default(app));
+            if let Some(n) = notice {
+                session.notice = Some(n);
+            }
+            app.screen = Screen::Terminal(session);
             Task::none()
+        }
+        AppMessage::TerminalSessionLost { client } => {
+            tracing::info!("原终端会话已结束，为调试终端打开新会话");
+            Task::perform(
+                async move {
+                    match open_and_subscribe(&client).await {
+                        Ok(sid) => AppMessage::TerminalReconnected {
+                            client,
+                            session_id: sid,
+                            notice: Some("原会话已结束，已为你打开新终端".to_string()),
+                        },
+                        Err(e) => AppMessage::TerminalReconnectFailed(e),
+                    }
+                },
+                |msg| msg,
+            )
         }
         AppMessage::TerminalReconnectFailed(msg) => {
             tracing::error!("终端自动重连失败: {}（可返回后重新打开调试终端）", msg);
