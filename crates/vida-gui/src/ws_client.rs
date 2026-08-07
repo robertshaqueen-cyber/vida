@@ -281,6 +281,24 @@ impl WsClient {
         })?
     }
 
+    /// 按调用顺序把请求放入 WebSocket 发送队列，不等待响应。
+    ///
+    /// 用于终端逐键输入和 resize：它们已经由 GUI 侧校验，且必须保持事件
+    /// 顺序。不要用于需要读取结果或向用户展示服务端业务错误的操作。
+    pub fn send_queued(&self, method: &str, params: serde_json::Value) -> DaemonResult<()> {
+        let (response_tx, _response_rx) = oneshot::channel();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let req = WsRequest {
+            method: method.to_string(),
+            params: Some(params),
+            id,
+        };
+        self.tx.send((req, response_tx)).map_err(|_| DaemonError {
+            message: "终端连接已断开，输入未发送。请等待自动重连或返回后重新打开终端。".to_string(),
+            category: None,
+        })
+    }
+
     /// Send a request with no params (unit variant).
     pub async fn send_no_params(&self, method: &str) -> DaemonResult<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();

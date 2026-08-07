@@ -58,6 +58,18 @@ daemon 层测试无法覆盖「按钮是否真的发出了请求」——测试�
 - 状态类 UI（如同步状态图标）只能由服务端响应更新，
   不得依据 GUI 本地推测决定是否发送请求或显示成功
 
+## 终端输入与 resize 约定
+
+- 人的普通键盘输入走 `SessionInput`，daemon 必须保持原始字节透传；
+  不做命令解释、换行转换，也不让 AI 进入人的输入路径
+- 剪贴板必须走独立的 `PasteSession`，由 daemon 查询真实
+  `TermMode::BRACKETED_PASTE`；禁止把多行粘贴直接当普通输入，否则会立即执行
+- 输入与 resize 在 GUI update 内按事件顺序进入同一发送队列；禁止“一键一个异步
+  Task”，异步调度可能打乱字符顺序
+- resize 行列数必须使用渲染器实测的物理像素 cell 尺寸计算：
+  `floor(logical bounds × scale / physical cell)`；不得混用逻辑像素与物理像素
+- 键盘、IME、剪贴板内容可能包含口令或私钥，永不写日志
+
 ## 内存测量规范
 
 - **唯一指标**：`vmmap --summary <pid>` 中的 `Physical footprint`

@@ -26,7 +26,7 @@ use std::thread;
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -339,6 +339,35 @@ impl PtyManager {
         Ok(())
     }
 
+    /// 粘贴文本：仅当终端应用启用了 bracketed-paste 时加保护边界。
+    ///
+    /// 与 `session_input` 分开，确保普通键盘输入继续严格原始透传。保护模式下
+    /// 移除 ESC，防止剪贴板内容伪造结束边界后注入额外控制序列。
+    pub fn paste_session(&self, session_id: &str, data: &[u8]) -> Result<()> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("会话不存在: {}", session_id))?;
+        let inner = session.lock().map_err(|_| anyhow::anyhow!("会话锁异常"))?;
+        if inner.closed.load(Ordering::Relaxed) {
+            anyhow::bail!("会话已结束: {}", session_id);
+        }
+        let bracketed = {
+            let term = inner
+                .term
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Term 锁异常"))?;
+            term.term.mode().contains(TermMode::BRACKETED_PASTE)
+        };
+        let encoded = encode_paste(data, bracketed);
+        let mut io = inner.io.lock().map_err(|_| anyhow::anyhow!("IO 锁异常"))?;
+        if let Some(writer) = io.writer.as_mut() {
+            writer.write_all(&encoded).context("粘贴到 PTY 失败")?;
+            writer.flush().ok();
+        }
+        Ok(())
+    }
+
     /// 调整会话尺寸：同时作用于 PTY（ioctl）和 Term。
     pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<()> {
         validate_size(cols, rows)?;
@@ -573,6 +602,19 @@ impl PtyManager {
     }
 }
 
+fn encode_paste(data: &[u8], bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return data.to_vec();
+    }
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut encoded = Vec::with_capacity(START.len() + data.len() + END.len());
+    encoded.extend_from_slice(START);
+    encoded.extend(data.iter().copied().filter(|byte| *byte != 0x1b));
+    encoded.extend_from_slice(END);
+    encoded
+}
+
 // ---------------------------------------------------------------------------
 // 内部辅助
 // ---------------------------------------------------------------------------
@@ -735,6 +777,14 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn paste_encoding_respects_mode_and_blocks_escape_injection() {
+        assert_eq!(encode_paste(b"one\ntwo", false), b"one\ntwo");
+        assert_eq!(
+            encode_paste(b"one\n\x1b[201~two", true),
+            b"\x1b[200~one\n[201~two\x1b[201~"
+        );
+    }
     #[test]
     fn validate_size_rejects_zero() {
         assert!(validate_size(0, 24).is_err());

@@ -111,7 +111,7 @@ impl SyncState {
 
 #[derive(Debug, Clone)]
 pub enum AppMessage {
-    // Debug terminal (M2b-1)
+    // Interactive debug terminal (M2b-2)
     OpenDebugTerminal,
     CloseDebugTerminal,
     TerminalPush(PushMsg),
@@ -135,6 +135,15 @@ pub enum AppMessage {
     /// 自动重连失败（等待冷却后由用户手动重试）。
     TerminalReconnectFailed(String),
     TerminalSetupError(String),
+    /// 人在终端 widget 中产生的原始输入字节。
+    TerminalInput(Vec<u8>),
+    /// 剪贴板文本；daemon 会按当前终端模式安全封装 bracketed paste。
+    TerminalPaste(Vec<u8>),
+    /// 终端画布按真实物理像素 cell 换算出的尺寸。
+    TerminalResize {
+        cols: u16,
+        rows: u16,
+    },
 
     // Connection
     WsConnected(WsClient),
@@ -1512,7 +1521,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
 
-        // ---- Debug terminal (M2b-1) ----
+        // ---- Interactive debug terminal (M2b-2) ----
         AppMessage::OpenDebugTerminal => {
             let client = match app.ws_client.as_ref() {
                 Some(c) => c.clone(),
@@ -1536,7 +1545,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 app.main_state_backup = Some(s.clone());
             }
             app.screen = Screen::Terminal(s_terminal::TerminalSession::new(session_id, 40, 100));
-            Task::none()
+            iced::widget::operation::focus::<AppMessage>(crate::term::widget::id())
         }
         AppMessage::TerminalDisconnected => {
             // 主动取消（点返回 → unsubscribe → rx 关闭）也会走到这里：
@@ -1672,6 +1681,84 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::TerminalSetupError(msg) => {
             tracing::error!("终端调试屏打开失败: {}", msg);
+            Task::none()
+        }
+        AppMessage::TerminalInput(data) => {
+            if data.is_empty() {
+                return Task::none();
+            }
+            let Some(client) = app.ws_client.as_ref() else {
+                return Task::none();
+            };
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.closed {
+                session.notice = Some("会话已结束，无法继续输入。请返回后重新打开终端。".into());
+                return Task::none();
+            }
+            // 同步入队保证逐键顺序；绝不记录 data（其中可能包含口令）。
+            if let Err(error) = client.send_queued(
+                "SessionInput",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "data": data,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
+            Task::none()
+        }
+        AppMessage::TerminalPaste(data) => {
+            if data.is_empty() {
+                return Task::none();
+            }
+            let Some(client) = app.ws_client.as_ref() else {
+                return Task::none();
+            };
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.closed {
+                session.notice = Some("会话已结束，无法粘贴。请返回后重新打开终端。".into());
+                return Task::none();
+            }
+            // 与普通输入分流：daemon 依据真实 TermMode 决定 bracketed paste。
+            // 绝不记录 data（剪贴板可能包含口令或私钥）。
+            if let Err(error) = client.send_queued(
+                "PasteSession",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "data": data,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
+            Task::none()
+        }
+        AppMessage::TerminalResize { cols, rows } => {
+            let Some(client) = app.ws_client.as_ref() else {
+                return Task::none();
+            };
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.closed || (session.grid.cols == cols && session.grid.rows == rows) {
+                return Task::none();
+            }
+
+            // 先让 GUI grid 与新尺寸一致；daemon 随后的 Full damage 会填满它。
+            session.grid.reset(rows, cols);
+            if let Err(error) = client.send_queued(
+                "ResizeSession",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "cols": cols,
+                    "rows": rows,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
             Task::none()
         }
         AppMessage::TerminalPush(PushMsg::Frame { session_id, bytes }) => {

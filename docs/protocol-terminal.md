@@ -106,6 +106,7 @@ else:
 |---|---|
 | `OpenLocalSession { cols, rows }` | 打开会话（固定 $SHELL，cwd=HOME） |
 | `SessionInput { session_id, data }` | 原始字节输入 |
+| `PasteSession { session_id, data }` | 剪贴板输入；按当前 TermMode 应用 bracketed-paste 保护 |
 | `ResizeSession { session_id, cols, rows }` | 调整尺寸 |
 | `CloseSession { session_id }` | 关闭会话 |
 | `ListSessions` | 列出所有会话 |

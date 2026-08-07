@@ -72,11 +72,70 @@ struct BuiltGeometry {
 pub struct TermPrimitive {
     snapshot: Arc<ClientGrid>,
     bounds: Rectangle,
+    viewport_metrics: Arc<ViewportMetrics>,
 }
 
 impl TermPrimitive {
-    pub fn new(snapshot: Arc<ClientGrid>, bounds: Rectangle) -> Self {
-        Self { snapshot, bounds }
+    pub fn new(
+        snapshot: Arc<ClientGrid>,
+        bounds: Rectangle,
+        viewport_metrics: Arc<ViewportMetrics>,
+    ) -> Self {
+        Self {
+            snapshot,
+            bounds,
+            viewport_metrics,
+        }
+    }
+}
+
+/// 渲染管线向交互 widget 回传的真实物理像素 cell 尺寸。
+///
+/// 原子字段避免渲染线程与 UI 线程互相持锁。`scale_bits == 0` 表示渲染器
+/// 尚未给出实测值；widget 会暂用与渲染器相同的默认字号公式，下一帧自动校正。
+#[derive(Debug)]
+pub struct ViewportMetrics {
+    /// 单次原子读写保证 width/height/scale 来自同一次测量：
+    /// [scale f32 bits:32][height u16:16][width u16:16]。
+    packed: AtomicU64,
+}
+
+impl Default for ViewportMetrics {
+    fn default() -> Self {
+        Self {
+            packed: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ViewportMetrics {
+    pub fn store(&self, cell_width: f32, cell_height: f32, scale: f32) {
+        let width = cell_width.round().clamp(1.0, u16::MAX as f32) as u64;
+        let height = cell_height.round().clamp(1.0, u16::MAX as f32) as u64;
+        let packed = (u64::from(scale.to_bits()) << 32) | (height << 16) | width;
+        self.packed.store(packed, Ordering::Release);
+    }
+
+    pub fn cell_size_for(&self, scale: f32) -> (f32, f32) {
+        let packed = self.packed.load(Ordering::Acquire);
+        let measured_scale_bits = (packed >> 32) as u32;
+        if measured_scale_bits == scale.to_bits() {
+            let width = (packed & 0xffff) as u16;
+            let height = ((packed >> 16) & 0xffff) as u16;
+            if width > 0 && height > 0 {
+                return (f32::from(width), f32::from(height));
+            }
+        }
+
+        let font_size = std::env::var("VIDA_FONT_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| *value >= 8.0 && *value <= 48.0)
+            .unwrap_or(16.0);
+        (
+            (font_size * 0.6 * scale).round().max(1.0),
+            (font_size * 1.25 * scale).round().max(1.0),
+        )
     }
 }
 
@@ -145,6 +204,11 @@ impl IcedPrimitive for TermPrimitive {
             reset_atlas(pipeline, device, queue, scale);
             pipeline.metrics = measure_font_at(pipeline, scale);
         }
+        self.viewport_metrics.store(
+            pipeline.metrics.cell_width,
+            pipeline.metrics.cell_height,
+            pipeline.metrics.scale,
+        );
 
         let version = self.snapshot.version;
         // O(1) 跳过：grid 未变化不重建任何东西
@@ -1175,7 +1239,11 @@ mod tests {
         // 快照 1：'A'
         let mut grid_a = ClientGrid::new(1, 1);
         grid_a.apply_frame(&frame_with('A'));
-        let p1 = TermPrimitive::new(Arc::new(grid_a), Rectangle::default());
+        let p1 = TermPrimitive::new(
+            Arc::new(grid_a),
+            Rectangle::default(),
+            Arc::new(ViewportMetrics::default()),
+        );
         let _ = p1.build_geometry(&mut pipeline, 0.0, 0.0);
         // 'A' 从 (1,0) 写入，宽度约 10px → 占 bytes [4, 44)
         let first_a = pipeline
@@ -1191,7 +1259,11 @@ mod tests {
         // 快照 2：新字符 '你'（第二帧）
         let mut grid_b = ClientGrid::new(1, 1);
         grid_b.apply_frame(&frame_with('你'));
-        let p2 = TermPrimitive::new(Arc::new(grid_b), Rectangle::default());
+        let p2 = TermPrimitive::new(
+            Arc::new(grid_b),
+            Rectangle::default(),
+            Arc::new(ViewportMetrics::default()),
+        );
         let _ = p2.build_geometry(&mut pipeline, 0.0, 0.0);
         let after = pipeline
             .atlas_data
@@ -1486,7 +1558,11 @@ mod tests {
                 },
             ],
         });
-        let prim = TermPrimitive::new(Arc::new(grid), Rectangle::default());
+        let prim = TermPrimitive::new(
+            Arc::new(grid),
+            Rectangle::default(),
+            Arc::new(ViewportMetrics::default()),
+        );
         let geom = prim
             .build_geometry(&mut pipeline, 10.7, 5.3)
             .expect("build_geometry 应成功");

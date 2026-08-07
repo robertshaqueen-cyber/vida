@@ -1,4 +1,4 @@
-//! 调试终端屏（M2b-1）：只读显示一个本地会话的终端画面。
+//! 调试终端屏（M2b-2）：显示并操作一个本地会话。
 //!
 //! 本轮不接标签页/连接面板/启动流程（M2b-3 才做）——
 //! 通过 VidaApp 的 debug 入口（S3 主界面底部调试按钮）进入。
@@ -10,10 +10,11 @@ use iced::{Element, Length};
 
 use crate::app::AppMessage;
 use crate::term::client_grid::ClientGrid;
+use crate::term::primitive::ViewportMetrics;
 use crate::term::widget;
 
 /// 终端会话状态（调试屏持有）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TerminalSession {
     pub session_id: String,
     pub grid: ClientGrid,
@@ -23,6 +24,8 @@ pub struct TerminalSession {
     pub exit_code: Option<u32>,
     /// 需要向用户展示的提示（如「原会话已结束，已为你打开新终端」）。
     pub notice: Option<String>,
+    /// 渲染器实测的 cell 物理像素尺寸，供交互 widget 计算行列数。
+    pub viewport_metrics: Arc<ViewportMetrics>,
 }
 
 impl TerminalSession {
@@ -33,6 +36,7 @@ impl TerminalSession {
             closed: false,
             exit_code: None,
             notice: None,
+            viewport_metrics: Arc::new(ViewportMetrics::default()),
         }
     }
 
@@ -62,7 +66,13 @@ impl TerminalSession {
         } else {
             text(format!("会话 {}", self.session_id)).size(12)
         };
-        let canvas = widget::canvas(self.snapshot());
+        let canvas = widget::canvas(
+            self.snapshot(),
+            self.viewport_metrics.clone(),
+            AppMessage::TerminalInput,
+            AppMessage::TerminalPaste,
+            terminal_resize_message,
+        );
         let back = button("返回").on_press(AppMessage::CloseDebugTerminal);
         let content = column![notice_el, status, canvas, back]
             .spacing(8)
@@ -73,4 +83,8 @@ impl TerminalSession {
             .width(Length::Fill)
             .into()
     }
+}
+
+fn terminal_resize_message(cols: u16, rows: u16) -> AppMessage {
+    AppMessage::TerminalResize { cols, rows }
 }

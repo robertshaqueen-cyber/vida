@@ -855,3 +855,43 @@ Weight::BOLD，下划线画 1.5px 线，反色用黑字+白底）。
 
 **验证要点**：row 2 的 `你好世界abc你好`，4 个中文 = 8 列，
 `abc` 起始应在第 16 列——所有者截图确认对齐。
+
+## M2b-2 终端输入、粘贴与 resize（2026-08-08）
+
+### 人的输入路径
+
+`TermCanvas` 是 iced focusable widget。进入终端屏时自动聚焦，点击画布也会聚焦；
+只有 focused 且窗口 focused 时才消费键盘和 IME 事件。普通字符使用 iced
+`KeyPressed.text` 的 UTF-8，中文等组合输入使用 `InputMethod::Commit`，并持续请求
+`Purpose::Terminal`，候选窗锚点取终端光标所在 cell。
+
+普通字符、Ctrl+A-Z/Ctrl+[ 等控制字节、方向键/Home/End/Delete/Page/F1-F12
+在 GUI 内转换为标准终端字节。`SessionInput` 的 daemon 语义不变：收到什么就原样
+写入 PTY，不做命令解释或换行转换，AI 也不进入人的输入路径。
+
+逐键输入禁止使用“一键一个异步 Task”：多个 Task 的调度顺序不等于键盘事件顺序。
+`WsClient::send_queued` 在 iced update 内同步进入单一 mpsc，后台 WebSocket writer
+按队列顺序发送；它只用于不读取响应的输入和 resize，不用于业务请求。
+
+### 粘贴必须与普通输入分流
+
+GUI 实测发现：把多行剪贴板直接走 `SessionInput` 会让 shell 逐行立即执行，这是
+终端安全问题。新增 `PasteSession`，daemon 查询 alacritty `TermMode::BRACKETED_PASTE`：
+
+- 启用时写入 `ESC[200~ + 内容 + ESC[201~`，多行先进入 shell 编辑缓冲区，用户按
+  Enter 后才执行；同时删除内容中的 ESC，防止伪造结束边界后注入控制序列。
+- 未启用时保持原内容，兼容不支持 bracketed paste 的程序。
+
+不得为了省接口而把所有输入都包成 paste；这会破坏控制键和 TUI。密码、私钥和
+剪贴板内容均不得写日志。
+
+### resize 使用同一份真实字体度量
+
+渲染管线把当前 scale 下实测的物理像素 `cell_width/cell_height` 原子回传给 widget。
+行列计算为 `floor(logical_bounds × scale / physical_cell)`，范围限制 1–1000。
+窗口变化只有跨过一个完整 cell、行列数真的改变时才发送 `ResizeSession`，因此无需
+常驻 debounce timer，空闲 CPU 仍为零。
+
+GUI 收到新尺寸时先重建 `ClientGrid`，daemon 随后在同一个请求中同时执行
+`Term::resize` 与 PTY ioctl。scale 变化时先用同公式的保守值，渲染器给出真实度量后
+下一帧自动校正，避免 Retina/跨显示器时逻辑像素与物理像素混用。
