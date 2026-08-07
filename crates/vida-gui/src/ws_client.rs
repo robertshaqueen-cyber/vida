@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -51,14 +52,51 @@ pub type DaemonResult<T> = std::result::Result<T, DaemonError>;
 
 type PendingMap = HashMap<u64, oneshot::Sender<DaemonResult<serde_json::Value>>>;
 
+/// 服务端推送消息（非请求-响应路径的旁路出口）。
+#[derive(Debug, Clone)]
+pub enum PushMsg {
+    /// 终端二进制帧（已解出 session_id，bytes 为完整 payload）。
+    Frame { session_id: String, bytes: Vec<u8> },
+    /// 会话结束事件。exit_code 缺失时为 None（未知退出码，不伪造 0）。
+    SessionClosed {
+        session_id: String,
+        exit_code: Option<u32>,
+    },
+}
+
+/// 推送订阅注册表：session_id → 推送出口。
+/// 多路复用：同一连接可订阅多个会话（daemon M2b-1 支持）。
+/// 用 unbounded channel：iced 的 Subscription stream 内部持有 receiver
+/// （不经 Message 传递，Message 只需 PushMsg 数据本身可 Clone）。
+type PushRegistry = Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<PushMsg>>>>;
+
 #[derive(Clone)]
 pub struct WsClient {
     tx: mpsc::UnboundedSender<(WsRequest, oneshot::Sender<DaemonResult<serde_json::Value>>)>,
+    /// 推送注册表（后台任务写入，subscribe 返回接收端）。
+    push_registry: PushRegistry,
 }
 
 impl std::fmt::Debug for WsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WsClient").finish()
+    }
+}
+
+// iced Subscription 的 data 需要 Hash + PartialEq：
+// 以 push_registry 的 Arc 指针为 identity——同一连接多次构造相同，
+// 重连（新 Arc）自动产生新 identity → iced 重启订阅 stream。
+impl PartialEq for WsClient {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.push_registry, &other.push_registry)
+    }
+}
+
+impl Eq for WsClient {}
+
+impl std::hash::Hash for WsClient {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.push_registry).hash(state);
     }
 }
 
@@ -147,6 +185,8 @@ impl WsClient {
             WsRequest,
             oneshot::Sender<DaemonResult<serde_json::Value>>,
         )>();
+        let push_registry: PushRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let push_registry_task = push_registry.clone();
 
         tokio::spawn(async move {
             let mut pending: PendingMap = HashMap::new();
@@ -167,8 +207,12 @@ impl WsClient {
                                             let _ = sender.send(Err(DaemonError { message, category }));
                                         }
                                     }
-                                    Err(_) => {}
+                                    // 非响应文本（如 Event 推送）走旁路出口
+                                    Err(_) => forward_text_push(&text, &push_registry_task),
                                 }
+                            }
+                            Ok(Message::Binary(bytes)) => {
+                                forward_binary_push(&bytes, &push_registry_task);
                             }
                             Ok(Message::Close(_)) => break,
                             Err(_) => break,
@@ -187,7 +231,28 @@ impl WsClient {
             }
         });
 
-        Ok(Self { tx })
+        Ok(Self { tx, push_registry })
+    }
+
+    /// 订阅某会话的推送：注册一个发送端，返回接收端。
+    /// 重连后注册表是新的（WsClient 重建），订阅方必须重新订阅。
+    pub fn subscribe(&self, session_id: &str) -> mpsc::UnboundedReceiver<PushMsg> {
+        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let mut reg = match self.push_registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reg.insert(session_id.to_string(), push_tx);
+        push_rx
+    }
+
+    /// 取消订阅：移除注册，不再转发该会话的推送。
+    pub fn unsubscribe(&self, session_id: &str) {
+        let mut reg = match self.push_registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reg.remove(session_id);
     }
 
     /// Send a request with params.
@@ -288,6 +353,81 @@ impl WsClient {
     pub async fn reveal_credential(&self, host_id: &str) -> DaemonResult<serde_json::Value> {
         self.send("RevealCredential", serde_json::json!({"host_id": host_id}))
             .await
+    }
+}
+
+/// 二进制帧头格式（与 daemon encode_frame 对应）：
+/// [0x01][session_id_len: u16 BE][session_id][payload]
+fn decode_frame_header(bytes: &[u8]) -> Option<(String, &[u8])> {
+    if bytes.len() < 3 || bytes[0] != 0x01 {
+        return None;
+    }
+    let id_len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+    if 3 + id_len > bytes.len() {
+        return None;
+    }
+    let id = String::from_utf8(bytes[3..3 + id_len].to_vec()).ok()?;
+    Some((id, &bytes[3 + id_len..]))
+}
+
+/// 把二进制推送帧转发给对应会话的订阅者。
+/// 解码失败（非终端帧）时静默丢弃——不是本客户端的职责。
+fn forward_binary_push(bytes: &[u8], registry: &PushRegistry) {
+    let Some((session_id, payload)) = decode_frame_header(bytes) else {
+        return;
+    };
+    let reg = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(tx) = reg.get(&session_id) {
+        let _ = tx.send(PushMsg::Frame {
+            session_id,
+            bytes: payload.to_vec(),
+        });
+    }
+}
+
+/// 把文本 Event 推送（如 session_closed）转发给对应会话的订阅者。
+#[derive(serde::Deserialize)]
+struct WsEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    event: String,
+    data: serde_json::Value,
+}
+
+fn forward_text_push(text: &str, registry: &PushRegistry) {
+    let event: WsEvent = match serde_json::from_str(text) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if event.event_type != "Event" {
+        return;
+    }
+    if event.event.as_str() == "session_closed" {
+        // session_id 缺失/类型错误：记 warn 并丢弃，不构造空串——
+        // 否则 reg.get("") 查不到订阅者，事件被静默吞掉。
+        let Some(session_id) = event.data.get("session_id").and_then(|v| v.as_str()) else {
+            tracing::warn!("session_closed 事件缺少有效的 session_id: {}", event.data);
+            return;
+        };
+        // exit_code 缺失 → None（未知退出码），不伪造 0。
+        let exit_code = event
+            .data
+            .get("exit_code")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let reg = match registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(tx) = reg.get(session_id) {
+            let _ = tx.send(PushMsg::SessionClosed {
+                session_id: session_id.to_string(),
+                exit_code,
+            });
+        }
     }
 }
 

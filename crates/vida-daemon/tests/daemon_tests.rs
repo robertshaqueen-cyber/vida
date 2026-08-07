@@ -1538,3 +1538,408 @@ async fn pty_yos_bandwidth_bounded() {
         total_bytes
     );
 }
+
+// -----------------------------------------------------------------------
+// 单连接多订阅（M2b-1）：同一 WS 连接订阅两个会话，帧带各自 session_id
+// -----------------------------------------------------------------------
+
+/// 解帧头：返回 (session_id, 剩余 payload)。
+fn decode_frame_header(bytes: &[u8]) -> (String, &[u8]) {
+    assert_eq!(bytes[0], 0x01, "帧头魔法字节");
+    let id_len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+    let id = String::from_utf8(bytes[3..3 + id_len].to_vec()).unwrap();
+    (id, &bytes[3 + id_len..])
+}
+
+/// 解码帧 payload 为行文本（测试用，宽松解析：任何越界即停止）。
+/// 格式：[seq:8][cursor_row:2][cursor_col:2][cursor_visible:1][line_count:2]
+/// 每行：[row:2][start:2][end:2][run_count:2]
+/// 每 run：[len:2][flags:1][fg tag:1(+payload)][bg tag:1(+payload)][char_len:1][chars]
+fn decode_frame_lines(payload: &[u8]) -> Vec<String> {
+    let mut pos = 15usize; // seq(8) + cursor(4) + visible(1) + line_count(2)
+    if payload.len() < pos {
+        return Vec::new();
+    }
+    let line_count = u16::from_be_bytes([payload[13], payload[14]]) as usize;
+    let mut rows: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    for _ in 0..line_count {
+        if pos + 8 > payload.len() {
+            break;
+        }
+        let row = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        pos += 8; // row + start + end + run_count
+        let run_count = u16::from_be_bytes([payload[pos - 2], payload[pos - 1]]) as usize;
+        let mut line = String::new();
+        for _ in 0..run_count {
+            if pos + 3 > payload.len() {
+                break;
+            }
+            // run_len = 该 run 覆盖的列数：字符需重复 run_len 次渲染
+            let run_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+            pos += 3; // len(2) + flags(1)
+            // fg tag
+            let fg_tag = payload[pos];
+            pos += 1;
+            match fg_tag {
+                0x00 => {}
+                0x01 => pos += 1,
+                0x02 => pos += 3,
+                _ => return Vec::new(),
+            }
+            // bg tag
+            let bg_tag = payload[pos];
+            pos += 1;
+            match bg_tag {
+                0x00 => {}
+                0x01 => pos += 1,
+                0x02 => pos += 3,
+                _ => return Vec::new(),
+            }
+            if pos + 1 > payload.len() {
+                break;
+            }
+            let char_len = payload[pos] as usize;
+            pos += 1;
+            if pos + char_len > payload.len() {
+                break;
+            }
+            if let Ok(s) = std::str::from_utf8(&payload[pos..pos + char_len]) {
+                for _ in 0..run_len {
+                    line.push_str(s);
+                }
+            }
+            pos += char_len;
+        }
+        rows.insert(row, line);
+    }
+    rows.into_values().collect()
+}
+
+/// 同一连接订阅两个会话：两个会话的帧都能收到，session_id 各自正确；
+/// Unsubscribe 其中一个后，另一个仍正常推送。
+#[tokio::test]
+async fn single_connection_multi_subscribe() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut ws, mut reader) = connect(addr).await;
+
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    let resp = send_recv(&mut ws, &mut reader, &auth).await;
+    assert_eq!(resp["type"], "Ok");
+
+    // 打开两个会话
+    let mut sids = Vec::new();
+    for i in 0..2 {
+        let open = format!(
+            r#"{{"method":"OpenLocalSession","params":{{"cols":80,"rows":24}},"id":{}}}"#,
+            2 + i
+        );
+        let resp = send_recv(&mut ws, &mut reader, &open).await;
+        assert_eq!(resp["type"], "Ok");
+        sids.push(resp["result"]["session_id"].as_str().unwrap().to_string());
+    }
+
+    // 同一连接订阅两个会话
+    for (i, sid) in sids.iter().enumerate() {
+        let sub = format!(
+            r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":{}}}"#,
+            sid,
+            4 + i
+        );
+        let resp = send_recv(&mut ws, &mut reader, &sub).await;
+        assert_eq!(resp["type"], "Ok", "订阅失败: {}", resp);
+    }
+
+    // 向两个会话各发一条 echo，触发增量帧
+    for (i, sid) in sids.iter().enumerate() {
+        // "echo subN\r" = e c h o _ s u b N
+        let mut data = b"echo sub".to_vec();
+        data.push(b'0' + i as u8);
+        data.push(0x0D);
+        let input = format!(
+            r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{:?}}},
+               "id":{}}}"#,
+            sid,
+            data,
+            6 + i
+        );
+        // 不等待响应（二进制帧会抢先），直接发送
+        ws.send(Message::Text(input.into())).await.unwrap();
+    }
+
+    // 收集 3 秒内两个会话的帧，验证 session_id 各自正确
+    let start = std::time::Instant::now();
+    let mut received_a = 0usize;
+    let mut received_b = 0usize;
+    let mut wrong_id = 0usize;
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let (sid, _) = decode_frame_header(&bytes);
+                        if sid == sids[0] {
+                            received_a += 1;
+                        } else if sid == sids[1] {
+                            received_b += 1;
+                        } else {
+                            wrong_id += 1;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    assert_eq!(wrong_id, 0, "收到未知 session_id 的帧");
+    assert!(
+        received_a > 0 && received_b > 0,
+        "两个会话都应收到帧: a={} b={}",
+        received_a,
+        received_b
+    );
+
+    // Unsubscribe 会话 A，会话 B 应继续推送
+    let unsub_a = format!(
+        r#"{{"method":"UnsubscribeSession","params":{{"session_id":"{}"}},"id":20}}"#,
+        sids[0]
+    );
+    let resp = send_recv(&mut ws, &mut reader, &unsub_a).await;
+    assert_eq!(resp["type"], "Ok", "取消订阅失败: {}", resp);
+
+    // 会话 B 继续产生输出（echo hello\r）
+    let input_b = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":[101,99,104,111,32,104,105,13]}},
+           "id":21}}"#,
+        sids[1]
+    );
+    ws.send(Message::Text(input_b.into())).await.unwrap();
+
+    let start2 = std::time::Instant::now();
+    let mut b_after = 0usize;
+    let mut a_after = 0usize;
+    while start2.elapsed() < std::time::Duration::from_secs(2) {
+        tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let (sid, _) = decode_frame_header(&bytes);
+                        if sid == sids[1] {
+                            b_after += 1;
+                        } else if sid == sids[0] {
+                            a_after += 1;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    assert_eq!(a_after, 0, "取消订阅后会话 A 不应再收到帧");
+    assert!(b_after > 0, "取消订阅 A 后会话 B 应继续推送");
+}
+
+/// 断开重连后重新订阅必须拿全量帧且画面恢复到断线前（规格 4.3）：
+/// 1. 打开会话，发送 'echo RECONNECT_MARKER\n' 并等待输出
+/// 2. 断开连接（会话属于 daemon，保留）
+/// 3. 新连接，用【同一个 session_id】SubscribeSession
+/// 4. 断言全量帧中包含 RECONNECT_MARKER（画面恢复到断线前）
+/// 5. 断言 ListSessions 数量未增加（没有偷偷新开会话）
+#[tokio::test]
+async fn reconnect_resubscribe_gets_full_frame() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, token, _dir) = start_daemon().await;
+    // 连接 A
+    let (mut ws_a, mut reader_a) = connect(addr).await;
+    let auth_a = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    let resp = send_recv(&mut ws_a, &mut reader_a, &auth_a).await;
+    assert_eq!(resp["type"], "Ok");
+
+    let resp = send_recv(
+        &mut ws_a,
+        &mut reader_a,
+        r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":24},"id":2}"#,
+    )
+    .await;
+    let sid = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    let sub_a = format!(
+        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
+        sid
+    );
+    let resp = send_recv(&mut ws_a, &mut reader_a, &sub_a).await;
+    assert_eq!(resp["type"], "Ok");
+
+    // 在会话中留下可见标记（画面恢复的判据）
+    let mut data: Vec<u8> = b"echo RECONNECT_MARKER".to_vec();
+    data.push(0x0D);
+    let input = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{:?}}},"id":4}}"#,
+        sid, data
+    );
+    ws_a.send(Message::Text(input.into())).await.unwrap();
+
+    // 等 shell 完全就绪再发送（排除输入过早进入 PTY 队列的时序问题）
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // 等待标记确实出现在连接 A 的帧里（确保 echo 已执行且未滚动出屏）
+    let deadline_a = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut marker_on_a = false;
+    while tokio::time::Instant::now() < deadline_a {
+        match reader_a.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let (_, payload) = decode_frame_header(&bytes);
+                let lines = decode_frame_lines(payload);
+                let text: String = lines.join("\n");
+                if text.contains("RECONNECT_MARKER") {
+                    marker_on_a = true;
+                    break;
+                }
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => panic!("read error: {:?}", e),
+            None => panic!("connection closed while waiting for marker"),
+        }
+    }
+    assert!(marker_on_a, "断线前 marker 应出现在连接 A 的帧中");
+
+    // 断开连接 A（会话属于 daemon，保留）
+    drop(ws_a);
+    drop(reader_a);
+
+    // 连接 B：同一会话重新订阅
+    let (mut ws_b, mut reader_b) = connect(addr).await;
+    let auth_b = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    let resp = send_recv(&mut ws_b, &mut reader_b, &auth_b).await;
+    assert_eq!(resp["type"], "Ok");
+
+    // 记录断线前的会话数量
+    let resp = send_recv(
+        &mut ws_b,
+        &mut reader_b,
+        r#"{"method":"ListSessions","params":{},"id":2}"#,
+    )
+    .await;
+    let sessions_before = resp["result"].as_array().map(|a| a.len()).unwrap_or(0);
+
+    let sub_b = format!(
+        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
+        sid
+    );
+    let resp = send_recv(&mut ws_b, &mut reader_b, &sub_b).await;
+    assert_eq!(resp["type"], "Ok", "重新订阅同一会话失败: {}", resp);
+
+    // 断言收到的帧包含 RECONNECT_MARKER（画面恢复到断线前）
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut marker_found = false;
+    while tokio::time::Instant::now() < deadline {
+        match reader_b.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let (sid_b, payload) = decode_frame_header(&bytes);
+                assert_eq!(sid_b, sid, "帧的 session_id 应正确");
+                let lines = decode_frame_lines(payload);
+                let text: String = lines.join("\n");
+                if text.contains("RECONNECT_MARKER") {
+                    marker_found = true;
+                    break;
+                }
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => panic!("read error: {:?}", e),
+            None => panic!("connection closed before full frame"),
+        }
+    }
+    assert!(
+        marker_found,
+        "重新订阅后的全量帧应包含断线前的输出（RECONNECT_MARKER）"
+    );
+
+    // 断言没有偷偷新开会话
+    let resp = send_recv(
+        &mut ws_b,
+        &mut reader_b,
+        r#"{"method":"ListSessions","params":{},"id":4}"#,
+    )
+    .await;
+    let sessions_after = resp["result"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        sessions_after, sessions_before,
+        "重连不应新增会话（旧会话应被复用）"
+    );
+}
+
+// -----------------------------------------------------------------------
+// 配置目录（首次启动）：不存在时自动创建；不可写时给人话错误（不 panic）
+// -----------------------------------------------------------------------
+
+/// VIDA_CONFIG_DIR 指向不存在的路径 → 启动成功且目录被创建。
+#[test]
+fn config_dir_created_if_missing() {
+    // poison 容忍：并行测试中其他测试失败会 poison 锁，不应连带失败
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let base = tempfile::tempdir().unwrap();
+    let missing = base.path().join("not-yet-created");
+    assert!(!missing.exists(), "前置条件：目录不应存在");
+    unsafe { std::env::set_var("VIDA_CONFIG_DIR", &missing) };
+
+    // 启动路径（与 main.rs 一致）：ensure_dirs 后再写 token
+    vida_core::config::ensure_dirs().unwrap();
+    let token = vida_daemon::ws_server::load_or_create_token().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(
+        missing.join("daemon.token").exists(),
+        "token 应写入新创建的目录"
+    );
+    assert!(missing.join("backups").is_dir(), "backups 子目录应被创建");
+
+    unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
+}
+
+/// VIDA_CONFIG_DIR 指向不可写路径 → 报出可读错误信息，不 panic。
+#[cfg(unix)]
+#[test]
+fn config_dir_unwritable_gives_clear_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let base = tempfile::tempdir().unwrap();
+    let readonly = base.path().join("readonly");
+    std::fs::create_dir(&readonly).unwrap();
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+    unsafe { std::env::set_var("VIDA_CONFIG_DIR", &readonly) };
+
+    let err = vida_core::config::ensure_dirs().expect_err("应返回错误");
+    let msg = format!("{:#}", err);
+    assert!(
+        (msg.contains("无法创建配置目录") || msg.contains("无法创建备份目录"))
+            && msg.contains("请检查权限"),
+        "错误应是人话（含目录与权限提示），实际: {}",
+        msg
+    );
+    assert!(!msg.contains("os error"), "不应暴露原始 os error: {}", msg);
+
+    // 恢复权限便于 tempdir 清理（即使上面的断言失败也要执行）
+    let _ = std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755));
+    unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
+}

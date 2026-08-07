@@ -209,6 +209,10 @@ cargo run --release --bin vida
 ## M2a 终端核心 — 验收清单
 
 > 全部使用 `VIDA_CONFIG_DIR=/tmp/vida-m2a` 隔离，不触碰真实配置。
+>
+> **不需要手动 mkdir**：daemon 启动时自动创建配置目录及 `backups/`
+> 子目录（`ensure_dirs`，M2b-1 起）。目录缺失时首次启动会自行创建；
+> 不可写时给出人话错误而非 os error。
 
 ### 指标（M2a-spec 第 8 节，实测）
 
@@ -416,3 +420,46 @@ cargo run --release -p vida-term-test -- send "$SID" '\x03'
 vmmap --summary $DAEMON_PID | grep "Physical footprint"
 ```
 
+
+## M2b-1 实时渲染 — 验收清单（检查点 B）
+
+### 指标
+
+| 指标 | 说明 |
+|---|---|
+| 空闲 CPU | 应 ≈ 0%（无推送帧时 GUI 不重绘、订阅挂起） |
+| `yes` 持续输出时 GUI CPU | 记录实测值（yes 命令从 vida-term-test 发出） |
+| 单终端 GUI 内存增量 | `vmmap --summary <pid>` Physical footprint，注意 scale factor |
+
+### 检查点 B 实测结果（2026-08-07，1920×1080 非 HiDPI，scale=1）
+
+| 指标 | 实测值 |
+|---|---|
+| 空闲 CPU | **0.0%**（终端屏打开、无输出时；无常驻定时器） |
+| `yes` 持续输出时 GUI CPU | **18-41%**（满屏 60fps 真实渲染：每帧重建几何 + 字形光栅化 + 上传） |
+| 单终端标签内存增量 | **16.9M**（33.6 → 50.5M，首标签含 iced pipeline 缓存：图集 4MB + 字形缓存；后续标签复用） |
+| 字体 | Menlo-Regular（显式指定）+ PingFangSC-Regular（中文 fallback） |
+| cell 尺寸（scale=1） | 10×20，ascent=16 |
+
+**验收结论**：echo hello / ls --color / vim / 中文 ls 全部正确；空闲零 CPU；
+daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
+
+### 手动验收步骤（GUI 只读，命令从 vida-term-test 发）
+
+1. 启动 daemon（保持运行），启动 GUI，进入主界面后点击左侧「▮_」调试终端按钮
+   → 预期：出现终端画面，显示 shell 提示符
+2. `vida-term-test send <SID> "echo hello\r"`
+   → 预期：GUI 实时显示 `hello`
+3. `vida-term-test send <SID> "ls --color\r"`
+   → 预期：目录列表颜色正确（绿色可执行文件、蓝色目录等）
+4. `vida-term-test send <SID> "vim\r"` → 等待界面绘制 → `:q!` 退出
+   → 预期：vim 界面正确显示
+5. 创建一个含中文文件名的目录后 `ls`
+   → 预期：中文文件名列对齐正确（宽字符占两列，不串列）
+6. 空闲观察（无任何输入 10 秒）：GUI CPU ≈ 0%
+7. `vida-term-test send <SID> "yes\r"` 持续 10 秒：观察 GUI CPU 与内存增量，
+   然后 Ctrl+C（`data:[3]`）停止
+8. 多订阅验证：GUI 打开调试终端的同时，用 vida-term-test 的
+   subscribe 命令订阅同一会话（若 CLI 支持）；否则由 daemon 集成测试
+   `single_connection_multi_subscribe` 覆盖（同一连接订阅两会话、
+   取消一个后另一个正常）

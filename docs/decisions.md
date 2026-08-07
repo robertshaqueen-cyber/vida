@@ -737,6 +737,99 @@ WIDE 位提供，客户端不再自行判定，两处判定必须一致。
 M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
 客户端不得再用字符数参与任何几何计算。
 
+**字形位图格式处理**（M2b-1 评审）：`img.content` 三种格式分支：
+- `Mask`（1 字节/像素）：主路径——cosmic_text 0.15 在 swash.rs 硬编码
+  `.format(Format::Alpha)`，实测 'A'/'你'/'a'/'粗' 均为 Mask，无暴露的
+  子像素设置（无需从源头改）
+- `SubpixelMask`（4 字节/像素 RGBA）：取 RGB 均值作 alpha（终端灰度渲染，
+  不做子像素抗锯齿）。防御分支——cosmic_text 当前不会产出，版本升级后可能
+- `Color`（彩色字形，如 emoji）：**已知限制——本轮不支持**，warn + 跳过该
+  字形（背景照画）。M2b-2/3 或后续里程碑按需实现
+- 显式长度校验 + warn（禁止 `.min(len-1)` 钳位——钳位把越界变成
+  「重复读最后一字节」，让错误信号消失只表现为画错）
+
+**物理像素约定**（M2b-1 评审，Retina 渲染）：内部一律用物理像素，
+只有与 iced 布局交互（widget bounds、鼠标坐标）时才换算。
+- `measure_font(scale)`：Metrics 字号 × scale（方式 B）——所有测量值
+  （advance/ascent/位图尺寸）同一来源同一单位，无手工换算；
+  physical() 的 scale 参数与字号分离时容易漏乘
+- **cell 尺寸一律取整为整数物理像素**（真实终端 Alacritty/WezTerm/
+  iTerm 同）：advance 实测 19.2 若直接用，每列 x=0/19.2/38.4/57.6...
+  落在非整数像素边界 → quad 覆盖半个物理像素 → 字形边缘重采样发虚，
+  且每列小数部分不同整行参差不齐。round() 最接近真实 advance，
+  列累计误差最小
+- scale=2 取整后实测：cell_width=19px、cell_height=40px、
+  ascent=29px（原始 19.2/40/28.5）。逻辑尺寸只用于与 iced 布局交互；
+  取整后 cell 宽度变化会影响列数换算（M2b-2 resize 用物理像素换算）
+- 字形 quad 整数对齐：glyph_x = cell_x + placement.left（left 是
+  整数）、glyph_y = (row_y + ascent).round() - placement.top、
+  下划线高度 1px（1.5px 曾落在非整数边界）。测试断言所有 quad
+  顶点坐标为整数
+- 字形缓存 key = (char, bold, scale.to_bits())：跨 DPI 拖动窗口时
+  scale 变化 → 旧字形全部失效，reset_atlas（清缓存/图集归零/cursor
+  重置/全量重传）后按新 scale 重建
+- quad 坐标（origin×scale + col×cw_physical）与 uniform screen_size
+  （physical_size）同一物理空间
+- 采样器 Nearest（min/mag/mipmap）——字形按物理像素精确光栅化，
+  无插值
+- **sRGB 处理**：iced 0.14 默认 GAMMA_CORRECTION=true → surface 为
+  sRGB 格式（iced 自身文字 CPU 端 into_linear 再输出）。终端管线
+  颜色是 sRGB 值，直接输出会被 GPU 二次编码 → 发灰。fs_main 在
+  surface 为 sRGB 时输出前 pow(2.2) 转 linear（uniform gamma flag
+  自适应，alpha 不参与 gamma）
+- 图集 1024×1024：2x 下 226 典型字符实测占用 15.0%（512² 时为
+  58.6%，粗体字形是独立位图会再翻倍，故保守扩 1024）。纹理
+  4MB，可接受。溢出有 warn（非静默丢弃）
+
+**终端字体显式指定**（M2b-1 评审，字体观感根因）：ASCII 曾用
+`CourierNewPSMT`（Courier New）——「发虚/和 GUI 原生字体不一样」
+的根因，与渲染管线无关。
+- **引入原因**：为绕开 GB18030 Bitmap（无矢量轮廓）删除所有含
+  "Bitmap" 的字体，副作用是**改变了 monospace fallback 顺序**，
+  Courier New（fontdb 加载顺序靠前）排到 Menlo 之前
+- **修正**：主字体显式 `Family::Name("Menlo")`（产品决策，不依赖
+  fallback 顺序）；`VIDA_FONT_FAMILY` 可覆盖；缺失时按候选回落
+  `Menlo → SF Mono → Monaco → 默认 monospace` 并 warn；启动日志
+  打印 'A'/'你' 实际字体名（log_face_names）
+- 中文仍走 fallback（BIZ UDGothic 等有矢量轮廓的字体）；
+  「删除含 Bitmap 字体」逻辑保留（防止位图字体混入），其副作用
+  由显式主字体消除
+- 配置接口：`VIDA_FONT_SIZE`（默认 16，范围 8-48）、
+  `VIDA_FONT_FAMILY`（默认 Menlo）——M2b-3 设置页接入时迁移为
+  Settings 字段
+- Menlo 16px 实测（scale=1）：cell_width=10、cell_height=20、
+  ascent=14（decisions.md 本轮记录）
+
+**排查记录与教训（M2b-1 完整链路）**：
+- **删除 Bitmap 字体的副作用**：为绕开 GB18030 Bitmap（无矢量轮廓）
+  删除所有含 "Bitmap" 的字体，副作用是改变了 monospace fallback 顺序，
+  ASCII 落到 Courier New（旧式打字机衬线体，笔画细/x-height 低）。
+  **教训：终端字体必须显式指定 family，不能依赖 fallback 顺序；
+  排查字体问题时第一步就该打印实际使用的字体名**（log_face_names）
+- **图集 cursor 必须跨帧持久**：每帧重置 next_x/next_y 会让新字形
+  覆盖已写入的字形（ASCII 先写入靠前最易被覆盖）。测试
+  atlas_cursor_must_persist_across_frames 覆盖
+- **write_texture 的 layout 必须匹配源缓冲布局**：bytes_per_row 需
+  256 对齐且与源数据行距一致，因此不能逐字形上传（字形宽 < 256
+  无法对齐）；方案为维护 CPU 完整图集 + 按行区间上传（行距恒
+  ATLAS*4=4096）。测试 atlas_row_upload_passes_validation 覆盖
+- **环境假设必须先测量再推理**：本机 1920×1080 非 HiDPI、scale=1。
+  此前多轮基于「Retina 2x」的推断（glyph.physical scale、整数
+  cell、gamma）均不成立或无关——scale=1 时字形 1:1 光栅化本无
+  模糊。字体观感问题的真正根因是字体选择（Courier New）
+- **GUI 日志排查**：tracing filter 必须用 bin 名（"vida"）而非
+  package 名（"vida_gui"）——module_path! 以 bin 名为前缀；
+  RUST_LOG 被 shell 设置时可能吞掉全部 GUI 日志（改用 VIDA_LOG）
+
+**已知渲染差异（不在 M2b-1 处理，M2b-3 或后续）**：
+1. **CJK 字距被撑开**：cell_width=10（Menlo 16px advance 取整），
+   宽字符分配 2×10=20px，但 PingFang 16px 字形实际宽约 16px，
+   靠左绘制右侧空 4px → 中文字间有空隙。Ghostty/Alacritty 的做法：
+   CJK 字形缩放填满 2 cell，或选 advance=2×ASCII 的 CJK 字体
+2. **笔画偏细，缺 stem darkening**：16px Menlo 在 1080p 非 HiDPI
+   下笔画偏细。Ghostty/Alacritty 在低 DPI 对字形 alpha 做轻微膨胀
+   补偿视觉重量。我们未做
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；

@@ -11,13 +11,13 @@
 //! cell_height = ascent + descent + line_gap（实测）
 
 #![allow(unexpected_cfgs)]
+// 历史验证工具（M2b-0）：保留原实现语义，clippy 不强制重构
+#![allow(clippy::type_complexity, clippy::too_many_arguments, clippy::ptr_arg)]
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use cosmic_text::{
-    Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache,
-};
+use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -60,11 +60,7 @@ fn rows() -> Vec<Vec<Run>> {
         // row 0: 尺子行——每列一个 '|'，验证背景/下划线/字形的列对齐
         vec![run(0, '|', 80)],
         // row 1: ASCII 基准线（与 row 2 同从第 8 列开始）
-        vec![
-            run(0, ' ', 8),
-            run(8, 'A', 26),
-            run(34, '0', 10),
-        ],
+        vec![run(0, ' ', 8), run(8, 'A', 26), run(34, '0', 10)],
         // row 2: 中文对齐测试 你好世界abc你好（abc 起始第 8+8=16 列）
         vec![
             run(0, ' ', 8),
@@ -82,41 +78,82 @@ fn rows() -> Vec<Vec<Run>> {
             run(4, '正', 1),
             run(6, '常', 1),
             run(8, ' ', 2),
-            Run { bold: true, ..run(10, '粗', 1) },
-            Run { bold: true, ..run(12, '体', 1) },
+            Run {
+                bold: true,
+                ..run(10, '粗', 1)
+            },
+            Run {
+                bold: true,
+                ..run(12, '体', 1)
+            },
             run(14, ' ', 2),
-            Run { underline: true, ..run(16, '下', 1) },
-            Run { underline: true, ..run(18, '划', 1) },
-            Run { underline: true, ..run(20, '线', 1) },
+            Run {
+                underline: true,
+                ..run(16, '下', 1)
+            },
+            Run {
+                underline: true,
+                ..run(18, '划', 1)
+            },
+            Run {
+                underline: true,
+                ..run(20, '线', 1)
+            },
             run(22, ' ', 2),
-            Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(24, '反', 1) },
-            Run { reverse: true, fg: (0, 0, 0), bg: Some((200, 200, 200)), ..run(26, '色', 1) },
+            Run {
+                reverse: true,
+                fg: (0, 0, 0),
+                bg: Some((200, 200, 200)),
+                ..run(24, '反', 1)
+            },
+            Run {
+                reverse: true,
+                fg: (0, 0, 0),
+                bg: Some((200, 200, 200)),
+                ..run(26, '色', 1)
+            },
         ],
         // row 4: 颜色
         vec![
             run(0, ' ', 4),
-            Run { fg: (255, 60, 60), ..run(4, '红', 1) },
+            Run {
+                fg: (255, 60, 60),
+                ..run(4, '红', 1)
+            },
             run(6, ' ', 2),
-            Run { fg: (60, 255, 60), ..run(8, '绿', 1) },
+            Run {
+                fg: (60, 255, 60),
+                ..run(8, '绿', 1)
+            },
             run(10, ' ', 2),
-            Run { fg: (60, 60, 255), ..run(12, '蓝', 1) },
+            Run {
+                fg: (60, 60, 255),
+                ..run(12, '蓝', 1)
+            },
             run(14, ' ', 2),
             run(16, '默', 1),
             run(18, '认', 1),
             run(20, ' ', 2),
-            Run { bg: Some((80, 80, 160)), ..run(22, '背', 1) },
-            Run { bg: Some((80, 80, 160)), ..run(24, '景', 1) },
+            Run {
+                bg: Some((80, 80, 160)),
+                ..run(22, '背', 1)
+            },
+            Run {
+                bg: Some((80, 80, 160)),
+                ..run(24, '景', 1)
+            },
         ],
         // row 5: 边界
-        vec![
-            run(0, '|', 1),
-            run(1, ' ', 78),
-            run(79, '|', 1),
-        ],
+        vec![run(0, '|', 1), run(1, ' ', 78), run(79, '|', 1)],
         // row 6: 光标（块状，位于 6,10）
         vec![
             run(0, ' ', 10),
-            Run { reverse: true, fg: (0, 0, 0), bg: Some((240, 240, 240)), ..run(10, '█', 1) },
+            Run {
+                reverse: true,
+                fg: (0, 0, 0),
+                bg: Some((240, 240, 240)),
+                ..run(10, '█', 1)
+            },
         ],
     ]
 }
@@ -131,9 +168,9 @@ const ROWS: u16 = 7;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
-    xy: [f32; 2],   // 窗口坐标 0..1
-    uv: [f32; 2],   // 图集坐标
-    color: [f32; 4],// 前景/背景色 + alpha
+    xy: [f32; 2],    // 窗口坐标 0..1
+    uv: [f32; 2],    // 图集坐标
+    color: [f32; 4], // 前景/背景色 + alpha
 }
 
 // ---------------------------------------------------------------------------
@@ -268,10 +305,26 @@ impl App {
                         bg.2 as f32 / 255.0,
                         1.0,
                     ];
-                    quads.push(Vertex { xy: [x0, row_y], uv: [0.0, 0.0], color: c });
-                    quads.push(Vertex { xy: [x1, row_y], uv: [0.0, 0.0], color: c });
-                    quads.push(Vertex { xy: [x1, row_y + ch], uv: [0.0, 0.0], color: c });
-                    quads.push(Vertex { xy: [x0, row_y + ch], uv: [0.0, 0.0], color: c });
+                    quads.push(Vertex {
+                        xy: [x0, row_y],
+                        uv: [0.0, 0.0],
+                        color: c,
+                    });
+                    quads.push(Vertex {
+                        xy: [x1, row_y],
+                        uv: [0.0, 0.0],
+                        color: c,
+                    });
+                    quads.push(Vertex {
+                        xy: [x1, row_y + ch],
+                        uv: [0.0, 0.0],
+                        color: c,
+                    });
+                    quads.push(Vertex {
+                        xy: [x0, row_y + ch],
+                        uv: [0.0, 0.0],
+                        color: c,
+                    });
                 }
 
                 // 字形：run 内每个 cell 单独排版单个字符，x 显式计算。
@@ -281,7 +334,16 @@ impl App {
                 let mut col = r.start_col;
                 for _ in 0..r.run_len {
                     let cell_x = col as f32 * cw;
-                    let glyph = self.rasterize_char(r.ch, r.bold, &mut cache, &mut atlas, &mut next_x, &mut next_y, &mut row_h, ATLAS);
+                    let glyph = self.rasterize_char(
+                        r.ch,
+                        r.bold,
+                        &mut cache,
+                        &mut atlas,
+                        &mut next_x,
+                        &mut next_y,
+                        &mut row_h,
+                        ATLAS,
+                    );
                     if let Some((gw, gh, u0, v0, u1, v1, _, top)) = glyph {
                         let fg = if r.reverse {
                             [0.0, 0.0, 0.0, 1.0]
@@ -298,8 +360,16 @@ impl App {
                         // glyph_y = baseline_y - placement.top
                         let (tw, th) = (gw as f32, gh as f32);
                         let y = row_y + self.metrics.ascent - top;
-                        quads.push(Vertex { xy: [cell_x, y], uv: [u0, v0], color: fg });
-                        quads.push(Vertex { xy: [cell_x + tw, y], uv: [u1, v0], color: fg });
+                        quads.push(Vertex {
+                            xy: [cell_x, y],
+                            uv: [u0, v0],
+                            color: fg,
+                        });
+                        quads.push(Vertex {
+                            xy: [cell_x + tw, y],
+                            uv: [u1, v0],
+                            color: fg,
+                        });
                         quads.push(Vertex {
                             xy: [cell_x + tw, y + th],
                             uv: [u1, v1],
@@ -339,10 +409,26 @@ impl App {
                             1.0,
                         ]
                     };
-                    quads.push(Vertex { xy: [ux0, uy], uv: [0.0, 0.0], color: lc });
-                    quads.push(Vertex { xy: [ux1, uy], uv: [0.0, 0.0], color: lc });
-                    quads.push(Vertex { xy: [ux1, uy + lh], uv: [0.0, 0.0], color: lc });
-                    quads.push(Vertex { xy: [ux0, uy + lh], uv: [0.0, 0.0], color: lc });
+                    quads.push(Vertex {
+                        xy: [ux0, uy],
+                        uv: [0.0, 0.0],
+                        color: lc,
+                    });
+                    quads.push(Vertex {
+                        xy: [ux1, uy],
+                        uv: [0.0, 0.0],
+                        color: lc,
+                    });
+                    quads.push(Vertex {
+                        xy: [ux1, uy + lh],
+                        uv: [0.0, 0.0],
+                        color: lc,
+                    });
+                    quads.push(Vertex {
+                        xy: [ux0, uy + lh],
+                        uv: [0.0, 0.0],
+                        color: lc,
+                    });
                 }
             }
         }
@@ -378,7 +464,13 @@ impl App {
             attrs = attrs.weight(cosmic_text::Weight::BOLD);
         }
         let text: String = ch.to_string();
-        buf.set_text(&mut self.font_system, &text, &attrs, Shaping::Advanced, None);
+        buf.set_text(
+            &mut self.font_system,
+            &text,
+            &attrs,
+            Shaping::Advanced,
+            None,
+        );
 
         // 取第一个 glyph 的位图
         let mut result = None;
@@ -404,16 +496,48 @@ impl App {
                     eprintln!("atlas overflow: ch={:?} w={} h={}", ch, gw, gh);
                     continue;
                 }
-                // 复制位图（Mask 单通道 alpha → RGBA 白字）
-                for py in 0..gh {
-                    for px in 0..gw {
-                        let src = (py * gw + px) as usize;
-                        let a = img.data[src.min(img.data.len() - 1)];
-                        let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
-                        atlas[idx] = 255;
-                        atlas[idx + 1] = 255;
-                        atlas[idx + 2] = 255;
-                        atlas[idx + 3] = a;
+                // 按 img.content 分支处理像素格式（与 M2b-1 primitive.rs 同步）：
+                // Mask 1 字节；SubpixelMask 4 字节取 RGB 均值；Color 跳过。
+                // 显式长度校验，不用钳位（钳位掩盖越界错误）。
+                match img.content {
+                    cosmic_text::SwashContent::Mask => {
+                        for py in 0..gh {
+                            for px in 0..gw {
+                                let src = (py * gw + px) as usize;
+                                let Some(&a) = img.data.get(src) else {
+                                    eprintln!("Mask 字形数据不完整: ch={:?}", ch);
+                                    continue;
+                                };
+                                let idx =
+                                    (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                                atlas[idx] = 255;
+                                atlas[idx + 1] = 255;
+                                atlas[idx + 2] = 255;
+                                atlas[idx + 3] = a;
+                            }
+                        }
+                    }
+                    cosmic_text::SwashContent::SubpixelMask => {
+                        for py in 0..gh {
+                            for px in 0..gw {
+                                let src = (py * gw + px) as usize * 4;
+                                let Some(slice) = img.data.get(src..src + 4) else {
+                                    eprintln!("SubpixelMask 字形数据不完整: ch={:?}", ch);
+                                    continue;
+                                };
+                                let a = (slice[0] as u32 + slice[1] as u32 + slice[2] as u32) / 3;
+                                let idx =
+                                    (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                                atlas[idx] = 255;
+                                atlas[idx + 1] = 255;
+                                atlas[idx + 2] = 255;
+                                atlas[idx + 3] = a as u8;
+                            }
+                        }
+                    }
+                    cosmic_text::SwashContent::Color => {
+                        eprintln!("彩色字形暂不支持，跳过: ch={:?}", ch);
+                        continue;
                     }
                 }
                 let u0 = *next_x as f32 / atlas_size as f32;
@@ -423,8 +547,14 @@ impl App {
                 *next_x += gw;
                 *row_h = (*row_h).max(gh);
                 result = Some((
-                    gw, gh, u0, v0, u1, v1,
-                    physical.y as f32, img.placement.top as f32,
+                    gw,
+                    gh,
+                    u0,
+                    v0,
+                    u1,
+                    v1,
+                    physical.y as f32,
+                    img.placement.top as f32,
                 ));
                 break;
             }
@@ -488,20 +618,22 @@ impl App {
             .write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&[w, h]));
 
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("atlas bg"),
-            layout: &renderer.pipeline.get_bind_group_layout(1),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&renderer.atlas_sampler),
-                },
-            ],
-        });
+        let bind_group = renderer
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("atlas bg"),
+                layout: &renderer.pipeline.get_bind_group_layout(1),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&renderer.atlas_sampler),
+                    },
+                ],
+            });
         renderer.atlas_texture = Some(tex);
         renderer.atlas_view = Some(view);
         renderer.bind_group = Some(bind_group);
@@ -516,7 +648,9 @@ impl App {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        renderer.queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&quads));
+        renderer
+            .queue
+            .write_buffer(&vbuf, 0, bytemuck::cast_slice(&quads));
         renderer.vertex_buffer = vbuf;
 
         // 索引：每 quad 6 个索引
@@ -529,7 +663,9 @@ impl App {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        renderer.queue.write_buffer(&ibuf, 0, bytemuck::cast_slice(&idx));
+        renderer
+            .queue
+            .write_buffer(&ibuf, 0, bytemuck::cast_slice(&idx));
         renderer.index_buffer = ibuf;
 
         // 渲染
@@ -585,10 +721,7 @@ impl ApplicationHandler for App {
 
         let attrs = Window::default_attributes()
             .with_title("vida M2b-0 term_grid")
-            .with_inner_size(LogicalSize::new(
-                COLS as f64 * 12.0,
-                ROWS as f64 * 20.0,
-            ));
+            .with_inner_size(LogicalSize::new(COLS as f64 * 12.0, ROWS as f64 * 20.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {

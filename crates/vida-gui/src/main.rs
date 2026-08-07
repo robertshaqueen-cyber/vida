@@ -1,6 +1,7 @@
 mod app;
 mod screens;
 mod secure_text_input;
+mod term;
 mod toast;
 mod ws_client;
 

@@ -5029,6 +5029,8 @@ dependencies = [
  "fontdb",
  "futures-util",
  "iced",
+ "iced_graphics",
+ "iced_wgpu",
  "objc",
  "pollster",
  "raw-window-handle",

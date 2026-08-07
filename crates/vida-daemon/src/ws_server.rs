@@ -106,10 +106,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
     let mut authenticated = false;
 
     // 推送通道：PTY 推送循环 → 桥接任务 → tokio channel → 此处
-    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<PushPayload>(8);
-    let mut push_bridge: Option<tokio::task::JoinHandle<()>> = None;
-    // 当前订阅的会话（session_closed 事件需要 session_id）
-    let mut current_session_id: Option<String> = None;
+    // (session_id, payload)：多路复用，一个连接可订阅多个会话。
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<(String, PushPayload)>(16);
+    // 每个会话一个桥接任务（key = session_id）
+    let mut push_bridges: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -126,17 +127,18 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         if let Some(cmd) = push_cmd_arc.lock().await.take() {
                             match cmd {
                                 PushCommand::Subscribe(rx, sid) => {
-                                    current_session_id = Some(sid);
                                     let tx = push_tx.clone();
+                                    let sid2 = sid.clone();
                                     // 桥接任务：轮询 std BoundedReceiver（try_recv），
-                                    // 避免阻塞 tokio runtime 线程。
-                                    push_bridge = Some(tokio::spawn(async move {
+                                    // 避免阻塞 tokio runtime 线程。按 session_id 存储，
+                                    // 同一连接可订阅多个会话（M2b-1 多路复用）。
+                                    if let Some(old) = push_bridges.insert(sid, tokio::spawn(async move {
                                         loop {
                                             match rx.try_recv() {
                                                 Some(payload) => {
                                                     // 直接传递 payload，由连接层区分
                                                     // 二进制帧 vs session_closed 事件
-                                                    if tx.send(payload).await.is_err() {
+                                                    if tx.send((sid2.clone(), payload)).await.is_err() {
                                                         break;
                                                     }
                                                 }
@@ -149,10 +151,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                                                 }
                                             }
                                         }
-                                    }));
+                                    })) {
+                                        // 重复订阅同一会话：abort 旧桥接任务
+                                        old.abort();
+                                    }
                                 }
-                                PushCommand::Unsubscribe => {
-                                    if let Some(handle) = push_bridge.take() {
+                                PushCommand::Unsubscribe(sid) => {
+                                    if let Some(handle) = push_bridges.remove(&sid) {
                                         handle.abort();
                                     }
                                 }
@@ -179,8 +184,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                 }
             }
 
-            // PTY 推送输出：二进制帧 或 session_closed 事件
-            Some(payload) = push_rx.recv() => {
+            // PTY 推送输出：二进制帧 或 session_closed 事件（含所属会话 id）
+            Some((sid, payload)) = push_rx.recv() => {
                 match payload.kind {
                     PushKind::Frame => {
                         if let Err(e) = write.send(Message::Binary(tokio_tungstenite::tungstenite::Bytes::from(payload.bytes))).await {
@@ -190,7 +195,6 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                     }
                     PushKind::SessionClosed { exit_code } => {
                         // 规格 5.3：shell 退出时推送事件
-                        let sid = current_session_id.as_deref().unwrap_or("");
                         let event = serde_json::json!({
                             "type": "Event",
                             "event": "session_closed",
@@ -209,12 +213,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
         }
     }
 
-    // 连接断开：必须中止推送桥接任务。
+    // 连接断开：必须中止全部推送桥接任务。
     // 否则桥接任务仍持有 push_tx（sender clone），channel 不会关闭，
     // 它会继续从会话的 BoundedReceiver 读帧并 send 到无人接收的
-    // channel —— 死循环浪费资源。
-    if let Some(handle) = push_bridge.take() {
+    // channel —— 死循环浪费资源。会话本身保留（不关闭）。
+    for (sid, handle) in push_bridges.drain() {
         handle.abort();
+        debug!("aborted push bridge for session {}", sid);
     }
 
     info!("Connection dropped: {}", addr);
@@ -224,8 +229,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
 enum PushCommand {
     /// 订阅推送：携带 BoundedReceiver + session_id，由连接层启动桥接任务。
     Subscribe(BoundedReceiver<PushPayload>, String),
-    /// 取消订阅：中止桥接任务。
-    Unsubscribe,
+    /// 取消订阅：按 session_id 中止对应桥接任务。
+    Unsubscribe(String),
 }
 
 async fn handle_message(
@@ -365,9 +370,9 @@ async fn handle_message(
         })
         .unwrap();
     }
-    if let Request::Pty(PtyRequest::UnsubscribeSession { .. }) = &request {
+    if let Request::Pty(PtyRequest::UnsubscribeSession { session_id }) = &request {
         // 同步检查会话存在性（持锁时间最短）
-        let has_sessions = {
+        let exists = {
             let pty = match pty_arc.read() {
                 Ok(p) => p,
                 Err(_) => {
@@ -382,21 +387,26 @@ async fn handle_message(
                     .unwrap();
                 }
             };
-            !pty.list_sessions().is_empty()
+            pty.list_sessions()
+                .iter()
+                .any(|s| s.session_id == *session_id)
         };
-        if !has_sessions {
+        if !exists {
             return serde_json::to_string(&Response {
                 id,
                 payload: ResponsePayload::Error {
                     code: -5,
-                    message: "没有活跃的会话".to_string(),
+                    message: "会话不存在".to_string(),
                     category: None,
                 },
             })
             .unwrap();
         }
         // pty guard 已释放，安全 await
-        push_cmd_out.lock().await.replace(PushCommand::Unsubscribe);
+        push_cmd_out
+            .lock()
+            .await
+            .replace(PushCommand::Unsubscribe(session_id.clone()));
         return serde_json::to_string(&Response {
             id,
             payload: ResponsePayload::Ok {
@@ -684,6 +694,15 @@ pub async fn start(state: Arc<Mutex<DaemonState>>) -> Result<SocketAddr> {
 
     // Write port file so GUI can discover the port
     let port_file = port_path()?;
+    // 防御：确保目录存在（正常启动已由 main 的 ensure_dirs 处理）
+    if let Some(dir) = port_file.parent() {
+        std::fs::create_dir_all(dir).with_context(|| {
+            format!(
+                "无法创建配置目录 {}：请检查权限（当前用户需对该路径有写权限）",
+                dir.display()
+            )
+        })?;
+    }
     std::fs::write(&port_file, addr.port().to_string())
         .with_context(|| format!("Failed to write daemon port to {}", port_file.display()))?;
 

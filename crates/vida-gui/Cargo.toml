@@ -24,15 +24,35 @@ rfd = "0.17"
 version = "= 0.14.0"
 features = ["tokio", "wgpu", "advanced"]
 
+[dependencies.cosmic-text]
+version = "0.15"
+default-features = false
+features = ["std", "swash"]
+
+[dependencies.fontdb]
+version = "0.23"
+default-features = false
+features = ["std", "fs"]
+
+[dependencies.bytemuck]
+version = "1"
+features = ["derive"]
+
+[dependencies.iced_wgpu]
+version = "= 0.14.0"
+
+[dependencies.wgpu]
+version = "27"
+
+[dependencies.iced_graphics]
+version = "= 0.14.0"
+
 [dev-dependencies]
 winit = "0.30"
 wgpu = "27"
 pollster = "0.4"
 raw-window-handle = "0.6"
 objc = "0.2"
-cosmic-text = "0.15"
-fontdb = "0.23"
-bytemuck = { version = "1", features = ["derive"] }
 unicode-width = "0.2.2"
 
 [[example]]

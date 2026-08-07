@@ -14,6 +14,10 @@ async fn main() -> Result<()> {
 
     info!("vida daemon starting");
 
+    // 首次启动：配置目录（如 ~/Library/Application Support/vida）可能不存在，
+    // 必须在写入 token/port/金库 之前创建，否则新用户首次启动直接失败。
+    vida_core::config::ensure_dirs()?;
+
     let token = vida_daemon::ws_server::load_or_create_token()?;
     info!("Auth token loaded");
 
