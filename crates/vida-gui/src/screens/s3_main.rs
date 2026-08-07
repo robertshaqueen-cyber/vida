@@ -92,8 +92,17 @@ impl State {
             tooltip::Position::Bottom,
         );
 
-        // Left side: tabs + add button + connect panel button
-        let left_side = row![tabs_row, add_btn, connect_panel_btn]
+        // 调试终端入口（M2b-1 只读终端）
+        let debug_term_btn = tooltip(
+            button(text("▮_").size(14))
+                .on_press(AppMessage::OpenDebugTerminal)
+                .style(button::text),
+            "调试终端 (M2b-1)",
+            tooltip::Position::Bottom,
+        );
+
+        // Left side: tabs + add button + connect panel button + debug terminal
+        let left_side = row![tabs_row, add_btn, connect_panel_btn, debug_term_btn]
             .spacing(4)
             .align_y(iced::Alignment::Center);
 

@@ -1538,3 +1538,151 @@ async fn pty_yos_bandwidth_bounded() {
         total_bytes
     );
 }
+
+// -----------------------------------------------------------------------
+// 单连接多订阅（M2b-1）：同一 WS 连接订阅两个会话，帧带各自 session_id
+// -----------------------------------------------------------------------
+
+/// 解帧头：返回 (session_id, 剩余 payload)。
+fn decode_frame_header(bytes: &[u8]) -> (String, &[u8]) {
+    assert_eq!(bytes[0], 0x01, "帧头魔法字节");
+    let id_len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+    let id = String::from_utf8(bytes[3..3 + id_len].to_vec()).unwrap();
+    (id, &bytes[3 + id_len..])
+}
+
+/// 同一连接订阅两个会话：两个会话的帧都能收到，session_id 各自正确；
+/// Unsubscribe 其中一个后，另一个仍正常推送。
+#[tokio::test]
+async fn single_connection_multi_subscribe() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut ws, mut reader) = connect(addr).await;
+
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token
+    );
+    let resp = send_recv(&mut ws, &mut reader, &auth).await;
+    assert_eq!(resp["type"], "Ok");
+
+    // 打开两个会话
+    let mut sids = Vec::new();
+    for i in 0..2 {
+        let open = format!(
+            r#"{{"method":"OpenLocalSession","params":{{"cols":80,"rows":24}},"id":{}}}"#,
+            2 + i
+        );
+        let resp = send_recv(&mut ws, &mut reader, &open).await;
+        assert_eq!(resp["type"], "Ok");
+        sids.push(resp["result"]["session_id"].as_str().unwrap().to_string());
+    }
+
+    // 同一连接订阅两个会话
+    for (i, sid) in sids.iter().enumerate() {
+        let sub = format!(
+            r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":{}}}"#,
+            sid,
+            4 + i
+        );
+        let resp = send_recv(&mut ws, &mut reader, &sub).await;
+        assert_eq!(resp["type"], "Ok", "订阅失败: {}", resp);
+    }
+
+    // 向两个会话各发一条 echo，触发增量帧
+    for (i, sid) in sids.iter().enumerate() {
+        // "echo subN\r" = e c h o _ s u b N 
+        let mut data = b"echo sub".to_vec();
+        data.push(b'0' + i as u8);
+        data.push(0x0D);
+        let input = format!(
+            r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{:?}}},
+               "id":{}}}"#,
+            sid, data, 6 + i
+        );
+        // 不等待响应（二进制帧会抢先），直接发送
+        ws.send(Message::Text(input.into())).await.unwrap();
+    }
+
+    // 收集 3 秒内两个会话的帧，验证 session_id 各自正确
+    let start = std::time::Instant::now();
+    let mut received_a = 0usize;
+    let mut received_b = 0usize;
+    let mut wrong_id = 0usize;
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let (sid, _) = decode_frame_header(&bytes);
+                        if sid == sids[0] {
+                            received_a += 1;
+                        } else if sid == sids[1] {
+                            received_b += 1;
+                        } else {
+                            wrong_id += 1;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    assert_eq!(wrong_id, 0, "收到未知 session_id 的帧");
+    assert!(
+        received_a > 0 && received_b > 0,
+        "两个会话都应收到帧: a={} b={}",
+        received_a,
+        received_b
+    );
+
+    // Unsubscribe 会话 A，会话 B 应继续推送
+    let unsub_a = format!(
+        r#"{{"method":"UnsubscribeSession","params":{{"session_id":"{}"}},"id":20}}"#,
+        sids[0]
+    );
+    let resp = send_recv(&mut ws, &mut reader, &unsub_a).await;
+    assert_eq!(resp["type"], "Ok", "取消订阅失败: {}", resp);
+
+    // 会话 B 继续产生输出（echo hello\r）
+    let input_b = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":[101,99,104,111,32,104,105,13]}},
+           "id":21}}"#,
+        sids[1]
+    );
+    ws.send(Message::Text(input_b.into())).await.unwrap();
+
+    let start2 = std::time::Instant::now();
+    let mut b_after = 0usize;
+    let mut a_after = 0usize;
+    while start2.elapsed() < std::time::Duration::from_secs(2) {
+        tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let (sid, _) = decode_frame_header(&bytes);
+                        if sid == sids[1] {
+                            b_after += 1;
+                        } else if sid == sids[0] {
+                            a_after += 1;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    assert_eq!(a_after, 0, "取消订阅后会话 A 不应再收到帧");
+    assert!(b_after > 0, "取消订阅 A 后会话 B 应继续推送");
+}

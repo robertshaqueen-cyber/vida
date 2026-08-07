@@ -1,4 +1,5 @@
 pub mod s0_connection;
+pub mod s_terminal;
 pub mod s1_setup;
 pub mod s2_unlock;
 pub mod s3_main;
@@ -82,6 +83,8 @@ pub enum Screen {
     ConflictFile(s7_conflict_file::State),
     RemoteMissing(s8_remote_missing::State),
     Backup(s9_backup::State),
+    /// 调试终端（M2b-1 只读渲染，M2b-3 起并入标签页体系）。
+    Terminal(s_terminal::TerminalSession),
 }
 
 impl Screen {
@@ -95,6 +98,9 @@ impl Screen {
             Screen::ConflictFile(s) => s.view(i18n),
             Screen::RemoteMissing(s) => s.view(i18n),
             Screen::Backup(s) => s.view(i18n),
+            // Terminal 屏不走统一 view（需要 app 级的 ws_client/订阅），
+            // 在 app::view 里单独渲染。
+            Screen::Terminal(s) => s.view(),
         }
     }
 }

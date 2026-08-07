@@ -3,9 +3,10 @@ use vida_core::i18n::{self, I18n};
 
 use crate::screens::{
     Screen, Tab, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential, s5_settings,
-    s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
+    s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup, s_terminal,
 };
-use crate::ws_client::WsClient;
+use crate::term::frame;
+use crate::ws_client::{PushMsg, WsClient};
 
 pub fn run() -> Result<(), iced::Error> {
     tracing_subscriber::fmt()
@@ -16,6 +17,7 @@ pub fn run() -> Result<(), iced::Error> {
         .init();
 
     iced::application(new, update, view)
+        .subscription(subscription)
         .title(|_: &VidaApp| "vida".to_string())
         .theme(|_: &VidaApp| Theme::Dark)
         .centered()
@@ -51,6 +53,9 @@ pub struct VidaApp {
     /// the clipboard if the current content still matches what we wrote.
     clipboard_guard: Option<(u64, String)>,
     clipboard_token: u64,
+    /// 调试终端的会话 id（M2b-1）。有值时 subscription() 挂起推送接收
+    /// stream；空闲时 recv().await 挂起 → CPU ≈ 0%。
+    debug_terminal_sid: Option<String>,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -99,6 +104,16 @@ impl SyncState {
 
 #[derive(Debug, Clone)]
 pub enum AppMessage {
+    // Debug terminal (M2b-1)
+    OpenDebugTerminal,
+    CloseDebugTerminal,
+    TerminalPush(PushMsg),
+    /// 订阅建立完成。
+    TerminalOpened { session_id: String },
+    /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
+    TerminalDisconnected,
+    TerminalSetupError(String),
+
     // Connection
     WsConnected(WsClient),
     WsError(String),
@@ -214,6 +229,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         cred_hide_token: 0,
         clipboard_guard: None,
         clipboard_token: 0,
+        debug_terminal_sid: None,
     };
 
     let connect = Task::perform(
@@ -260,6 +276,45 @@ impl VidaApp {
             self.active_tab_id = self.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
         }
     }
+}
+
+/// 订阅：只有调试终端活跃时挂起推送接收 stream。
+/// 帧到达 → TerminalPush；无推送时 recv().await 挂起 → 空闲 CPU ≈ 0%。
+/// 连接断开（sender drop）→ recv 返回 None → TerminalDisconnected。
+fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
+    let Some(ws) = app.ws_client.as_ref() else {
+        return iced::Subscription::none();
+    };
+    let Some(sid) = app.debug_terminal_sid.as_ref() else {
+        return iced::Subscription::none();
+    };
+    // data 的 identity = (sid, WsClient 的 Arc 指针)：
+    // 重连（新连接）自动换 identity → iced 重启订阅 stream → 重新 SubscribeSession 拿全量帧。
+    let data = (sid.clone(), ws.clone());
+    iced::Subscription::run_with(data, |d| {
+        let sid = d.0.clone();
+        let ws = d.1.clone();
+        // unfold 状态 = (ws, sid, rx)：全部随状态传递，闭包零捕获。
+        // 首次迭代 rx=None → 注册订阅；无推送时 rx.recv().await 挂起 → CPU ≈ 0%。
+        futures_util::stream::unfold(
+            Some((ws, sid, None::<tokio::sync::mpsc::UnboundedReceiver<PushMsg>>)),
+            |state| async move {
+                let (ws, sid, rx_opt) = state?;
+                let mut rx = match rx_opt {
+                    Some(rx) => rx,
+                    None => ws.subscribe(&sid),
+                };
+                let msg = match rx.recv().await {
+                    Some(msg) => msg,
+                    None => {
+                        // 后台任务断开：通知上层
+                        return Some((AppMessage::TerminalDisconnected, None));
+                    }
+                };
+                Some((AppMessage::TerminalPush(msg), Some((ws, sid, Some(rx)))))
+            },
+        )
+    })
 }
 
 fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
@@ -1387,6 +1442,112 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 },
                 |r| r,
             )
+        }
+
+        // ---- Debug terminal (M2b-1) ----
+        AppMessage::OpenDebugTerminal => {
+            let client = match app.ws_client.as_ref() {
+                Some(c) => c.clone(),
+                None => return Task::none(),
+            };
+            Task::perform(
+                async move {
+                    // 打开本地会话 → 订阅推送 → 拿接收端
+                    match client
+                        .send("OpenLocalSession", serde_json::json!({"cols": 100, "rows": 40}))
+                        .await
+                    {
+                        Ok(resp) => {
+                            let sid = match resp.get("session_id").and_then(|v| v.as_str()) {
+                                Some(s) => s.to_string(),
+                                None => {
+                                    return AppMessage::TerminalSetupError(
+                                        "OpenLocalSession 响应缺少 session_id".to_string(),
+                                    )
+                                }
+                            };
+                            match client
+                                .send("SubscribeSession", serde_json::json!({"session_id": sid}))
+                                .await
+                            {
+                                Ok(_) => AppMessage::TerminalOpened { session_id: sid },
+                                Err(e) => AppMessage::TerminalSetupError(format!(
+                                    "订阅失败: {}",
+                                    e.message
+                                )),
+                            }
+                        }
+                        Err(e) => {
+                            AppMessage::TerminalSetupError(format!("打开会话失败: {}", e.message))
+                        }
+                    }
+                },
+                |msg| msg,
+            )
+        }
+        AppMessage::TerminalOpened { session_id } => {
+            app.debug_terminal_sid = Some(session_id.clone());
+            app.screen = Screen::Terminal(s_terminal::TerminalSession::new(session_id, 40, 100));
+            Task::none()
+        }
+        AppMessage::TerminalDisconnected => {
+            if let Screen::Terminal(s) = &mut app.screen {
+                s.closed = true;
+            }
+            tracing::warn!("终端推送连接断开（如需恢复请重新打开调试终端）");
+            Task::none()
+        }
+        AppMessage::TerminalSetupError(msg) => {
+            tracing::error!("终端调试屏打开失败: {}", msg);
+            Task::none()
+        }
+        AppMessage::TerminalPush(PushMsg::Frame { session_id, bytes }) => {
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.session_id != session_id {
+                return Task::none();
+            }
+            // 订阅后第一帧是全量帧 → 重置 grid；后续增量帧按区间更新。
+            // 帧协议不含 rows/cols 字段：grid 尺寸在 OpenLocalSession 时
+            // 已由客户端指定（TerminalSession::new），全量帧只重置内容。
+            let first = session.grid.last_seq.is_none();
+            match frame::decode_frame(&bytes) {
+                Some(f) => {
+                    if first {
+                        let (rows, cols) = (session.grid.rows, session.grid.cols);
+                        session.grid.reset(rows, cols);
+                    }
+                    session.apply_frame(&f);
+                }
+                None => {
+                    tracing::warn!("终端帧解码失败（丢弃）");
+                }
+            }
+            Task::none()
+        }
+        AppMessage::TerminalPush(PushMsg::SessionClosed { session_id, exit_code }) => {
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.session_id == session_id {
+                session.closed = true;
+                tracing::info!("终端会话 {} 结束, exit_code={}", session_id, exit_code);
+            }
+            Task::none()
+        }
+        AppMessage::CloseDebugTerminal => {
+            if let Some(client) = app.ws_client.as_ref() {
+                let client = client.clone();
+                let sid = match &app.screen {
+                    Screen::Terminal(s) => s.session_id.clone(),
+                    _ => String::new(),
+                };
+                client.unsubscribe(&sid);
+                let _ = sid;
+            }
+            app.debug_terminal_sid = None;
+            Task::none()
         }
     }
 }
