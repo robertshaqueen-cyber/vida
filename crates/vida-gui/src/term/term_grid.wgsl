@@ -1,12 +1,16 @@
 // M2b-1 终端 WGSL 着色器（搬运自 M2b-0 term_grid example）
-// 顶点格式: [x, y, u, v, r, g, b, a]  (xy 为窗口像素坐标)
-// uniform: screen_size (窗口物理像素宽高)
+// 顶点格式: [x, y, u, v, r, g, b, a]  (xy 为窗口物理像素坐标)
+// uniform: screen (窗口物理像素宽高 + sRGB 校正开关)
 
-struct ScreenSize {
+struct ScreenInfo {
     size: vec2<f32>,
+    /// >0.5 表示 surface 为 sRGB 格式：片元颜色需在输出前转 linear，
+    /// 由 GPU 在写入时做 linear→sRGB 编码（iced 自身文字管线同样如此）。
+    gamma: f32,
+    _pad: f32,
 }
 
-@group(0) @binding(0) var<uniform> screen: ScreenSize;
+@group(0) @binding(0) var<uniform> screen: ScreenInfo;
 
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
@@ -38,5 +42,10 @@ fn vs_main(
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).a;
-    return vec4<f32>(in.color.rgb, in.color.a * alpha);
+    var color = vec4<f32>(in.color.rgb, in.color.a * alpha);
+    if screen.gamma > 0.5 {
+        // sRGB → linear（近似 2.2；alpha 不参与 gamma）
+        color = vec4<f32>(pow(color.rgb, vec3<f32>(2.2)), color.a);
+    }
+    return color;
 }

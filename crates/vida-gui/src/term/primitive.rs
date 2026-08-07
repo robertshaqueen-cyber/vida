@@ -51,7 +51,9 @@ struct FontMetrics {
 const DEFAULT_FG: (u8, u8, u8) = (200, 200, 200);
 const DEFAULT_BG: (u8, u8, u8) = (13, 13, 20);
 
-/// 字形缓存条目：位图在图集中的 (宽, 高, u0, v0, u1, v1, baseline偏移, placement.top)。
+/// 字形缓存条目：(宽, 高, u0, v0, u1, v1, placement.left, placement.top)。
+/// left/top 都是整数（物理像素），glyph_x = cell_x + left、
+/// glyph_y = 基线取整 - top，保证字形 quad 落在整数像素边界。
 type GlyphEntry = (u32, u32, f32, f32, f32, f32, f32, f32);
 
 /// 一帧渲染所需的全部几何数据（变化时才重建）。
@@ -99,6 +101,8 @@ pub struct TermPipeline {
     /// 图集打包 cursor (next_x, next_y, row_h)——必须跨帧持久：
     /// 每帧重置会让新字形覆盖已写入的字形（ASCII 靠前最易被覆盖）。
     atlas_cursor: Mutex<(u32, u32, u32)>,
+    /// surface 是否为 sRGB 格式（决定 fs_main 是否做 linear 转换）。
+    is_srgb: bool,
 }
 
 impl IcedPrimitive for TermPrimitive {
@@ -144,12 +148,13 @@ impl IcedPrimitive for TermPrimitive {
             upload_atlas_rows(&pipeline.atlas_texture, queue, &geometry.atlas, y, h);
         }
 
-        // 上传 screen size 到 uniform（物理像素）
+        // 上传 screen 信息到 uniform（物理像素 + sRGB 校正开关）
         let phys = viewport.physical_size();
+        let gamma = if pipeline.is_srgb { 1.0 } else { 0.0 };
         queue.write_buffer(
             &pipeline.uniform_buffer,
             0,
-            bytemuck::bytes_of(&[phys.width as f32, phys.height as f32]),
+            bytemuck::bytes_of(&[phys.width as f32, phys.height as f32, gamma, 0.0]),
         );
 
         // 上传 quads
@@ -379,6 +384,10 @@ impl TermPrimitive {
         let grid = &self.snapshot;
         let mut quads: Vec<Vertex> = Vec::new();
 
+        // 整数对齐：origin 与 cell 尺寸都是整数物理像素——
+        // 任何小数都会让字形 quad 落在非整数像素边界导致发虚。
+        let origin_x = origin_x.round();
+        let origin_y = origin_y.round();
         for row in 0..grid.rows {
             let row_y = origin_y + row as f32 * ch;
             let mut col: u16 = 0;
@@ -420,7 +429,7 @@ impl TermPrimitive {
                         cell.ch,
                         bold,
                     );
-                    if let Some((gw, gh, u0, v0, u1, v1, _, top)) = glyph {
+                    if let Some((gw, gh, u0, v0, u1, v1, left, top)) = glyph {
                         let fg = if cell.flags & frame::flag::REVERSE != 0 {
                             [0.0, 0.0, 0.0, 1.0]
                         } else {
@@ -432,20 +441,24 @@ impl TermPrimitive {
                                 1.0,
                             ]
                         };
-                        // 统一基线：glyph_y = row_y + ascent - placement.top
-                        let y = row_y + metrics.ascent - top;
+                        // 整数像素对齐：glyph_x = cell_x + placement.left
+                        // （left 是整数）；基线取整后 - top（top 是整数）。
+                        // 三处全是整数 → 字形 quad 落在整数像素边界。
+                        let gx = cell_x + left;
+                        let y = (row_y + metrics.ascent).round() - top;
                         push_quad(
                             &mut quads,
-                            [cell_x, y, cell_x + gw as f32, y + gh as f32],
+                            [gx, y, gx + gw as f32, y + gh as f32],
                             [u0, v0, u1, v1],
                             fg,
                         );
                     }
                 }
 
-                // 下划线：基线下方 2px，宽度 = cell 列宽
+                // 下划线：基线下方 2px，宽度 = cell 列宽。
+                // 高度必须取整像素（1px）——1.5px 会落在非整数像素边界。
                 if cell.flags & frame::flag::UNDERLINE != 0 {
-                    let uy = row_y + metrics.ascent + 2.0;
+                    let uy = (row_y + metrics.ascent + 2.0).round();
                     let lc = if cell.flags & frame::flag::REVERSE != 0 {
                         [0.0, 0.0, 0.0, 1.0]
                     } else {
@@ -459,7 +472,7 @@ impl TermPrimitive {
                     };
                     push_quad(
                         &mut quads,
-                        [cell_x, uy, cell_x + cw * col_width as f32, uy + 1.5],
+                        [cell_x, uy, cell_x + cw * col_width as f32, uy + 1.0],
                         [0.0, 0.0, 0.0, 0.0],
                         lc,
                     );
@@ -680,7 +693,7 @@ fn rasterize_char(
                 v0,
                 u1,
                 v1,
-                physical.y as f32,
+                img.placement.left as f32,
                 img.placement.top as f32,
             );
             dirty.push((*next_x, *next_y, gw, gh));
@@ -732,13 +745,19 @@ fn build_pipeline(
     // （见 apply_scale_change）。
     let metrics = measure_font(&mut font_system, 1.0);
 
+    tracing::info!("终端渲染 surface format: {:?}", format);
+    if format.is_srgb() {
+        tracing::info!(
+            "surface 为 sRGB 格式：着色器输出将按 linear→sRGB 编码，             颜色需在 fs_main 中先转 linear"
+        );
+    }
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("term shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("term_grid.wgsl").into()),
     });
     let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("term screen uniform"),
-        size: 8,
+        size: 16, // vec2(size) + f32(gamma) + padding
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -746,7 +765,7 @@ fn build_pipeline(
         label: Some("term uniform bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -926,6 +945,7 @@ fn build_pipeline(
         built_version: AtomicU64::new(u64::MAX),
         atlas_data: Mutex::new(atlas_data),
         atlas_cursor: Mutex::new((1, 0, 0)),
+        is_srgb: format.is_srgb(),
     }
 }
 
@@ -935,6 +955,12 @@ fn build_pipeline(
 /// 方式 B：Metrics 字号 × scale（而非 physical() 的 scale 参数）——
 /// 所有测量值（advance/ascent/位图尺寸）出自同一来源同一单位，
 /// 无手工换算；physical() 的 scale 参数与字号分离时容易漏乘。
+///
+/// **cell 尺寸必须取整为整数物理像素**：真实终端（Alacritty/
+/// WezTerm/iTerm）都是整数 cell。advance 实测 19.2 若直接用，每列
+/// x = 0/19.2/38.4/57.6... 落在非整数像素边界，quad 覆盖半个物理
+/// 像素 → 字形边缘被重新采样 → 笔画发虚，且每列小数部分不同，
+/// 整行参差不齐。round() 最接近真实 advance，列累计误差最小。
 fn measure_font(font_system: &mut FontSystem, scale: f32) -> FontMetrics {
     let metrics = Metrics::new(16.0 * scale, 20.0 * scale);
     let mut buf = Buffer::new_empty(metrics);
@@ -942,9 +968,9 @@ fn measure_font(font_system: &mut FontSystem, scale: f32) -> FontMetrics {
     buf.set_size(font_system, Some(100.0), None);
     buf.set_text(font_system, "M", &attrs, Shaping::Advanced, None);
     let fallback = FontMetrics {
-        cell_width: 9.6 * scale,
-        cell_height: 20.0 * scale,
-        ascent: 14.26 * scale,
+        cell_width: (9.6 * scale).round().max(1.0),
+        cell_height: (20.0 * scale).round().max(1.0),
+        ascent: (14.26 * scale).round(),
         scale,
     };
     let Some(layout) = buf.layout_runs().next() else {
@@ -952,9 +978,9 @@ fn measure_font(font_system: &mut FontSystem, scale: f32) -> FontMetrics {
         return fallback;
     };
     FontMetrics {
-        cell_width: layout.line_w,
-        cell_height: metrics.line_height,
-        ascent: layout.line_y - layout.line_top,
+        cell_width: layout.line_w.round().max(1.0),
+        cell_height: metrics.line_height.round().max(1.0),
+        ascent: (layout.line_y - layout.line_top).round(),
         scale,
     }
 }
@@ -1167,6 +1193,65 @@ mod tests {
             "scale=2 下图集溢出（使用 {:.1}%），需要扩大 ATLAS_SIZE",
             usage
         );
+    }
+
+    /// 所有 quad 顶点坐标必须是整数物理像素（小数边界 = 发虚）。
+    #[test]
+    fn quad_coordinates_are_integer_pixels() {
+        let (device, queue) = headless_device();
+        let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        // 2x scale（Retina）
+        pipeline.metrics = measure_font_at(&pipeline, 2.0);
+
+        // 含中文/属性/背景的 grid
+        let mut grid = ClientGrid::new(4, 8);
+        grid.apply_frame(&crate::term::frame::TerminalFrame {
+            seq: 1,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            lines: vec![
+                crate::term::frame::LineUpdate {
+                    row: 0,
+                    start_col: 0,
+                    end_col: 1,
+                    runs: vec![crate::term::frame::Run {
+                        len: 2,
+                        flags: 0x40, // WIDE
+                        fg: ColorSpec::Default,
+                        bg: ColorSpec::Default,
+                        ch: '你',
+                    }],
+                },
+                crate::term::frame::LineUpdate {
+                    row: 1,
+                    start_col: 0,
+                    end_col: 0,
+                    runs: vec![crate::term::frame::Run {
+                        len: 1,
+                        flags: 0x01 | 0x04, // bold + underline
+                        fg: ColorSpec::Rgb(255, 0, 0),
+                        bg: ColorSpec::Rgb(0, 0, 255),
+                        ch: 'A',
+                    }],
+                },
+            ],
+        });
+        let prim = TermPrimitive::new(Arc::new(grid), Rectangle::default());
+        let geom = prim
+            .build_geometry(&mut pipeline, 10.7, 5.3)
+            .expect("build_geometry 应成功");
+        assert!(!geom.quads.is_empty(), "应有 quads");
+
+        for v in &geom.quads {
+            for coord in v.xy {
+                assert!(
+                    (coord - coord.round()).abs() < 1e-4,
+                    "quad 顶点坐标必须是整数: {}",
+                    coord
+                );
+            }
+        }
     }
 
     fn headless_device() -> (wgpu::Device, wgpu::Queue) {

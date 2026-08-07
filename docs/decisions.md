@@ -753,8 +753,18 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
 - `measure_font(scale)`：Metrics 字号 × scale（方式 B）——所有测量值
   （advance/ascent/位图尺寸）同一来源同一单位，无手工换算；
   physical() 的 scale 参数与字号分离时容易漏乘
-- scale=2 实测：cell_width=19.2px、cell_height=40.0px、ascent≈28.5px
-  （此前逻辑值 9.60/20.0/14.26）
+- **cell 尺寸一律取整为整数物理像素**（真实终端 Alacritty/WezTerm/
+  iTerm 同）：advance 实测 19.2 若直接用，每列 x=0/19.2/38.4/57.6...
+  落在非整数像素边界 → quad 覆盖半个物理像素 → 字形边缘重采样发虚，
+  且每列小数部分不同整行参差不齐。round() 最接近真实 advance，
+  列累计误差最小
+- scale=2 取整后实测：cell_width=19px、cell_height=40px、
+  ascent=29px（原始 19.2/40/28.5）。逻辑尺寸只用于与 iced 布局交互；
+  取整后 cell 宽度变化会影响列数换算（M2b-2 resize 用物理像素换算）
+- 字形 quad 整数对齐：glyph_x = cell_x + placement.left（left 是
+  整数）、glyph_y = (row_y + ascent).round() - placement.top、
+  下划线高度 1px（1.5px 曾落在非整数边界）。测试断言所有 quad
+  顶点坐标为整数
 - 字形缓存 key = (char, bold, scale.to_bits())：跨 DPI 拖动窗口时
   scale 变化 → 旧字形全部失效，reset_atlas（清缓存/图集归零/cursor
   重置/全量重传）后按新 scale 重建
@@ -762,6 +772,11 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
   （physical_size）同一物理空间
 - 采样器 Nearest（min/mag/mipmap）——字形按物理像素精确光栅化，
   无插值
+- **sRGB 处理**：iced 0.14 默认 GAMMA_CORRECTION=true → surface 为
+  sRGB 格式（iced 自身文字 CPU 端 into_linear 再输出）。终端管线
+  颜色是 sRGB 值，直接输出会被 GPU 二次编码 → 发灰。fs_main 在
+  surface 为 sRGB 时输出前 pow(2.2) 转 linear（uniform gamma flag
+  自适应，alpha 不参与 gamma）
 - 图集 1024×1024：2x 下 226 典型字符实测占用 15.0%（512² 时为
   58.6%，粗体字形是独立位图会再翻倍，故保守扩 1024）。纹理
   4MB，可接受。溢出有 warn（非静默丢弃）
