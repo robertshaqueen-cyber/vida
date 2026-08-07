@@ -32,15 +32,39 @@ pub fn backup_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("backups"))
 }
 
-/// Ensures the config directory structure exists.
+/// Ensures the config directory structure exists（首次启动必须调用）。
+/// 错误信息说人话：发生了什么 + 原因 + 建议下一步。
 pub fn ensure_dirs() -> Result<()> {
     let base = config_dir()?;
-    std::fs::create_dir_all(&base)
-        .with_context(|| format!("Failed to create config directory: {}", base.display()))?;
+    // 注意：不用 with_context —— 它会保留 cause 链里的 "os error N"。
+    // 用户只需要知道「发生了什么 + 建议」，原始 errno 无助于普通用户。
+    if let Err(e) = std::fs::create_dir_all(&base) {
+        return Err(anyhow::anyhow!(
+            "无法创建配置目录 {}：{}。请检查权限（当前用户需对该路径有写权限）",
+            base.display(),
+            friendly_io_error(&e)
+        ));
+    }
     let backups = backup_dir()?;
-    std::fs::create_dir_all(&backups)
-        .with_context(|| format!("Failed to create backup directory: {}", backups.display()))?;
+    if let Err(e) = std::fs::create_dir_all(&backups) {
+        return Err(anyhow::anyhow!(
+            "无法创建备份目录 {}：{}。请检查权限（当前用户需对该路径有写权限）",
+            backups.display(),
+            friendly_io_error(&e)
+        ));
+    }
     Ok(())
+}
+
+/// 把 io 错误转成一句话的人话（不含 "os error N" 字样）。
+fn friendly_io_error(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "权限不足".to_string(),
+        std::io::ErrorKind::NotFound => "路径不存在".to_string(),
+        std::io::ErrorKind::AlreadyExists => "路径已存在".to_string(),
+        std::io::ErrorKind::ReadOnlyFilesystem => "文件系统只读".to_string(),
+        _ => "写入失败".to_string(),
+    }
 }
 
 /// Returns the language config file path.
@@ -69,7 +93,13 @@ pub fn save_language_choice(choice: &str) -> Result<()> {
         anyhow::bail!("无效的语言选择: {}", choice);
     }
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir)?;
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(anyhow::anyhow!(
+            "无法创建配置目录 {}：{}。请检查权限（当前用户需对该路径有写权限）",
+            dir.display(),
+            friendly_io_error(&e)
+        ));
+    }
     let content = format!("language = {:?}\n", choice);
     let tmp = dir.join("language.toml.tmp");
     std::fs::write(&tmp, content)?;

@@ -209,6 +209,10 @@ cargo run --release --bin vida
 ## M2a 终端核心 — 验收清单
 
 > 全部使用 `VIDA_CONFIG_DIR=/tmp/vida-m2a` 隔离，不触碰真实配置。
+>
+> **不需要手动 mkdir**：daemon 启动时自动创建配置目录及 `backups/`
+> 子目录（`ensure_dirs`，M2b-1 起）。目录缺失时首次启动会自行创建；
+> 不可写时给出人话错误而非 os error。
 
 ### 指标（M2a-spec 第 8 节，实测）
 

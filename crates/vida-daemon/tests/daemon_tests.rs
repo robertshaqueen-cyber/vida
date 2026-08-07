@@ -1885,3 +1885,55 @@ async fn reconnect_resubscribe_gets_full_frame() {
         "重连不应新增会话（旧会话应被复用）"
     );
 }
+
+// -----------------------------------------------------------------------
+// 配置目录（首次启动）：不存在时自动创建；不可写时给人话错误（不 panic）
+// -----------------------------------------------------------------------
+
+/// VIDA_CONFIG_DIR 指向不存在的路径 → 启动成功且目录被创建。
+#[test]
+fn config_dir_created_if_missing() {
+    // poison 容忍：并行测试中其他测试失败会 poison 锁，不应连带失败
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let base = tempfile::tempdir().unwrap();
+    let missing = base.path().join("not-yet-created");
+    assert!(!missing.exists(), "前置条件：目录不应存在");
+    unsafe { std::env::set_var("VIDA_CONFIG_DIR", &missing) };
+
+    // 启动路径（与 main.rs 一致）：ensure_dirs 后再写 token
+    vida_core::config::ensure_dirs().unwrap();
+    let token = vida_daemon::ws_server::load_or_create_token().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(missing.join("daemon.token").exists(), "token 应写入新创建的目录");
+    assert!(missing.join("backups").is_dir(), "backups 子目录应被创建");
+
+    unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
+}
+
+/// VIDA_CONFIG_DIR 指向不可写路径 → 报出可读错误信息，不 panic。
+#[cfg(unix)]
+#[test]
+fn config_dir_unwritable_gives_clear_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let base = tempfile::tempdir().unwrap();
+    let readonly = base.path().join("readonly");
+    std::fs::create_dir(&readonly).unwrap();
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+    unsafe { std::env::set_var("VIDA_CONFIG_DIR", &readonly) };
+
+    let err = vida_core::config::ensure_dirs().err().expect("应返回错误");
+    let msg = format!("{:#}", err);
+    assert!(
+        (msg.contains("无法创建配置目录") || msg.contains("无法创建备份目录"))
+            && msg.contains("请检查权限"),
+        "错误应是人话（含目录与权限提示），实际: {}",
+        msg
+    );
+    assert!(!msg.contains("os error"), "不应暴露原始 os error: {}", msg);
+
+    // 恢复权限便于 tempdir 清理（即使上面的断言失败也要执行）
+    let _ = std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755));
+    unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
+}

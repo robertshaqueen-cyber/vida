@@ -692,6 +692,15 @@ pub async fn start(state: Arc<Mutex<DaemonState>>) -> Result<SocketAddr> {
 
     // Write port file so GUI can discover the port
     let port_file = port_path()?;
+    // 防御：确保目录存在（正常启动已由 main 的 ensure_dirs 处理）
+    if let Some(dir) = port_file.parent() {
+        std::fs::create_dir_all(dir).with_context(|| {
+            format!(
+                "无法创建配置目录 {}：请检查权限（当前用户需对该路径有写权限）",
+                dir.display()
+            )
+        })?;
+    }
     std::fs::write(&port_file, addr.port().to_string())
         .with_context(|| format!("Failed to write daemon port to {}", port_file.display()))?;
 
