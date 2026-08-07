@@ -321,6 +321,32 @@ impl VidaApp {
     }
 }
 
+/// 退出 M2b-2 的临时调试终端并恢复主界面。
+/// M2b-3 把终端并入正式标签页后删除这条兼容路径。
+fn leave_debug_terminal(app: &mut VidaApp) {
+    if !matches!(app.screen, Screen::Terminal(_)) {
+        return;
+    }
+
+    if let Some(session_id) = app.debug_terminal_sid.take()
+        && let Some(client) = app.ws_client.as_ref()
+    {
+        client.unsubscribe(&session_id);
+        if let Err(error) = client.send_queued(
+            "CloseSession",
+            serde_json::json!({"session_id": session_id}),
+        ) {
+            tracing::warn!("退出调试终端时未能关闭会话：{}", error.message);
+        }
+    }
+    app.terminal_reconnect_cooldown = None;
+    let main_state = app.main_state_backup.take().unwrap_or(s3_main::State {
+        revealed_credential: None,
+        credential_copied: false,
+    });
+    app.screen = Screen::Main(main_state);
+}
+
 /// 订阅：调试终端活跃时挂起推送接收 stream；启用光标闪烁时另加 500ms tick。
 /// 帧到达 → TerminalPush；推送本身在无数据时 recv().await 挂起。
 /// 连接断开（sender drop）→ recv 返回 None → TerminalDisconnected。
@@ -610,6 +636,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- Tab management ----
         AppMessage::SwitchTab(tab_id) => {
+            // 调试终端还不是正式 tab；点击任一真实 tab 时先退出临时屏，
+            // 否则 active_tab_id 虽变化，最上层仍会继续渲染终端。
+            leave_debug_terminal(app);
             app.active_tab_id = tab_id;
             // Invalidate any pending credential-hide timer and clear the
             // revealed credential: it belongs to the previous host.
@@ -632,6 +661,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::OpenSettingsTab => {
+            leave_debug_terminal(app);
             // Add settings tab if not already present, or switch to it
             let existing = app.tabs.iter().find(|t| t.id == "settings");
             if existing.is_none() {
@@ -1888,19 +1918,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::CloseDebugTerminal => {
-            // 取消订阅 + 恢复 Main 屏
-            if let Some(client) = app.ws_client.as_ref()
-                && let Screen::Terminal(s) = &app.screen
-            {
-                client.unsubscribe(&s.session_id);
-            }
-            app.debug_terminal_sid = None;
-            app.terminal_reconnect_cooldown = None;
-            let main_state = app.main_state_backup.take().unwrap_or(s3_main::State {
-                revealed_credential: None,
-                credential_copied: false,
-            });
-            app.screen = Screen::Main(main_state);
+            leave_debug_terminal(app);
             Task::none()
         }
     }

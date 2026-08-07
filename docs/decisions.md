@@ -854,6 +854,11 @@ Regular 下显得过细、像被横向压扁。宽字符普通输出改用字体
 只保留 `monospaced` family，避免比例字体破坏固定 cell；字号使用一组常用整数选项。
 配置中已不存在的字体回落到已安装的 Menlo，再回落到列表第一项。
 
+连续输出验收显示 13px / 16px 行高虽然字形边界理论上未越界，但视觉密度明显高于
+Ghostty，多行中文像互相遮盖。默认行高从字号的 1.25 倍调整为 1.4 倍：Menlo 13
+在 scale=1 下为 cell 8×18、ascent 14。字形诊断测试同时断言 Menlo Regular/Bold
+和 PingFang Medium 的实际位图上下界均位于 cell 内。
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；

@@ -54,6 +54,8 @@ struct FontMetrics {
 const DEFAULT_FG: (u8, u8, u8) = (255, 255, 255);
 const DEFAULT_BG: (u8, u8, u8) = (40, 44, 52);
 const DEFAULT_FONT_SIZE: f32 = 13.0;
+/// Ghostty 风格的默认行高：13px 字号对应约 18px 行高。
+const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
 
 /// 字形缓存条目：(宽, 高, u0, v0, u1, v1, placement.left, placement.top)。
 /// left/top 都是整数（物理像素），glyph_x = cell_x + left、
@@ -194,7 +196,9 @@ impl ViewportMetrics {
             .unwrap_or(DEFAULT_FONT_SIZE);
         (
             (font_size * 0.6 * scale).round().max(1.0),
-            (font_size * 1.25 * scale).round().max(1.0),
+            (font_size * LINE_HEIGHT_MULTIPLIER * scale)
+                .round()
+                .max(1.0),
         )
     }
 }
@@ -814,7 +818,7 @@ fn rasterize_char(
     // Menlo 前导致 ASCII 用了旧式打字机衬线体）。
     let mut buf = Buffer::new_empty(Metrics::new(
         state.font_size * scale,
-        state.font_size * 1.25 * scale,
+        state.font_size * LINE_HEIGHT_MULTIPLIER * scale,
     ));
     buf.set_size(font_system, Some(100.0), None);
     let mut attrs = Attrs::new().family(cosmic_text::Family::Name(&state.font_family));
@@ -1248,7 +1252,7 @@ fn resolve_font_family(db: &fontdb::Database, requested: &str) -> String {
 /// 打印 'A' 与 '你' 实际使用的字体名（启动日志，便于一眼确认）。
 fn log_face_names(font_system: &mut FontSystem, font_size: f32, family: &str) {
     for ch in ['A', '你'] {
-        let metrics = Metrics::new(font_size, font_size * 1.25);
+        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_MULTIPLIER);
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
         let attrs = Attrs::new()
@@ -1288,8 +1292,8 @@ fn measure_font(
     font_size: f32,
     family: &str,
 ) -> FontMetrics {
-    // 行高 = 字号 × 1.25（16→20 的既有比例）
-    let line_height = font_size * 1.25;
+    // 行高 = 字号 × 1.4：13px → 18px，接近 Ghostty 默认视觉密度。
+    let line_height = font_size * LINE_HEIGHT_MULTIPLIER;
     let metrics = Metrics::new(font_size * scale, line_height * scale);
     let mut buf = Buffer::new_empty(metrics);
     let attrs = Attrs::new().family(cosmic_text::Family::Name(family));
@@ -1298,7 +1302,7 @@ fn measure_font(
     let fallback = FontMetrics {
         cell_width: (9.6 * scale).round().max(1.0),
         cell_height: (line_height * scale).round().max(1.0),
-        ascent: (14.26 * scale).round(),
+        ascent: (font_size * 1.08 * scale).round(),
         scale,
         font_size,
     };
@@ -1546,7 +1550,7 @@ mod tests {
     fn diagnostic_font_sizes_and_face() {
         let (device, queue) = headless_device();
         let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
-        for size in [16.0f32, 18.0, 20.0, 22.0] {
+        for size in [13.0f32, 16.0, 18.0, 20.0, 22.0] {
             pipeline.metrics = measure_font_at_size(&pipeline, 1.0, size);
             let metrics = pipeline.metrics;
             let mut font_system = pipeline
@@ -1566,7 +1570,8 @@ mod tests {
                 font_size: size,
                 font_family: pipeline.font_family.clone(),
             };
-            for ch in ['A', '你'] {
+            for (ch, bold, wide) in [('A', false, false), ('A', true, false), ('你', false, true)]
+            {
                 let r = rasterize_char(
                     &mut font_system,
                     &mut cache,
@@ -1574,28 +1579,41 @@ mod tests {
                     &mut state,
                     ATLAS_SIZE,
                     ch,
-                    glyph_weight(false, ch == '你'),
+                    glyph_weight(bold, wide),
                 );
                 // 字体名：从 cache_key 的 font_id 查
                 let face_name = rasterize_face_name(
                     &mut font_system,
                     ch,
-                    false,
-                    ch == '你',
+                    bold,
+                    wide,
                     size,
                     &pipeline.font_family,
                 );
                 match r {
-                    Some((gw, gh, ..)) => {
+                    Some((gw, gh, _, _, _, _, left, top)) => {
+                        let glyph_y = metrics.ascent - top;
+                        assert!(
+                            glyph_y >= 0.0 && glyph_y + gh as f32 <= metrics.cell_height,
+                            "字号 {size} 的 {ch} 越过行边界: y={glyph_y}, h={gh}, line={}",
+                            metrics.cell_height
+                        );
+                        if size == DEFAULT_FONT_SIZE {
+                            assert_eq!(metrics.cell_height, 18.0);
+                        }
                         eprintln!(
-                            "[diag] 字号 {}: cell={}x{} asc={} '{}'位图={}x{} 字体={}",
+                            "[diag] 字号 {}: cell={}x{} asc={} '{}' bold={} 位图={}x{} left={} top={} bottom={} 字体={}",
                             size,
                             metrics.cell_width,
                             metrics.cell_height,
                             metrics.ascent,
                             ch,
+                            bold,
                             gw,
                             gh,
+                            left,
+                            top,
+                            gh as f32 - top,
                             face_name
                         );
                     }
@@ -1614,7 +1632,7 @@ mod tests {
         font_size: f32,
         family: &str,
     ) -> String {
-        let metrics = Metrics::new(font_size, font_size * 1.25);
+        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_MULTIPLIER);
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
         let mut attrs = Attrs::new().family(cosmic_text::Family::Name(family));
