@@ -57,7 +57,9 @@ const fn run(start_col: u16, ch: char, run_len: u16) -> Run {
 
 fn rows() -> Vec<Vec<Run>> {
     vec![
-        // row 0: ASCII 基准线
+        // row 0: 尺子行——每列一个 '|'，验证背景/下划线/字形的列对齐
+        vec![run(0, '|', 80)],
+        // row 1: ASCII 基准线
         vec![
             run(0, ' ', 7),
             run(7, 'A', 26),
@@ -120,7 +122,7 @@ fn rows() -> Vec<Vec<Run>> {
 }
 
 const COLS: u16 = 80;
-const ROWS: u16 = 6;
+const ROWS: u16 = 7;
 
 // ---------------------------------------------------------------------------
 // 顶点与图集
@@ -248,11 +250,20 @@ impl App {
         for (row_idx, row) in rows().iter().enumerate() {
             let row_y = row_idx as f32 * ch;
             for r in row {
+                // run 的显示列宽 = 各字符列宽之和（宽字符 2，普通 1）。
+                // 终端渲染中「字符数」与「列数」是两个量：位置/宽度一律用列数，
+                // 只有遍历字符时才用字符数。背景/下划线/字形必须同用列数。
+                let run_cols: u16 = (0..r.run_len)
+                    .map(|_| {
+                        unicode_width::UnicodeWidthChar::width(r.ch).unwrap_or(1) as u16
+                    })
+                    .sum();
+
                 // 背景 quad：显式 bg 或反色（反色时背景 = 前景色，实现前景/背景对调）
                 if r.bg.is_some() || r.reverse {
                     let bg = r.bg.unwrap_or(r.fg);
                     let x0 = r.start_col as f32 * cw;
-                    let x1 = (r.start_col as f32 + r.run_len as f32) * cw;
+                    let x1 = (r.start_col as f32 + run_cols as f32) * cw;
                     let c = [
                         bg.0 as f32 / 255.0,
                         bg.1 as f32 / 255.0,
@@ -314,10 +325,10 @@ impl App {
                     col += advance;
                 }
 
-                // 下划线：run 级一次绘制（整 run 宽度下方 1px 线）
+                // 下划线：run 级一次绘制（整 run 显示列宽下方 1px 线）
                 if r.underline {
                     let ux0 = r.start_col as f32 * cw;
-                    let ux1 = (r.start_col as f32 + r.run_len as f32) * cw;
+                    let ux1 = (r.start_col as f32 + run_cols as f32) * cw;
                     let uy = row_y + self.metrics.ascent + 2.0; // 基线下方 2px
                     let lh = 1.5;
                     let lc = if r.reverse {
@@ -563,6 +574,7 @@ impl App {
         }
 
         renderer.queue.submit(std::iter::once(encoder.finish()));
+
         output.present();
     }
 }

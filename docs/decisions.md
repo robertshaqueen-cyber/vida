@@ -728,6 +728,20 @@ watch 工具已改进：跳过首帧间隔、微秒精度、`--duration` 自动�
 这是 example 临时方案——M2b-1 后宽字符由 daemon 推送协议 flags 的
 WIDE 位提供，客户端不再自行判定，两处判定必须一致。
 
+**防复发约定：字符数 ≠ 列数**（M2b-0 必改 1 后半 + 评审）：
+终端渲染中「字符数」与「列数」是两个量。凡涉及位置或宽度的计算
+一律用列数（背景 quad、下划线、run 跨度 = `run_cols` = 各字符列宽
+之和），只有遍历字符时才用字符数（`run_len`）。
+本轮已因混用出现两次错误：①字形列推进用列、背景宽度用字符数；
+②初始实现里宽字符判定用 `ch > 0xFF` 把 é ü α β 误判为双列。
+M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
+客户端不得再用字符数参与任何几何计算。
+
+**对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
+每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
+80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；
+反色块白底边缘 [col24, col28) 与列边界精确重合。
+
 **教训：macOS 'GB18030 Bitmap' 纯位图中文字体**（无 glyf/cff 矢量轮廓表）：
 cosmic-text 的 swash 光栅化对它会静默失败（get_image 返回 None），
 中文 fallback 选中它导致字形缺失。构造 FontSystem 时必须用自定义 fontdb
