@@ -169,6 +169,8 @@ struct App {
     renderer: Option<Renderer>,
     font_system: FontSystem,
     metrics: FontMetrics,
+    /// 字形缓存：(字符, 粗体) → 位图在图集中的位置
+    glyph_cache: std::collections::HashMap<(char, bool), (u32, u32, f32, f32, f32, f32, f32)>,
 }
 
 struct Renderer {
@@ -177,6 +179,8 @@ struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     atlas_texture: Option<wgpu::Texture>,
@@ -198,6 +202,7 @@ impl App {
             renderer: None,
             font_system,
             metrics,
+            glyph_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -241,64 +246,15 @@ impl App {
                     quads.push(Vertex { xy: [x0, row_y + ch], uv: [0.0, 0.0], color: c });
                 }
 
-                // 字形：每个 run 一个 buffer，run 内同字符
-                let mut buf = Buffer::new_empty(Metrics::new(16.0, 20.0));
-                buf.set_size(&mut self.font_system, Some(r.run_len as f32 * cw), None);
-                let mut attrs = Attrs::new().family(cosmic_text::Family::Monospace);
-                if r.bold {
-                    attrs = attrs.weight(cosmic_text::Weight::BOLD);
-                }
-                let text: String = r.ch.to_string().repeat(r.run_len as usize);
-                buf.set_text(&mut self.font_system, &text, &attrs, Shaping::Advanced, None);
-
-                for line in buf.layout_runs() {
-                    for glyph in line.glyphs {
-                        let physical = glyph.physical((0.0, 0.0), 1.0);
-                        let img = match cache
-                            .get_image(&mut self.font_system, physical.cache_key)
-                        {
-                            Some(img) => img,
-                            None => continue,
-                        };
-                        let gw = img.placement.width;
-                        let gh = img.placement.height;
-                        if gw == 0 || gh == 0 {
-                            continue;
-                        }
-                        // 图集换行
-                        if next_x + gw > ATLAS {
-                            next_x = 1;
-                            next_y += row_h.max(1);
-                            row_h = 0;
-                        }
-                        if next_y + gh > ATLAS {
-                            // 图集溢出：忽略该字形（调试时打印）
-                            eprintln!("atlas overflow at glyph w={} h={}", gw, gh);
-                            continue;
-                        }
-                        // 复制位图（Mask = 单通道 alpha → RGBA 白字）
-                        for py in 0..gh {
-                            for px in 0..gw {
-                                let src = (py * gw + px) as usize;
-                                let a = img.data[src.min(img.data.len() - 1)];
-                                let idx =
-                                    (((next_y + py) * ATLAS + (next_x + px)) as usize) * 4;
-                                atlas[idx] = 255;
-                                atlas[idx + 1] = 255;
-                                atlas[idx + 2] = 255;
-                                atlas[idx + 3] = a;
-                            }
-                        }
-                        let u0 = next_x as f32 / ATLAS as f32;
-                        let v0 = next_y as f32 / ATLAS as f32;
-                        let u1 = (next_x + gw) as f32 / ATLAS as f32;
-                        let v1 = (next_y + gh) as f32 / ATLAS as f32;
-                        next_x += gw;
-                        row_h = row_h.max(gh);
-
-                        // glyph 绝对位置：run 起始 x + glyph 内偏移
-                        let gx = r.start_col as f32 * cw + physical.x as f32;
-                        let gy = row_y + physical.y as f32;
+                // 字形：run 内每个 cell 单独排版单个字符，x 显式计算。
+                // 第 i 个 cell 的 x = (start_col + advance_before_i) * cell_width
+                // advance_before_i = 前 i 个字符的列宽之和（普通 1，宽 2）。
+                // 不使用 glyph.x（文本引擎的推进结果）。
+                let mut col = r.start_col;
+                for i in 0..r.run_len {
+                    let cell_x = (r.start_col + i) as f32 * cw;
+                    let glyph = self.rasterize_char(r.ch, r.bold, &mut cache, &mut atlas, &mut next_x, &mut next_y, &mut row_h, ATLAS);
+                    if let Some((gw, gh, u0, v0, u1, v1, gy)) = glyph {
                         let fg = if r.reverse {
                             [0.0, 0.0, 0.0, 1.0]
                         } else {
@@ -310,20 +266,25 @@ impl App {
                             ]
                         };
                         let (tw, th) = (gw as f32, gh as f32);
-                        quads.push(Vertex { xy: [gx, gy], uv: [u0, v0], color: fg });
-                        quads.push(Vertex { xy: [gx + tw, gy], uv: [u1, v0], color: fg });
+                        // 宽字符占 2 列，但字形本身画在 cell_x 处（宽度 1 或 2 cell）
+                        quads.push(Vertex { xy: [cell_x, gy], uv: [u0, v0], color: fg });
+                        quads.push(Vertex { xy: [cell_x + tw, gy], uv: [u1, v0], color: fg });
                         quads.push(Vertex {
-                            xy: [gx + tw, gy + th],
+                            xy: [cell_x + tw, gy + th],
                             uv: [u1, v1],
                             color: fg,
                         });
                         quads.push(Vertex {
-                            xy: [gx, gy + th],
+                            xy: [cell_x, gy + th],
                             uv: [u0, v1],
                             color: fg,
                         });
                     }
+                    // 推进列：普通 1，宽 2
+                    let advance = if r.ch as u32 > 0xFF { 2 } else { 1 };
+                    col += advance;
                 }
+                let _ = col;
 
                 // 下划线：run 级一次绘制（整 run 宽度下方 1px 线）
                 if r.underline {
@@ -350,6 +311,92 @@ impl App {
         }
 
         (atlas, quads)
+    }
+
+    /// 光栅化单个字符到图集（带缓存：同字符+同粗体只光栅化一次）。
+    /// 返回 (位图宽, 高, u0, v0, u1, v1, 垂直位置)。
+    /// 不使用文本引擎的 glyph.x——位置由调用方显式计算。
+    fn rasterize_char(
+        &mut self,
+        ch: char,
+        bold: bool,
+        cache: &mut SwashCache,
+        atlas: &mut Vec<u8>,
+        next_x: &mut u32,
+        next_y: &mut u32,
+        row_h: &mut u32,
+        atlas_size: u32,
+    ) -> Option<(u32, u32, f32, f32, f32, f32, f32)> {
+        let key = (ch, bold);
+        // 用 self 内的字形缓存
+        if let Some(cached) = self.glyph_cache.get(&key) {
+            return Some(*cached);
+        }
+
+        // 单个字符排版（cosmic-text 只为拿 glyph 位图）
+        let mut buf = Buffer::new_empty(Metrics::new(16.0, 20.0));
+        buf.set_size(&mut self.font_system, Some(100.0), None);
+        let mut attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+        if bold {
+            attrs = attrs.weight(cosmic_text::Weight::BOLD);
+        }
+        let text: String = ch.to_string();
+        buf.set_text(&mut self.font_system, &text, &attrs, Shaping::Advanced, None);
+
+        // 取第一个 glyph 的位图
+        let mut result = None;
+        for line in buf.layout_runs() {
+            for glyph in line.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let img = match cache.get_image(&mut self.font_system, physical.cache_key) {
+                    Some(img) => img,
+                    None => continue,
+                };
+                let gw = img.placement.width;
+                let gh = img.placement.height;
+                if gw == 0 || gh == 0 {
+                    continue;
+                }
+                // 图集换行
+                if *next_x + gw > atlas_size {
+                    *next_x = 1;
+                    *next_y += (*row_h).max(1);
+                    *row_h = 0;
+                }
+                if *next_y + gh > atlas_size {
+                    eprintln!("atlas overflow: ch={:?} w={} h={}", ch, gw, gh);
+                    continue;
+                }
+                // 复制位图（Mask 单通道 alpha → RGBA 白字）
+                for py in 0..gh {
+                    for px in 0..gw {
+                        let src = (py * gw + px) as usize;
+                        let a = img.data[src.min(img.data.len() - 1)];
+                        let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
+                        atlas[idx] = 255;
+                        atlas[idx + 1] = 255;
+                        atlas[idx + 2] = 255;
+                        atlas[idx + 3] = a;
+                    }
+                }
+                let u0 = *next_x as f32 / atlas_size as f32;
+                let v0 = *next_y as f32 / atlas_size as f32;
+                let u1 = (*next_x + gw) as f32 / atlas_size as f32;
+                let v1 = (*next_y + gh) as f32 / atlas_size as f32;
+                *next_x += gw;
+                *row_h = (*row_h).max(gh);
+                result = Some((gw, gh, u0, v0, u1, v1, physical.y as f32));
+                break;
+            }
+            if result.is_some() {
+                break;
+            }
+        }
+
+        if let Some(r) = result {
+            self.glyph_cache.insert(key, r);
+        }
+        result
     }
 
     fn render(&mut self, renderer: &mut Renderer) {
@@ -393,10 +440,17 @@ impl App {
                 depth_or_array_layers: 1,
             },
         );
+        // 上传 screen size 到 uniform（像素 → NDC）
+        let w = renderer.config.width as f32;
+        let h = renderer.config.height as f32;
+        renderer
+            .queue
+            .write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&[w, h]));
+
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas bg"),
-            layout: &renderer.pipeline.get_bind_group_layout(0),
+            layout: &renderer.pipeline.get_bind_group_layout(1),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -469,7 +523,8 @@ impl App {
                 ..Default::default()
             });
             rpass.set_pipeline(&renderer.pipeline);
-            rpass.set_bind_group(0, renderer.bind_group.as_ref().unwrap(), &[]);
+            rpass.set_bind_group(0, &renderer.uniform_bind_group, &[]);
+            rpass.set_bind_group(1, renderer.bind_group.as_ref().unwrap(), &[]);
             // 顶点布局: xy(f32x2) uv(f32x2) color(f32x4)
             rpass.set_vertex_buffer(0, renderer.vertex_buffer.slice(..));
             rpass.set_index_buffer(renderer.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -535,31 +590,58 @@ impl ApplicationHandler for App {
             label: Some("term_grid shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("term_grid.wgsl").into()),
         });
+        // uniform buffer：screen size（像素 → NDC 用）
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screen uniform"),
+            size: 8, // vec2<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("uniform bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("uniform bg"),
+            layout: &uniform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let atlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("atlas bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("term_grid layout"),
-            bind_group_layouts: &[&device.create_bind_group_layout(
-                &wgpu::BindGroupLayoutDescriptor {
-                    label: Some("atlas bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                    ],
-                },
-            )],
+            bind_group_layouts: &[&uniform_bgl, &atlas_bgl],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -627,6 +709,8 @@ impl ApplicationHandler for App {
             surface,
             config,
             pipeline,
+            uniform_buffer,
+            uniform_bind_group,
             vertex_buffer: empty_vbuf,
             index_buffer: empty_ibuf,
             atlas_texture: None,
