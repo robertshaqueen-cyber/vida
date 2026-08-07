@@ -57,8 +57,11 @@ type PendingMap = HashMap<u64, oneshot::Sender<DaemonResult<serde_json::Value>>>
 pub enum PushMsg {
     /// 终端二进制帧（已解出 session_id，bytes 为完整 payload）。
     Frame { session_id: String, bytes: Vec<u8> },
-    /// 会话结束事件。
-    SessionClosed { session_id: String, exit_code: u32 },
+    /// 会话结束事件。exit_code 缺失时为 None（未知退出码，不伪造 0）。
+    SessionClosed {
+        session_id: String,
+        exit_code: Option<u32>,
+    },
 }
 
 /// 推送订阅注册表：session_id → 推送出口。
@@ -404,23 +407,26 @@ fn forward_text_push(text: &str, registry: &PushRegistry) {
     }
     match event.event.as_str() {
         "session_closed" => {
-            let session_id = event
-                .data
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let exit_code = event
-                .data
-                .get("exit_code")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default() as u32;
+            // session_id 缺失/类型错误：记 warn 并丢弃，不构造空串——
+            // 否则 reg.get("") 查不到订阅者，事件被静默吞掉。
+            let Some(session_id) = event.data.get("session_id").and_then(|v| v.as_str()) else {
+                tracing::warn!(
+                    "session_closed 事件缺少有效的 session_id: {}",
+                    event.data
+                );
+                return;
+            };
+            // exit_code 缺失 → None（未知退出码），不伪造 0。
+            let exit_code = event.data.get("exit_code").and_then(|v| v.as_u64()).map(|v| v as u32);
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if let Some(tx) = reg.get(&session_id) {
-                let _ = tx.send(PushMsg::SessionClosed { session_id, exit_code });
+            if let Some(tx) = reg.get(session_id) {
+                let _ = tx.send(PushMsg::SessionClosed {
+                    session_id: session_id.to_string(),
+                    exit_code,
+                });
             }
         }
         _ => {}

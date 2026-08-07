@@ -56,6 +56,8 @@ pub struct VidaApp {
     /// 调试终端的会话 id（M2b-1）。有值时 subscription() 挂起推送接收
     /// stream；空闲时 recv().await 挂起 → CPU ≈ 0%。
     debug_terminal_sid: Option<String>,
+    /// 终端重连冷却（10 秒内最多重连一次，防止 daemon 未恢复时空转）。
+    terminal_reconnect_cooldown: Option<std::time::Instant>,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -112,6 +114,13 @@ pub enum AppMessage {
     TerminalOpened { session_id: String },
     /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
     TerminalDisconnected,
+    /// 自动重连完成：新连接 + 新会话已就绪。
+    TerminalReconnected {
+        client: WsClient,
+        session_id: String,
+    },
+    /// 自动重连失败（等待冷却后由用户手动重试）。
+    TerminalReconnectFailed(String),
     TerminalSetupError(String),
 
     // Connection
@@ -230,6 +239,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         clipboard_guard: None,
         clipboard_token: 0,
         debug_terminal_sid: None,
+        terminal_reconnect_cooldown: None,
     };
 
     let connect = Task::perform(
@@ -315,6 +325,25 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
             },
         )
     })
+}
+
+/// 打开本地会话并订阅推送，返回 session_id。
+/// 重连路径与首次打开共用（重连后必须重新订阅拿全量帧）。
+async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
+    let resp = client
+        .send("OpenLocalSession", serde_json::json!({"cols": 100, "rows": 40}))
+        .await
+        .map_err(|e| format!("打开会话失败: {}", e.message))?;
+    let sid = resp
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "OpenLocalSession 响应缺少 session_id".to_string())?
+        .to_string();
+    client
+        .send("SubscribeSession", serde_json::json!({"session_id": sid}))
+        .await
+        .map_err(|e| format!("订阅失败: {}", e.message))?;
+    Ok(sid)
 }
 
 fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
@@ -1452,34 +1481,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             };
             Task::perform(
                 async move {
-                    // 打开本地会话 → 订阅推送 → 拿接收端
-                    match client
-                        .send("OpenLocalSession", serde_json::json!({"cols": 100, "rows": 40}))
-                        .await
-                    {
-                        Ok(resp) => {
-                            let sid = match resp.get("session_id").and_then(|v| v.as_str()) {
-                                Some(s) => s.to_string(),
-                                None => {
-                                    return AppMessage::TerminalSetupError(
-                                        "OpenLocalSession 响应缺少 session_id".to_string(),
-                                    )
-                                }
-                            };
-                            match client
-                                .send("SubscribeSession", serde_json::json!({"session_id": sid}))
-                                .await
-                            {
-                                Ok(_) => AppMessage::TerminalOpened { session_id: sid },
-                                Err(e) => AppMessage::TerminalSetupError(format!(
-                                    "订阅失败: {}",
-                                    e.message
-                                )),
-                            }
-                        }
-                        Err(e) => {
-                            AppMessage::TerminalSetupError(format!("打开会话失败: {}", e.message))
-                        }
+                    match open_and_subscribe(&client).await {
+                        Ok(sid) => AppMessage::TerminalOpened { session_id: sid },
+                        Err(e) => AppMessage::TerminalSetupError(e),
                     }
                 },
                 |msg| msg,
@@ -1494,7 +1498,47 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             if let Screen::Terminal(s) = &mut app.screen {
                 s.closed = true;
             }
-            tracing::warn!("终端推送连接断开（如需恢复请重新打开调试终端）");
+            tracing::warn!("终端推送连接断开，尝试自动重连");
+            // 冷却：10 秒内最多触发一次重连，防止 daemon 未恢复时空转
+            let now = std::time::Instant::now();
+            if app
+                .terminal_reconnect_cooldown
+                .is_some_and(|t| now < t)
+            {
+                return Task::none();
+            }
+            app.terminal_reconnect_cooldown = Some(now + std::time::Duration::from_secs(10));
+            Task::perform(
+                async {
+                    // 先等 5 秒让 daemon 有时间恢复
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    match WsClient::connect().await {
+                        Ok(client) => {
+                            // 新连接 → 必须重新 OpenLocalSession + SubscribeSession
+                            // 拿全量帧（规格 4.3：不能沿用旧 grid 打增量）。
+                            match open_and_subscribe(&client).await {
+                                Ok(sid) => {
+                                    AppMessage::TerminalReconnected { client, session_id: sid }
+                                }
+                                Err(e) => AppMessage::TerminalReconnectFailed(e),
+                            }
+                        }
+                        Err(e) => AppMessage::TerminalReconnectFailed(e.to_string()),
+                    }
+                },
+                |msg| msg,
+            )
+        }
+        AppMessage::TerminalReconnected { client, session_id } => {
+            // 新 WsClient（新 Arc 指针）→ subscription identity 变化 → iced
+            // 重启推送 stream → 首次迭代订阅新会话 → 收到全量帧。
+            app.ws_client = Some(client);
+            app.debug_terminal_sid = Some(session_id.clone());
+            app.screen = Screen::Terminal(s_terminal::TerminalSession::new(session_id, 40, 100));
+            Task::none()
+        }
+        AppMessage::TerminalReconnectFailed(msg) => {
+            tracing::error!("终端自动重连失败: {}（可返回后重新打开调试终端）", msg);
             Task::none()
         }
         AppMessage::TerminalSetupError(msg) => {
@@ -1532,7 +1576,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             };
             if session.session_id == session_id {
                 session.closed = true;
-                tracing::info!("终端会话 {} 结束, exit_code={}", session_id, exit_code);
+                session.exit_code = exit_code;
+                match exit_code {
+                    Some(code) => tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code),
+                    None => tracing::info!("终端会话 {} 结束, 退出码未知", session_id),
+                }
             }
             Task::none()
         }

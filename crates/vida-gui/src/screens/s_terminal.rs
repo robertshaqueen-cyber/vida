@@ -19,6 +19,8 @@ pub struct TerminalSession {
     pub grid: ClientGrid,
     /// 会话是否已结束（session_closed 事件）。
     pub closed: bool,
+    /// 退出码（None = 未知，如被信号终止）。
+    pub exit_code: Option<u32>,
 }
 
 impl TerminalSession {
@@ -27,6 +29,7 @@ impl TerminalSession {
             session_id,
             grid: ClientGrid::new(rows, cols),
             closed: false,
+            exit_code: None,
         }
     }
 
@@ -44,7 +47,11 @@ impl TerminalSession {
     /// 渲染终端画面 + 会话状态栏。
     pub fn view(&self) -> Element<'_, AppMessage> {
         let status = if self.closed {
-            text("会话已结束（shell 退出）").size(12)
+            let code_text = match self.exit_code {
+                Some(code) => format!("会话已结束（shell 退出，exit_code={}）", code),
+                None => "会话已结束（shell 退出，退出码未知）".to_string(),
+            };
+            text(code_text).size(12)
         } else {
             text(format!("会话 {}", self.session_id)).size(12)
         };

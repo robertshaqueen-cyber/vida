@@ -1686,3 +1686,91 @@ async fn single_connection_multi_subscribe() {
     assert_eq!(a_after, 0, "取消订阅后会话 A 不应再收到帧");
     assert!(b_after > 0, "取消订阅 A 后会话 B 应继续推送");
 }
+
+/// 断开重连后重新订阅必须拿全量帧（规格 4.3）：
+/// 1. 连接 A 订阅会话，用 for 循环填满屏幕
+/// 2. 断开连接 A（会话仍属 daemon，保留）
+/// 3. 新连接 B 重新订阅同一会话 → 首帧应覆盖全部可见行（全量帧特征）
+#[tokio::test]
+async fn reconnect_resubscribe_gets_full_frame() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, token, _dir) = start_daemon().await;
+    // 连接 A
+    let (mut ws_a, mut reader_a) = connect(addr).await;
+    let auth_a = format!(r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token);
+    let resp = send_recv(&mut ws_a, &mut reader_a, &auth_a).await;
+    assert_eq!(resp["type"], "Ok");
+
+    let resp = send_recv(
+        &mut ws_a,
+        &mut reader_a,
+        r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":24},"id":2}"#,
+    )
+    .await;
+    let sid = resp["result"]["session_id"].as_str().unwrap().to_string();
+
+    let sub_a = format!(
+        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":3}}"#,
+        sid
+    );
+    let resp = send_recv(&mut ws_a, &mut reader_a, &sub_a).await;
+    assert_eq!(resp["type"], "Ok");
+
+    // 填满屏幕：echo 24 行（ 结尾触发命令执行）
+    let mut data: Vec<u8> = b"for i in $(seq 1 24); do echo fill$i; done".to_vec();
+    data.push(0x0D);
+    let input = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{:?}}},"id":4}}"#,
+        sid, data
+    );
+    ws_a.send(Message::Text(input.into())).await.unwrap();
+
+    // 等输出完成（约 1.5 秒）
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // 断开连接 A
+    drop(ws_a);
+    drop(reader_a);
+
+    // 连接 B：重新订阅同一会话
+    let (mut ws_b, mut reader_b) = connect(addr).await;
+    let auth_b = format!(r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#, token);
+    let resp = send_recv(&mut ws_b, &mut reader_b, &auth_b).await;
+    assert_eq!(resp["type"], "Ok");
+
+    let sub_b = format!(
+        r#"{{"method":"SubscribeSession","params":{{"session_id":"{}"}},"id":2}}"#,
+        sid
+    );
+    let resp = send_recv(&mut ws_b, &mut reader_b, &sub_b).await;
+    assert_eq!(resp["type"], "Ok", "重新订阅失败: {}", resp);
+
+    // 收到的第一帧必须是全量帧：lines 覆盖全部 24 个可见行（fill1..24 占满）
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut full_line_count: Option<usize> = None;
+    while tokio::time::Instant::now() < deadline {
+        match reader_b.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let (sid_b, payload) = decode_frame_header(&bytes);
+                assert_eq!(sid_b, sid, "帧的 session_id 应正确");
+                // payload: [seq:8][cursor_row:2][cursor_col:2][cursor_visible:1][line_count:2]
+                if payload.len() >= 15 {
+                    let line_count = u16::from_be_bytes([payload[13], payload[14]]) as usize;
+                    full_line_count = Some(line_count);
+                    break;
+                }
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => panic!("read error: {:?}", e),
+            None => panic!("connection closed before full frame"),
+            _ => {}
+        }
+    }
+    let line_count = full_line_count.expect("应收到全量帧");
+    assert!(
+        line_count >= 20,
+        "重新订阅后的首帧应覆盖大部分可见行（全量帧特征），实际 {} 行",
+        line_count
+    );
+}
