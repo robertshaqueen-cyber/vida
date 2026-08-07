@@ -283,7 +283,8 @@ impl App {
                     // 推进列：普通 1，宽 2
                     let advance = if r.ch as u32 > 0xFF { 2 } else { 1 };
                     col += advance;
-                }
+
+}
                 let _ = col;
 
                 // 下划线：run 级一次绘制（整 run 宽度下方 1px 线）
@@ -530,6 +531,7 @@ impl App {
             rpass.set_index_buffer(renderer.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..(idx.len() as u32), 0, 0..1);
         }
+
         renderer.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }

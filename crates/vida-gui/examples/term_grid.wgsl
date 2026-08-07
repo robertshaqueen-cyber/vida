@@ -37,6 +37,6 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).r;
+    let alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).a;
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
