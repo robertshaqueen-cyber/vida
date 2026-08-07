@@ -781,6 +781,25 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
   58.6%，粗体字形是独立位图会再翻倍，故保守扩 1024）。纹理
   4MB，可接受。溢出有 warn（非静默丢弃）
 
+**终端字体显式指定**（M2b-1 评审，字体观感根因）：ASCII 曾用
+`CourierNewPSMT`（Courier New）——「发虚/和 GUI 原生字体不一样」
+的根因，与渲染管线无关。
+- **引入原因**：为绕开 GB18030 Bitmap（无矢量轮廓）删除所有含
+  "Bitmap" 的字体，副作用是**改变了 monospace fallback 顺序**，
+  Courier New（fontdb 加载顺序靠前）排到 Menlo 之前
+- **修正**：主字体显式 `Family::Name("Menlo")`（产品决策，不依赖
+  fallback 顺序）；`VIDA_FONT_FAMILY` 可覆盖；缺失时按候选回落
+  `Menlo → SF Mono → Monaco → 默认 monospace` 并 warn；启动日志
+  打印 'A'/'你' 实际字体名（log_face_names）
+- 中文仍走 fallback（BIZ UDGothic 等有矢量轮廓的字体）；
+  「删除含 Bitmap 字体」逻辑保留（防止位图字体混入），其副作用
+  由显式主字体消除
+- 配置接口：`VIDA_FONT_SIZE`（默认 16，范围 8-48）、
+  `VIDA_FONT_FAMILY`（默认 Menlo）——M2b-3 设置页接入时迁移为
+  Settings 字段
+- Menlo 16px 实测（scale=1）：cell_width=10、cell_height=20、
+  ascent=14（decisions.md 本轮记录）
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；

@@ -45,6 +45,8 @@ struct FontMetrics {
     ascent: f32,
     /// 光栅化缩放因子（= viewport scale_factor）。
     scale: f32,
+    /// 逻辑字号（em 单位）。默认 16，可用 VIDA_FONT_SIZE 覆盖。
+    font_size: f32,
 }
 
 /// 终端默认配色（主题色）。
@@ -105,6 +107,8 @@ pub struct TermPipeline {
     is_srgb: bool,
     /// 一次性诊断打印标记（测量用）。
     diag_printed: std::sync::atomic::AtomicU8,
+    /// 实际使用的字体族（显式指定 + 回落链解析，不依赖加载顺序）。
+    font_family: String,
 }
 
 impl IcedPrimitive for TermPrimitive {
@@ -121,13 +125,16 @@ impl IcedPrimitive for TermPrimitive {
         let scale = viewport.scale_factor();
         // [测量] 一次性打印 iced 传入的 bounds/viewport 实况
         if pipeline.diag_printed.load(Ordering::Relaxed) == 0 {
-            pipeline
-                .diag_printed
-                .store(1, Ordering::Relaxed);
+            pipeline.diag_printed.store(1, Ordering::Relaxed);
             tracing::info!(
                 "term diag: iced_bounds={:?} self_bounds={:?} physical_size={:?} scale={} metrics={}x{} asc={}",
-                bounds, self.bounds, viewport.physical_size(), scale,
-                pipeline.metrics.cell_width, pipeline.metrics.cell_height, pipeline.metrics.ascent
+                bounds,
+                self.bounds,
+                viewport.physical_size(),
+                scale,
+                pipeline.metrics.cell_width,
+                pipeline.metrics.cell_height,
+                pipeline.metrics.ascent
             );
         }
         // scale 变化（窗口拖到不同 DPI 显示器）：旧字形（按旧 scale 光栅化）
@@ -326,7 +333,12 @@ fn measure_font_at(pipeline: &TermPipeline, scale: f32) -> FontMetrics {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    measure_font(&mut font_system, scale)
+    measure_font(
+        &mut font_system,
+        scale,
+        pipeline.metrics.font_size,
+        &pipeline.font_family,
+    )
 }
 
 /// 把字形级脏区域（x,y,w,h）合并成行区间（y, h），重叠/相邻的合并。
@@ -385,6 +397,8 @@ impl TermPrimitive {
             row_h,
             dirty: Vec::new(),
             scale: metrics.scale,
+            font_size: metrics.font_size,
+            font_family: pipeline.font_family.clone(),
         };
 
         let mut font_system = match pipeline.font_system.lock() {
@@ -573,6 +587,10 @@ struct AtlasState {
     dirty: Vec<(u32, u32, u32, u32)>,
     /// 光栅化 scale（= viewport scale_factor，物理像素）。
     scale: f32,
+    /// 逻辑字号（em）。
+    font_size: f32,
+    /// 实际字体族名（显式指定，非 fallback 结果）。
+    font_family: String,
 }
 
 /// 光栅化单个字符到图集（带缓存）。返回 (宽, 高, u0, v0, u1, v1, baseline, top)。
@@ -596,10 +614,15 @@ fn rasterize_char(
     let row_h = &mut state.row_h;
     let dirty = &mut state.dirty;
 
-    // 字号 × scale（方式 B）：位图与 advance 都是物理像素
-    let mut buf = Buffer::new_empty(Metrics::new(16.0 * scale, 20.0 * scale));
+    // 字号 × scale（方式 B）：位图与 advance 都是物理像素。
+    // 字体族显式指定（不依赖 fallback 顺序——Courier New 曾排在
+    // Menlo 前导致 ASCII 用了旧式打字机衬线体）。
+    let mut buf = Buffer::new_empty(Metrics::new(
+        state.font_size * scale,
+        state.font_size * 1.25 * scale,
+    ));
     buf.set_size(font_system, Some(100.0), None);
-    let mut attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    let mut attrs = Attrs::new().family(cosmic_text::Family::Name(&state.font_family));
     if bold {
         attrs = attrs.weight(cosmic_text::Weight::BOLD);
     }
@@ -753,10 +776,29 @@ fn build_pipeline(
     for id in bitmap_ids {
         db.remove_face(id);
     }
+    // 字体族显式指定（产品决策，不依赖 fallback 顺序）：
+    // VIDA_FONT_FAMILY 覆盖，默认 Menlo；缺失时按候选回落并 warn。
+    // 必须在 db move 进 FontSystem 之前解析。
+    let requested = std::env::var("VIDA_FONT_FAMILY").unwrap_or_else(|_| "Menlo".to_string());
+    let family = resolve_font_family(&db, &requested);
     let mut font_system = FontSystem::new_with_locale_and_db("zh-Hans".into(), db);
     // 初始 scale=1.0；首次 prepare 时用真实 viewport scale 重新测量
-    // （见 apply_scale_change）。
-    let metrics = measure_font(&mut font_system, 1.0);
+    // （见 apply_scale_change）。字号可经 VIDA_FONT_SIZE 覆盖（对照实验用）。
+    let font_size = std::env::var("VIDA_FONT_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| *v >= 8.0 && *v <= 48.0)
+        .unwrap_or(16.0);
+    if family != requested {
+        tracing::warn!(
+            "字体 {} 不可用，回落为 {}（候选: Menlo → SF Mono → Monaco → 默认）",
+            requested,
+            family
+        );
+    }
+    tracing::info!("终端字体: {}（请求 {}）", family, requested);
+    let metrics = measure_font(&mut font_system, 1.0, font_size, &family);
+    log_face_names(&mut font_system, font_size, &family);
 
     tracing::info!("终端渲染 surface format: {:?}", format);
     if format.is_srgb() {
@@ -960,6 +1002,46 @@ fn build_pipeline(
         atlas_cursor: Mutex::new((1, 0, 0)),
         is_srgb: format.is_srgb(),
         diag_printed: std::sync::atomic::AtomicU8::new(0),
+        font_family: family,
+    }
+}
+
+/// 解析实际字体族：请求的字体不可用时按候选回落。
+/// 候选顺序：请求值 → Menlo → SF Mono → Monaco → 默认 monospace。
+fn resolve_font_family(db: &fontdb::Database, requested: &str) -> String {
+    let candidates = [requested, "Menlo", "SF Mono", "Monaco"];
+    for name in candidates {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(name)],
+            ..Default::default()
+        };
+        if db.query(&query).is_some() {
+            return name.to_string();
+        }
+    }
+    "Monospace".to_string()
+}
+
+/// 打印 'A' 与 '你' 实际使用的字体名（启动日志，便于一眼确认）。
+fn log_face_names(font_system: &mut FontSystem, font_size: f32, family: &str) {
+    for ch in ['A', '你'] {
+        let metrics = Metrics::new(font_size, font_size * 1.25);
+        let mut buf = Buffer::new_empty(metrics);
+        buf.set_size(font_system, Some(100.0), None);
+        let attrs = Attrs::new().family(cosmic_text::Family::Name(family));
+        let text: String = ch.to_string();
+        buf.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
+        for line in buf.layout_runs() {
+            for glyph in line.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let name = font_system
+                    .db_mut()
+                    .face(physical.cache_key.font_id)
+                    .map(|f| f.post_script_name.clone())
+                    .unwrap_or_else(|| "未知".to_string());
+                tracing::info!("终端字形 '{}' 使用字体: {}", ch, name);
+            }
+        }
     }
 }
 
@@ -975,17 +1057,25 @@ fn build_pipeline(
 /// x = 0/19.2/38.4/57.6... 落在非整数像素边界，quad 覆盖半个物理
 /// 像素 → 字形边缘被重新采样 → 笔画发虚，且每列小数部分不同，
 /// 整行参差不齐。round() 最接近真实 advance，列累计误差最小。
-fn measure_font(font_system: &mut FontSystem, scale: f32) -> FontMetrics {
-    let metrics = Metrics::new(16.0 * scale, 20.0 * scale);
+fn measure_font(
+    font_system: &mut FontSystem,
+    scale: f32,
+    font_size: f32,
+    family: &str,
+) -> FontMetrics {
+    // 行高 = 字号 × 1.25（16→20 的既有比例）
+    let line_height = font_size * 1.25;
+    let metrics = Metrics::new(font_size * scale, line_height * scale);
     let mut buf = Buffer::new_empty(metrics);
-    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    let attrs = Attrs::new().family(cosmic_text::Family::Name(family));
     buf.set_size(font_system, Some(100.0), None);
     buf.set_text(font_system, "M", &attrs, Shaping::Advanced, None);
     let fallback = FontMetrics {
         cell_width: (9.6 * scale).round().max(1.0),
-        cell_height: (20.0 * scale).round().max(1.0),
+        cell_height: (line_height * scale).round().max(1.0),
         ascent: (14.26 * scale).round(),
         scale,
+        font_size,
     };
     let Some(layout) = buf.layout_runs().next() else {
         tracing::warn!("字体度量失败，使用默认值");
@@ -996,6 +1086,7 @@ fn measure_font(font_system: &mut FontSystem, scale: f32) -> FontMetrics {
         cell_height: metrics.line_height.round().max(1.0),
         ascent: (layout.line_y - layout.line_top).round(),
         scale,
+        font_size,
     }
 }
 
@@ -1140,6 +1231,101 @@ mod tests {
         }
     }
 
+    /// 字号对照实验：16/18/20/22 下 cell 尺寸与 'A' 实际字体名。
+    /// 判定：若字号增大观感改善 → 非渲染 bug，是 16px 的固有效果；
+    /// 若各字号同样发虚 → 渲染问题。
+    #[test]
+    fn diagnostic_font_sizes_and_face() {
+        let (device, queue) = headless_device();
+        let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        for size in [16.0f32, 18.0, 20.0, 22.0] {
+            pipeline.metrics = measure_font_at_size(&pipeline, 1.0, size);
+            let metrics = pipeline.metrics;
+            let mut font_system = pipeline
+                .font_system
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut cache = SwashCache::new();
+            let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
+                std::collections::HashMap::new();
+            let mut state = AtlasState {
+                data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+                next_x: 1,
+                next_y: 0,
+                row_h: 0,
+                dirty: Vec::new(),
+                scale: 1.0,
+                font_size: size,
+                font_family: pipeline.font_family.clone(),
+            };
+            let r = rasterize_char(
+                &mut font_system,
+                &mut cache,
+                &mut glyph_cache,
+                &mut state,
+                ATLAS_SIZE,
+                'A',
+                false,
+            );
+            // 字体名：从 cache_key 的 font_id 查
+            let face_name = rasterize_face_name(&mut font_system, 'A', false, size);
+            match r {
+                Some((gw, gh, ..)) => {
+                    eprintln!(
+                        "[diag] 字号 {}: cell={}x{} asc={} 'A'位图={}x{} 字体={}",
+                        size,
+                        metrics.cell_width,
+                        metrics.cell_height,
+                        metrics.ascent,
+                        gw,
+                        gh,
+                        face_name
+                    );
+                }
+                None => eprintln!("[diag] 字号 {}: 光栅化失败", size),
+            }
+        }
+    }
+
+    /// 查 'A' 光栅化时实际使用的字体名（post script name）。
+    fn rasterize_face_name(
+        font_system: &mut FontSystem,
+        ch: char,
+        bold: bool,
+        font_size: f32,
+    ) -> String {
+        let metrics = Metrics::new(font_size, font_size * 1.25);
+        let mut buf = Buffer::new_empty(metrics);
+        buf.set_size(font_system, Some(100.0), None);
+        let mut attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+        if bold {
+            attrs = attrs.weight(cosmic_text::Weight::BOLD);
+        }
+        let text: String = ch.to_string();
+        buf.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
+        let mut name = String::new();
+        for line in buf.layout_runs() {
+            for glyph in line.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                name = font_system
+                    .db_mut()
+                    .face(physical.cache_key.font_id)
+                    .map(|f| f.post_script_name.clone())
+                    .unwrap_or_else(|| "未知".to_string());
+            }
+        }
+        name
+    }
+
+    /// 用指定字号测量（诊断用）。
+    fn measure_font_at_size(pipeline: &TermPipeline, scale: f32, font_size: f32) -> FontMetrics {
+        let mut font_system = pipeline
+            .font_system
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        measure_font(&mut font_system, scale, font_size, &pipeline.font_family)
+    }
+
     /// 测量第一步：'A' 在 scale=1 与 scale=2 下的实际位图尺寸。
     /// gw≈18-20 表示 2x 光栅化生效；gw≈9-10 表示仍是 1x。
     #[test]
@@ -1149,8 +1335,10 @@ mod tests {
         for scale in [1.0f32, 2.0f32] {
             pipeline.metrics = measure_font_at(&pipeline, scale);
             let metrics = pipeline.metrics;
-            let mut font_system =
-                pipeline.font_system.lock().unwrap_or_else(|e| e.into_inner());
+            let mut font_system = pipeline
+                .font_system
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut cache = SwashCache::new();
             let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
                 std::collections::HashMap::new();
@@ -1161,6 +1349,8 @@ mod tests {
                 row_h: 0,
                 dirty: Vec::new(),
                 scale,
+                font_size: 16.0,
+                font_family: pipeline.font_family.clone(),
             };
             let r = rasterize_char(
                 &mut font_system,
@@ -1206,6 +1396,8 @@ mod tests {
             row_h: 0,
             dirty: Vec::new(),
             scale,
+            font_size: 16.0,
+            font_family: pipeline.font_family.clone(),
         };
 
         // 典型字符集：95 个 ASCII + 常用中文 + 符号
