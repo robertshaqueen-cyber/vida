@@ -704,3 +704,29 @@ loop {
 
 watch 工具已改进：跳过首帧间隔、微秒精度、`--duration` 自动退出
 并打印统计（帧数/字节/平均间隔/低于 16ms 占比）。
+
+### M2b-0 结论 16：字体度量与逐 cell 定位（2026-08-07）
+
+**实测字体度量**（cosmic-text 0.15，Monospace 族，SF Mono/Menlo 回退，
+字号 16px，行高 20px）：
+
+| 指标 | 实测值 | 测量方式 |
+|---|---|---|
+| `cell_width` | **9.63 px** | 排单个 'M'，取 layout `line_w` |
+| `cell_height` | **20.0 px** | Metrics 的 line_height（ascent+descent+line_gap 由字体计算） |
+
+**逐 cell 定位的实现**（term_grid example）：
+- 每个 cell 的 x = `col * cell_width`，显式计算
+- 每个 RLE run 一个 cosmic-text Buffer（run 内同字符），
+  run 的 glyph x = `start_col * cell_width + glyph 内偏移`
+- 宽字符（中文）占 `2 * cell_width`，由 run 的 start_col 推进，
+  **不由字体决定**
+- 不把整行拼成字符串排版——避免字体回退/emoji 时字形宽度
+  与列宽模型不一致
+
+**渲染路径**：cosmic-text 排版 → SwashCache 光栅化字形到 512×512
+图集（灰度 alpha）→ wgpu 纹理 quad 逐 glyph 绘制。属性（粗体用
+Weight::BOLD，下划线画 1.5px 线，反色用黑字+白底）。
+
+**验证要点**：row1 的 `你好世界abc你好`，4 个中文 = 8 列，
+`abc` 起始应在第 16 列——所有者截图确认对齐。
