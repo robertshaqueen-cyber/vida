@@ -30,7 +30,15 @@ wgpu = "27"
 pollster = "0.4"
 raw-window-handle = "0.6"
 objc = "0.2"
+cosmic-text = "0.15"
+fontdb = "0.23"
+bytemuck = { version = "1", features = ["derive"] }
+unicode-width = "0.2.2"
 
 [[example]]
 name = "wgpu_baseline"
 path = "examples/wgpu_baseline.rs"
+
+[[example]]
+name = "term_grid"
+path = "examples/term_grid.rs"

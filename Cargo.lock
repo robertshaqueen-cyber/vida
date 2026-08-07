@@ -5024,6 +5024,9 @@ name = "vida-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
+ "cosmic-text",
+ "fontdb",
  "futures-util",
  "iced",
  "objc",
@@ -5036,6 +5039,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "vida-core",
  "wgpu",
  "winit",

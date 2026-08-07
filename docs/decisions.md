@@ -704,3 +704,61 @@ loop {
 
 watch 工具已改进：跳过首帧间隔、微秒精度、`--duration` 自动退出
 并打印统计（帧数/字节/平均间隔/低于 16ms 占比）。
+
+### M2b-0 结论 16：字体度量与逐 cell 定位（2026-08-07）
+
+**实测字体度量**（cosmic-text 0.15，Monospace 族，SF Mono/Menlo 回退，
+字号 16px，行高 20px）：
+
+| 指标 | 实测值 | 测量方式 |
+|---|---|---|
+| `cell_width` | **9.60 px** | 排单个 'M'，取 layout `line_w`（移除位图字体后主字体为 Menlo） |
+| `cell_height` | **20.0 px** | Metrics 的 line_height（ascent+descent+line_gap 由字体计算） |
+| `ascent` | **14.26 px** | `line_y - line_top`（主字体 Menlo 的基线到行顶距离），全局统一基线 |
+
+**统一基线**（M2b-0 必改 3）：所有字符（含 fallback 字体）用主字体 ascent 对齐：
+`glyph_y = row_y + ascent - placement.top`。不用各字体自己的度量——
+中英文基线不一致是「中文偏下/abc 上标」的成因。
+
+**反色**（M2b-0 必改 2）：前景/背景对调，背景 quad 条件为
+`bg.is_some() || reverse`，reverse 时背景取 run 前景色。
+
+**宽字符判定**（M2b-0 必改 1）：用 unicode-width crate 按 East Asian Width
+判定（`U+00FF` 以上不算宽，é ü α β → ✓ ● 都是单列）。
+这是 example 临时方案——M2b-1 后宽字符由 daemon 推送协议 flags 的
+WIDE 位提供，客户端不再自行判定，两处判定必须一致。
+
+**防复发约定：字符数 ≠ 列数**（M2b-0 必改 1 后半 + 评审）：
+终端渲染中「字符数」与「列数」是两个量。凡涉及位置或宽度的计算
+一律用列数（背景 quad、下划线、run 跨度 = `run_cols` = 各字符列宽
+之和），只有遍历字符时才用字符数（`run_len`）。
+本轮已因混用出现两次错误：①字形列推进用列、背景宽度用字符数；
+②初始实现里宽字符判定用 `ch > 0xFF` 把 é ü α β 误判为双列。
+M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
+客户端不得再用字符数参与任何几何计算。
+
+**对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
+每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
+80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；
+反色块白底边缘 [col24, col28) 与列边界精确重合。
+
+**教训：macOS 'GB18030 Bitmap' 纯位图中文字体**（无 glyf/cff 矢量轮廓表）：
+cosmic-text 的 swash 光栅化对它会静默失败（get_image 返回 None），
+中文 fallback 选中它导致字形缺失。构造 FontSystem 时必须用自定义 fontdb
+移除 post_script_name 含 'Bitmap' 的字体，fallback 才会选中有轮廓的字体。
+
+**逐 cell 定位的实现**（term_grid example）：
+- 每个 cell 的 x = `col * cell_width`，显式计算
+- 每个 RLE run 一个 cosmic-text Buffer（run 内同字符），
+  run 的 glyph x = `start_col * cell_width + glyph 内偏移`
+- 宽字符（中文）占 `2 * cell_width`，由 run 的 start_col 推进，
+  **不由字体决定**
+- 不把整行拼成字符串排版——避免字体回退/emoji 时字形宽度
+  与列宽模型不一致
+
+**渲染路径**：cosmic-text 排版 → SwashCache 光栅化字形到 512×512
+图集（灰度 alpha）→ wgpu 纹理 quad 逐 glyph 绘制。属性（粗体用
+Weight::BOLD，下划线画 1.5px 线，反色用黑字+白底）。
+
+**验证要点**：row 2 的 `你好世界abc你好`，4 个中文 = 8 列，
+`abc` 起始应在第 16 列——所有者截图确认对齐。
