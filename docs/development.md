@@ -431,6 +431,19 @@ vmmap --summary $DAEMON_PID | grep "Physical footprint"
 | `yes` 持续输出时 GUI CPU | 记录实测值（yes 命令从 vida-term-test 发出） |
 | 单终端 GUI 内存增量 | `vmmap --summary <pid>` Physical footprint，注意 scale factor |
 
+### 检查点 B 实测结果（2026-08-07，1920×1080 非 HiDPI，scale=1）
+
+| 指标 | 实测值 |
+|---|---|
+| 空闲 CPU | **0.0%**（终端屏打开、无输出时；无常驻定时器） |
+| `yes` 持续输出时 GUI CPU | **18-41%**（满屏 60fps 真实渲染：每帧重建几何 + 字形光栅化 + 上传） |
+| 单终端标签内存增量 | **16.9M**（33.6 → 50.5M，首标签含 iced pipeline 缓存：图集 4MB + 字形缓存；后续标签复用） |
+| 字体 | Menlo-Regular（显式指定）+ PingFangSC-Regular（中文 fallback） |
+| cell 尺寸（scale=1） | 10×20，ascent=16 |
+
+**验收结论**：echo hello / ls --color / vim / 中文 ls 全部正确；空闲零 CPU；
+daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
+
 ### 手动验收步骤（GUI 只读，命令从 vida-term-test 发）
 
 1. 启动 daemon（保持运行），启动 GUI，进入主界面后点击左侧「▮_」调试终端按钮

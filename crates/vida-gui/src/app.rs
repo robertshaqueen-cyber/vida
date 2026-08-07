@@ -61,8 +61,8 @@ pub struct VidaApp {
     debug_terminal_sid: Option<String>,
     /// 终端重连冷却（10 秒内最多重连一次，防止 daemon 未恢复时空转）。
     terminal_reconnect_cooldown: Option<std::time::Instant>,
-    /// 终端帧计数（诊断用）。
-    term_diag_count: u64,
+    /// 进入终端屏时备份的 Main 屏状态（返回时恢复，不丢失主界面状态）。
+    main_state_backup: Option<s3_main::State>,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -256,7 +256,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         clipboard_token: 0,
         debug_terminal_sid: None,
         terminal_reconnect_cooldown: None,
-        term_diag_count: 0,
+        main_state_backup: None,
     };
 
     let connect = Task::perform(
@@ -309,13 +309,6 @@ impl VidaApp {
 /// 帧到达 → TerminalPush；无推送时 recv().await 挂起 → 空闲 CPU ≈ 0%。
 /// 连接断开（sender drop）→ recv 返回 None → TerminalDisconnected。
 fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
-    // [diag] subscription 调用计数：iced 每次 update 后重新求值。
-    // 若每秒 60 次 → subscription 每次重建（身份比较失败）。
-    static SUB_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SUB_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n <= 5 || n.is_multiple_of(100) {
-        tracing::info!("[diag] subscription() 调用 #{}", n);
-    }
     let Some(ws) = app.ws_client.as_ref() else {
         return iced::Subscription::none();
     };
@@ -1537,10 +1530,20 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::TerminalOpened { session_id } => {
             app.debug_terminal_sid = Some(session_id.clone());
+            // 备份当前 Main 屏状态（hosts/tabs 等在 VidaApp 上，但 Main 的
+            // UI 状态如已揭示凭据需保留），返回时恢复。
+            if let Screen::Main(s) = &app.screen {
+                app.main_state_backup = Some(s.clone());
+            }
             app.screen = Screen::Terminal(s_terminal::TerminalSession::new(session_id, 40, 100));
             Task::none()
         }
         AppMessage::TerminalDisconnected => {
+            // 主动取消（点返回 → unsubscribe → rx 关闭）也会走到这里：
+            // 此时已不在终端屏，不重连（否则用户返回后被拉回终端）。
+            if !matches!(app.screen, Screen::Terminal(_)) {
+                return Task::none();
+            }
             if let Screen::Terminal(s) = &mut app.screen {
                 s.closed = true;
             }
@@ -1627,6 +1630,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             session_id,
             notice,
         } => {
+            // 重连任务飞行期间用户可能已返回主界面：不再重新打开终端屏。
+            if !matches!(app.screen, Screen::Terminal(_)) {
+                app.ws_client = Some(client);
+                return Task::none();
+            }
             // 新 WsClient（新 Arc 指针）→ subscription identity 变化 → iced
             // 重启推送 stream → 首次迭代订阅 → 收到全量帧。
             app.ws_client = Some(client);
@@ -1670,16 +1678,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let Screen::Terminal(session) = &mut app.screen else {
                 return Task::none();
             };
-            // [diag] 帧计数 + version：判断「daemon 每帧推」vs「grid 每帧变」
-            app.term_diag_count += 1;
-            if app.term_diag_count <= 5 || app.term_diag_count.is_multiple_of(100) {
-                tracing::info!(
-                    "[diag] 帧 #{} version={} bytes={}",
-                    app.term_diag_count,
-                    session.grid.version,
-                    bytes.len()
-                );
-            }
+
             if session.session_id != session_id {
                 return Task::none();
             }
@@ -1721,16 +1720,19 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::CloseDebugTerminal => {
-            if let Some(client) = app.ws_client.as_ref() {
-                let client = client.clone();
-                let sid = match &app.screen {
-                    Screen::Terminal(s) => s.session_id.clone(),
-                    _ => String::new(),
-                };
-                client.unsubscribe(&sid);
-                let _ = sid;
+            // 取消订阅 + 恢复 Main 屏
+            if let Some(client) = app.ws_client.as_ref()
+                && let Screen::Terminal(s) = &app.screen
+            {
+                client.unsubscribe(&s.session_id);
             }
             app.debug_terminal_sid = None;
+            app.terminal_reconnect_cooldown = None;
+            let main_state = app.main_state_backup.take().unwrap_or(s3_main::State {
+                revealed_credential: None,
+                credential_copied: false,
+            });
+            app.screen = Screen::Main(main_state);
             Task::none()
         }
     }
