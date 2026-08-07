@@ -191,7 +191,20 @@ struct Renderer {
 
 impl App {
     fn new() -> Self {
-        let mut font_system = FontSystem::new();
+        // 系统含 "GB18030 Bitmap" 等纯位图 CJK 字体（无 glyf/cff 轮廓表），
+        // swash 无法光栅化轮廓导致字形缺失。构造自定义 fontdb 移除它们，
+        // 使 fallback 选中有轮廓的字体（如 BIZ UDGothic）。
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let bitmap_ids: Vec<_> = db
+            .faces()
+            .filter(|f| f.post_script_name.contains("Bitmap"))
+            .map(|f| f.id)
+            .collect();
+        for id in bitmap_ids {
+            db.remove_face(id);
+        }
+        let mut font_system = FontSystem::new_with_locale_and_db("zh-Hans".into(), db);
         let metrics = measure_font(&mut font_system);
         eprintln!(
             "cell_width={:.2}px cell_height={:.2}px",
