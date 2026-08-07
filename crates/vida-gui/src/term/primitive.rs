@@ -54,7 +54,9 @@ struct FontMetrics {
 const DEFAULT_FG: (u8, u8, u8) = (255, 255, 255);
 const DEFAULT_BG: (u8, u8, u8) = (40, 44, 52);
 const DEFAULT_FONT_SIZE: f32 = 13.0;
-/// Ghostty 风格的默认行高：13px 字号对应约 18px 行高。
+/// 终端设置沿用 Ghostty 等终端的 pt 语义；cosmic-text 的 size 单位是 px。
+const POINTS_TO_PIXELS: f32 = 96.0 / 72.0;
+/// Ghostty 风格的默认行高：13pt 字号对应约 18px 行高。
 const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
 
 /// 字形缓存条目：(宽, 高, u0, v0, u1, v1, placement.left, placement.top)。
@@ -195,7 +197,9 @@ impl ViewportMetrics {
             .filter(|value| *value >= 8.0 && *value <= 48.0)
             .unwrap_or(DEFAULT_FONT_SIZE);
         (
-            (font_size * 0.6 * scale).round().max(1.0),
+            (font_size * POINTS_TO_PIXELS * 0.6 * scale)
+                .round()
+                .max(1.0),
             (font_size * LINE_HEIGHT_MULTIPLIER * scale)
                 .round()
                 .max(1.0),
@@ -817,7 +821,7 @@ fn rasterize_char(
     // 字体族显式指定（不依赖 fallback 顺序——Courier New 曾排在
     // Menlo 前导致 ASCII 用了旧式打字机衬线体）。
     let mut buf = Buffer::new_empty(Metrics::new(
-        state.font_size * scale,
+        state.font_size * POINTS_TO_PIXELS * scale,
         state.font_size * LINE_HEIGHT_MULTIPLIER * scale,
     ));
     buf.set_size(font_system, Some(100.0), None);
@@ -1252,7 +1256,10 @@ fn resolve_font_family(db: &fontdb::Database, requested: &str) -> String {
 /// 打印 'A' 与 '你' 实际使用的字体名（启动日志，便于一眼确认）。
 fn log_face_names(font_system: &mut FontSystem, font_size: f32, family: &str) {
     for ch in ['A', '你'] {
-        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_MULTIPLIER);
+        let metrics = Metrics::new(
+            font_size * POINTS_TO_PIXELS,
+            font_size * LINE_HEIGHT_MULTIPLIER,
+        );
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
         let attrs = Attrs::new()
@@ -1292,17 +1299,19 @@ fn measure_font(
     font_size: f32,
     family: &str,
 ) -> FontMetrics {
-    // 行高 = 字号 × 1.4：13px → 18px，接近 Ghostty 默认视觉密度。
+    // 行高 = 设置点数 × 1.4：13pt → 18px，接近 Ghostty 默认视觉密度。
     let line_height = font_size * LINE_HEIGHT_MULTIPLIER;
-    let metrics = Metrics::new(font_size * scale, line_height * scale);
+    let metrics = Metrics::new(font_size * POINTS_TO_PIXELS * scale, line_height * scale);
     let mut buf = Buffer::new_empty(metrics);
     let attrs = Attrs::new().family(cosmic_text::Family::Name(family));
     buf.set_size(font_system, Some(100.0), None);
     buf.set_text(font_system, "M", &attrs, Shaping::Advanced, None);
     let fallback = FontMetrics {
-        cell_width: (9.6 * scale).round().max(1.0),
+        cell_width: (font_size * POINTS_TO_PIXELS * 0.6 * scale)
+            .round()
+            .max(1.0),
         cell_height: (line_height * scale).round().max(1.0),
-        ascent: (font_size * 1.08 * scale).round(),
+        ascent: (font_size * POINTS_TO_PIXELS * 0.8 * scale).round(),
         scale,
         font_size,
     };
@@ -1323,11 +1332,11 @@ fn measure_font(
 mod tests {
     use super::*;
 
-    /// 验证 upload_atlas_rows 的 layout 参数（行距 2048、对齐、源缓冲大小）
-    /// 在真实 wgpu 校验层可通过。参数错误会 panic，测试失败即暴露。
+    /// 验证 upload_atlas_rows 的 layout 参数，并从 GPU 回读逐字节比对。
+    /// 行距、偏移或上传范围有任何错误都会直接失败。
     /// 用 headless 实例（无窗口），与 GUI 用同一 wgpu 版本（27）。
     #[test]
-    fn atlas_row_upload_passes_validation() {
+    fn atlas_row_upload_roundtrips_exact_pixels() {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -1359,24 +1368,64 @@ mod tests {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
         let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
         atlas[3] = 255;
+        let probe_a = ((3 * ATLAS_SIZE + 17) * 4) as usize;
+        atlas[probe_a..probe_a + 4].copy_from_slice(&[11, 22, 33, 44]);
+        let probe_b = ((9 * ATLAS_SIZE + (ATLAS_SIZE - 1)) * 4) as usize;
+        atlas[probe_b..probe_b + 4].copy_from_slice(&[55, 66, 77, 88]);
 
         // 单行区间（自检路径）
         upload_atlas_rows(&texture, &queue, &atlas, 0, 1);
         // 多行区间（首帧字形打包后通常跨多行）
         upload_atlas_rows(&texture, &queue, &atlas, 3, 7);
-        queue.submit([]);
+        let expected = extract_rows(&atlas, 3, 7);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atlas readback"),
+            size: expected.len() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("atlas readback encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 3, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(ATLAS_SIZE * 4),
+                    rows_per_image: Some(7),
+                },
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: 7,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device
             .poll(wgpu::PollType::Wait {
-                submission_index: None,
+                submission_index: Some(submission),
                 timeout: Some(std::time::Duration::from_secs(2)),
             })
             .expect("提交应成功");
+        let mapped = readback.slice(..).get_mapped_range();
+        assert_eq!(&*mapped, expected.as_slice(), "GPU 图集回读必须逐字节一致");
     }
 
     /// 合并逻辑：重叠/相邻的脏区域应合并为同一行区间。
@@ -1599,7 +1648,9 @@ mod tests {
                             metrics.cell_height
                         );
                         if size == DEFAULT_FONT_SIZE {
+                            assert_eq!(metrics.cell_width, 10.0);
                             assert_eq!(metrics.cell_height, 18.0);
+                            assert_eq!(metrics.ascent, 15.0);
                         }
                         eprintln!(
                             "[diag] 字号 {}: cell={}x{} asc={} '{}' bold={} 位图={}x{} left={} top={} bottom={} 字体={}",
@@ -1632,7 +1683,10 @@ mod tests {
         font_size: f32,
         family: &str,
     ) -> String {
-        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_MULTIPLIER);
+        let metrics = Metrics::new(
+            font_size * POINTS_TO_PIXELS,
+            font_size * LINE_HEIGHT_MULTIPLIER,
+        );
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
         let mut attrs = Attrs::new().family(cosmic_text::Family::Name(family));

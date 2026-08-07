@@ -854,10 +854,13 @@ Regular 下显得过细、像被横向压扁。宽字符普通输出改用字体
 只保留 `monospaced` family，避免比例字体破坏固定 cell；字号使用一组常用整数选项。
 配置中已不存在的字体回落到已安装的 Menlo，再回落到列表第一项。
 
-连续输出验收显示 13px / 16px 行高虽然字形边界理论上未越界，但视觉密度明显高于
-Ghostty，多行中文像互相遮盖。默认行高从字号的 1.25 倍调整为 1.4 倍：Menlo 13
-在 scale=1 下为 cell 8×18、ascent 14。字形诊断测试同时断言 Menlo Regular/Bold
-和 PingFang Medium 的实际位图上下界均位于 cell 内。
+连续输出验收显示原实现还把终端设置的 13pt 错当成了 13px，Menlo `A` 最终只有
+8×9px，低分辨率 hinting 让笔画像被随机切掉。终端字号现在明确使用 pt 语义，
+光栅化前按 `96/72` 转成 cosmic-text 的 px；行高仍按设置点数的 1.4 倍计算。
+Menlo 13pt 在 scale=1 下为 cell 10×18、ascent 15，`A` 位图 10×12，PingFang
+Medium 中文位图 17×17。诊断测试断言这些位图的上下界都位于 cell 内。
+图集增量上传测试会把跨行探针写入 GPU 纹理，再复制回 MAP_READ buffer 与 CPU 图集
+逐字节比较；因此本次缺笔已确认不是 atlas 行距、上传范围或 GPU 数据损坏。
 
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
