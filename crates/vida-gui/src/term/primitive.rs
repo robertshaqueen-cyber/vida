@@ -33,12 +33,18 @@ struct Vertex {
 }
 
 /// 字体度量（与 M2b-0 一致）。
+///
+/// 约定（decisions.md）：**内部一律用物理像素**，只有与 iced 布局交互
+/// （widget bounds、鼠标坐标）时才做换算。cell_* / ascent 都是物理像素值，
+/// scale 变化（跨 DPI 拖动窗口）时重新测量。
 #[derive(Clone, Copy)]
 struct FontMetrics {
     cell_width: f32,
     cell_height: f32,
     /// 主字体 ascent（基线到顶部距离），全局统一基线。
     ascent: f32,
+    /// 光栅化缩放因子（= viewport scale_factor）。
+    scale: f32,
 }
 
 /// 终端默认配色（主题色）。
@@ -82,8 +88,10 @@ pub struct TermPipeline {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     vertex_count: u32,
-    /// 字形缓存：跨帧复用，同字符同粗体只光栅化一次。
-    glyph_cache: Mutex<std::collections::HashMap<(char, bool), GlyphEntry>>,
+    /// 字形缓存：跨帧复用，同字符同粗体同 scale 只光栅化一次。
+    /// key = (char, bold, scale.to_bits())——scale 变化（跨 DPI 拖动）
+    /// 时旧字形必须失效重新光栅化。
+    glyph_cache: Mutex<std::collections::HashMap<(char, bool, u32), GlyphEntry>>,
     /// 已构建的 grid 版本号：prepare 里 O(1) 跳过未变化的帧。
     built_version: AtomicU64,
     /// 图集持久数据（增量上传用）。
@@ -104,13 +112,22 @@ impl IcedPrimitive for TermPrimitive {
         _bounds: &Rectangle,
         viewport: &Viewport,
     ) {
+        let scale = viewport.scale_factor();
+        // scale 变化（窗口拖到不同 DPI 显示器）：旧字形（按旧 scale 光栅化）
+        // 必须全部失效——重置字形缓存/图集/cursor 并强制全量重建。
+        // 注意 built_version 比较在 scale 检查之后：scale 变了即使 version
+        // 相同也要重建（图集内容变了）。
+        if pipeline.metrics.scale != scale {
+            reset_atlas(pipeline, device, queue, scale);
+            pipeline.metrics = measure_font_at(pipeline, scale);
+        }
+
         let version = self.snapshot.version;
         // O(1) 跳过：grid 未变化不重建任何东西
         if pipeline.built_version.load(Ordering::Relaxed) == version {
             return;
         }
 
-        let scale = viewport.scale_factor();
         let origin_x = self.bounds.x * scale;
         let origin_y = self.bounds.y * scale;
 
@@ -196,8 +213,13 @@ impl IcedPrimitive for TermPrimitive {
     }
 }
 
-/// 图集尺寸（行距 512×4=2048 字节，天然满足 wgpu 256 字节对齐）。
-pub const ATLAS_SIZE: u32 = 512;
+/// 图集尺寸（行距 1024×4=4096 字节，天然满足 wgpu 256 字节对齐）。
+///
+/// 2x（Retina）实测：226 个典型字符（95 ASCII + 中文 + 符号）占用
+/// 512² 的 58.6%。粗体字形是独立位图（缓存 key 含 bold），真实终端
+/// 字符集（vim/输出符号/粗体）会超 512——扩到 1024（4 倍面积）。
+/// 纹理内存 1024²×4B = 4MB，可接受。
+pub const ATLAS_SIZE: u32 = 1024;
 
 /// 上传图集的一批连续行（[y, y+h)）到 GPU 纹理。
 /// 源缓冲为 CPU 完整图集（每行 ATLAS_SIZE*4 字节），bytes_per_row 恒为
@@ -246,6 +268,49 @@ fn extract_rows(atlas: &[u8], y: u32, h: u32) -> Vec<u8> {
     out
 }
 
+/// scale 变化时重置图集相关状态：清字形缓存、图集归零、
+/// cursor 重置、全量上传空图集、强制重建（built_version 置 MAX）。
+fn reset_atlas(
+    pipeline: &mut TermPipeline,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scale: f32,
+) {
+    tracing::info!(
+        "终端渲染 scale 变化: {} → {}",
+        pipeline.metrics.scale,
+        scale
+    );
+    if let Ok(mut guard) = pipeline.glyph_cache.lock() {
+        guard.clear();
+    }
+    let mut fresh = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
+    fresh[0] = 255;
+    fresh[1] = 255;
+    fresh[2] = 255;
+    fresh[3] = 255;
+    if let Ok(mut guard) = pipeline.atlas_data.lock() {
+        *guard = fresh.clone();
+    }
+    if let Ok(mut guard) = pipeline.atlas_cursor.lock() {
+        *guard = (1, 0, 0);
+    }
+    // 全量重传空图集（旧 scale 的字形全部作废）
+    upload_atlas_rows(&pipeline.atlas_texture, queue, &fresh, 0, ATLAS_SIZE);
+    // 强制重建：built_version 置 MAX 使其与任何 version 不等
+    pipeline.built_version.store(u64::MAX, Ordering::Relaxed);
+    let _ = device;
+}
+
+/// 在真实 scale 下重新测量字体（用 pipeline 的 FontSystem）。
+fn measure_font_at(pipeline: &TermPipeline, scale: f32) -> FontMetrics {
+    let mut font_system = match pipeline.font_system.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    measure_font(&mut font_system, scale)
+}
+
 /// 把字形级脏区域（x,y,w,h）合并成行区间（y, h），重叠/相邻的合并。
 fn merge_row_ranges(dirty: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32)> {
     if dirty.is_empty() {
@@ -274,8 +339,6 @@ impl TermPrimitive {
         origin_x: f32,
         origin_y: f32,
     ) -> Option<BuiltGeometry> {
-        const ATLAS: u32 = 512;
-
         let mut glyph_cache = match pipeline.glyph_cache.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -284,8 +347,8 @@ impl TermPrimitive {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if atlas.len() != (ATLAS * ATLAS * 4) as usize {
-            atlas = vec![0u8; (ATLAS * ATLAS * 4) as usize];
+        if atlas.len() != (ATLAS_SIZE * ATLAS_SIZE * 4) as usize {
+            atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
             atlas[0] = 255;
             atlas[1] = 255;
             atlas[2] = 255;
@@ -296,12 +359,14 @@ impl TermPrimitive {
             Ok(guard) => *guard,
             Err(poisoned) => *poisoned.into_inner(),
         };
+        let metrics = pipeline.metrics;
         let mut atlas_state = AtlasState {
             data: atlas,
             next_x,
             next_y,
             row_h,
             dirty: Vec::new(),
+            scale: metrics.scale,
         };
 
         let mut font_system = match pipeline.font_system.lock() {
@@ -309,7 +374,6 @@ impl TermPrimitive {
             Err(poisoned) => poisoned.into_inner(),
         };
         let mut cache = SwashCache::new();
-        let metrics = pipeline.metrics;
         let cw = metrics.cell_width;
         let ch = metrics.cell_height;
         let grid = &self.snapshot;
@@ -352,7 +416,7 @@ impl TermPrimitive {
                         &mut cache,
                         &mut glyph_cache,
                         &mut atlas_state,
-                        ATLAS,
+                        ATLAS_SIZE,
                         cell.ch,
                         bold,
                     );
@@ -481,19 +545,22 @@ struct AtlasState {
     row_h: u32,
     /// 本帧新增字形区域（字形级，上传前合并为行区间）。
     dirty: Vec<(u32, u32, u32, u32)>,
+    /// 光栅化 scale（= viewport scale_factor，物理像素）。
+    scale: f32,
 }
 
 /// 光栅化单个字符到图集（带缓存）。返回 (宽, 高, u0, v0, u1, v1, baseline, top)。
 fn rasterize_char(
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
-    glyph_cache: &mut std::collections::HashMap<(char, bool), GlyphEntry>,
+    glyph_cache: &mut std::collections::HashMap<(char, bool, u32), GlyphEntry>,
     state: &mut AtlasState,
     atlas_size: u32,
     ch: char,
     bold: bool,
 ) -> Option<GlyphEntry> {
-    let key = (ch, bold);
+    let scale = state.scale;
+    let key = (ch, bold, scale.to_bits());
     if let Some(cached) = glyph_cache.get(&key) {
         return Some(*cached);
     }
@@ -503,7 +570,8 @@ fn rasterize_char(
     let row_h = &mut state.row_h;
     let dirty = &mut state.dirty;
 
-    let mut buf = Buffer::new_empty(Metrics::new(16.0, 20.0));
+    // 字号 × scale（方式 B）：位图与 advance 都是物理像素
+    let mut buf = Buffer::new_empty(Metrics::new(16.0 * scale, 20.0 * scale));
     buf.set_size(font_system, Some(100.0), None);
     let mut attrs = Attrs::new().family(cosmic_text::Family::Monospace);
     if bold {
@@ -660,7 +728,9 @@ fn build_pipeline(
         db.remove_face(id);
     }
     let mut font_system = FontSystem::new_with_locale_and_db("zh-Hans".into(), db);
-    let metrics = measure_font(&mut font_system);
+    // 初始 scale=1.0；首次 prepare 时用真实 viewport scale 重新测量
+    // （见 apply_scale_change）。
+    let metrics = measure_font(&mut font_system, 1.0);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("term shader"),
@@ -755,8 +825,8 @@ fn build_pipeline(
     let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("term atlas"),
         size: wgpu::Extent3d {
-            width: ATLAS,
-            height: ATLAS,
+            width: ATLAS_SIZE,
+            height: ATLAS_SIZE,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -805,7 +875,7 @@ fn build_pipeline(
     });
 
     // 初始图集：全透明 + (0,0) 白像素（背景 quad 采样）
-    let mut atlas_data = vec![0u8; (ATLAS * ATLAS * 4) as usize];
+    let mut atlas_data = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
     atlas_data[0] = 255;
     atlas_data[1] = 255;
     atlas_data[2] = 255;
@@ -820,8 +890,8 @@ fn build_pipeline(
         &atlas_data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(ATLAS * 4),
-            rows_per_image: Some(ATLAS),
+            bytes_per_row: Some(ATLAS_SIZE * 4),
+            rows_per_image: Some(ATLAS_SIZE),
         },
         wgpu::Extent3d {
             width: ATLAS,
@@ -861,16 +931,21 @@ fn build_pipeline(
 
 /// 用 cosmic-text 实测 'M' 的 advance width、行高和 ascent。
 /// 度量失败时回退到常用等宽值（显式 match，不用 unwrap_or_default）。
-fn measure_font(font_system: &mut FontSystem) -> FontMetrics {
-    let metrics = Metrics::new(16.0, 20.0);
+/// 按给定 scale 测量字体（物理像素值）。
+/// 方式 B：Metrics 字号 × scale（而非 physical() 的 scale 参数）——
+/// 所有测量值（advance/ascent/位图尺寸）出自同一来源同一单位，
+/// 无手工换算；physical() 的 scale 参数与字号分离时容易漏乘。
+fn measure_font(font_system: &mut FontSystem, scale: f32) -> FontMetrics {
+    let metrics = Metrics::new(16.0 * scale, 20.0 * scale);
     let mut buf = Buffer::new_empty(metrics);
     let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
     buf.set_size(font_system, Some(100.0), None);
     buf.set_text(font_system, "M", &attrs, Shaping::Advanced, None);
     let fallback = FontMetrics {
-        cell_width: 9.6,
-        cell_height: 20.0,
-        ascent: 14.26,
+        cell_width: 9.6 * scale,
+        cell_height: 20.0 * scale,
+        ascent: 14.26 * scale,
+        scale,
     };
     let Some(layout) = buf.layout_runs().next() else {
         tracing::warn!("字体度量失败，使用默认值");
@@ -880,6 +955,7 @@ fn measure_font(font_system: &mut FontSystem) -> FontMetrics {
         cell_width: layout.line_w,
         cell_height: metrics.line_height,
         ascent: layout.line_y - layout.line_top,
+        scale,
     }
 }
 
@@ -1022,6 +1098,75 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// 评估 scale=2（Retina）下图集占用率：光栅化典型终端字符集
+    /// （95 ASCII + 常用中文 + 常见符号），报告占用比例。
+    /// 2x 后字形面积 4 倍，512×512 可能不够——据此决定是否扩到 1024。
+    #[test]
+    fn atlas_usage_at_scale_2() {
+        let (device, queue) = headless_device();
+        let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let scale = 2.0f32;
+        pipeline.metrics = measure_font_at(&pipeline, scale);
+        let mut font_system = pipeline
+            .font_system
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = SwashCache::new();
+        let mut glyph_cache: std::collections::HashMap<(char, bool, u32), GlyphEntry> =
+            std::collections::HashMap::new();
+        let mut state = AtlasState {
+            data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+            next_x: 1,
+            next_y: 0,
+            row_h: 0,
+            dirty: Vec::new(),
+            scale,
+        };
+
+        // 典型字符集：95 个 ASCII + 常用中文 + 符号
+        let mut chars: Vec<char> = (32u8..127).map(|c| c as char).collect();
+        chars.extend("你好世界数据库备份生产服务器测试环境开发部署运维监控日志配置密码密钥网络主机集群容器镜像版本更新删除创建修改查询添加移除管理权限用户组角色策略规则异常错误警告信息成功失败正在等待中".chars());
+        chars.extend("→←↑↓✓✗●○■□▲△★☆═║╔╗╚╝│─┌┐└┘·…！？，。；：、（）【】《》".chars());
+        chars.dedup();
+
+        let mut skipped = 0usize;
+        for ch in &chars {
+            let key = (*ch, false, scale.to_bits());
+            if glyph_cache.contains_key(&key) {
+                continue;
+            }
+            let r = rasterize_char(
+                &mut font_system,
+                &mut cache,
+                &mut glyph_cache,
+                &mut state,
+                ATLAS_SIZE,
+                *ch,
+                false,
+            );
+            if r.is_none() {
+                skipped += 1;
+            }
+        }
+
+        let used_rows = state.next_y + state.row_h;
+        let usage = (used_rows as f64) / (ATLAS_SIZE as f64) * 100.0;
+        eprintln!(
+            "[atlas-usage] scale={} 字符={} 跳过={} 图集使用到行 {} / {} = {:.1}%",
+            scale,
+            chars.len(),
+            skipped,
+            used_rows,
+            ATLAS_SIZE,
+            usage
+        );
+        assert!(
+            usage < 100.0,
+            "scale=2 下图集溢出（使用 {:.1}%），需要扩大 ATLAS_SIZE",
+            usage
+        );
     }
 
     fn headless_device() -> (wgpu::Device, wgpu::Queue) {

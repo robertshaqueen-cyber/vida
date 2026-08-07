@@ -748,6 +748,24 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
 - 显式长度校验 + warn（禁止 `.min(len-1)` 钳位——钳位把越界变成
   「重复读最后一字节」，让错误信号消失只表现为画错）
 
+**物理像素约定**（M2b-1 评审，Retina 渲染）：内部一律用物理像素，
+只有与 iced 布局交互（widget bounds、鼠标坐标）时才换算。
+- `measure_font(scale)`：Metrics 字号 × scale（方式 B）——所有测量值
+  （advance/ascent/位图尺寸）同一来源同一单位，无手工换算；
+  physical() 的 scale 参数与字号分离时容易漏乘
+- scale=2 实测：cell_width=19.2px、cell_height=40.0px、ascent≈28.5px
+  （此前逻辑值 9.60/20.0/14.26）
+- 字形缓存 key = (char, bold, scale.to_bits())：跨 DPI 拖动窗口时
+  scale 变化 → 旧字形全部失效，reset_atlas（清缓存/图集归零/cursor
+  重置/全量重传）后按新 scale 重建
+- quad 坐标（origin×scale + col×cw_physical）与 uniform screen_size
+  （physical_size）同一物理空间
+- 采样器 Nearest（min/mag/mipmap）——字形按物理像素精确光栅化，
+  无插值
+- 图集 1024×1024：2x 下 226 典型字符实测占用 15.0%（512² 时为
+  58.6%，粗体字形是独立位图会再翻倍，故保守扩 1024）。纹理
+  4MB，可接受。溢出有 warn（非静默丢弃）
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；
