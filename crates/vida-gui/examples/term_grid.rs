@@ -266,16 +266,16 @@ impl App {
                             ]
                         };
                         let (tw, th) = (gw as f32, gh as f32);
-                        // 宽字符占 2 列，但字形本身画在 cell_x 处（宽度 1 或 2 cell）
-                        quads.push(Vertex { xy: [cell_x, gy], uv: [u0, v0], color: fg });
-                        quads.push(Vertex { xy: [cell_x + tw, gy], uv: [u1, v0], color: fg });
+                        let y = row_y + gy;
+                        quads.push(Vertex { xy: [cell_x, y], uv: [u0, v0], color: fg });
+                        quads.push(Vertex { xy: [cell_x + tw, y], uv: [u1, v0], color: fg });
                         quads.push(Vertex {
-                            xy: [cell_x + tw, gy + th],
+                            xy: [cell_x + tw, y + th],
                             uv: [u1, v1],
                             color: fg,
                         });
                         quads.push(Vertex {
-                            xy: [cell_x, gy + th],
+                            xy: [cell_x, y + th],
                             uv: [u0, v1],
                             color: fg,
                         });
