@@ -823,18 +823,27 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
 
 **M2b-2 所有者视觉验收修正（2026-08-08）**：初次验收确认 Menlo 16、
 灰色前景与 CJK 字距在 scale=1 下无法接受。读取本机 Ghostty 默认配置后，
-默认值改为 Menlo 13、前景 `#ffffff`、背景 `#282c34`；WIDE 字形横向铺满协议
-指定的两个 cell，避免 PingFang 实际字形宽度小于双 cell 时形成明显空隙。
+默认值改为 Menlo 13、前景 `#ffffff`、背景 `#282c34`。
 `VIDA_FONT_SIZE` / `VIDA_FONT_FAMILY` 覆盖仍保留。
 
-scale=1 的真实 GUI 截图仍显示灰度抗锯齿边缘偏碎、偏细，因此 shader 对字形
-alpha 使用 `pow(alpha, 0.72)` 提升中间覆盖率，模拟低 DPI stem darkening；0/1
-端点不变，不影响实心背景和光标。终端 canvas 自身设为 `#282c34`，不再透出
-iced 页面背景。
+scale=1 的真实 GUI 截图仍显示灰度抗锯齿边缘偏碎、偏细，因此字形首次写入 CPU
+图集时对 alpha 使用 `pow(alpha, 0.72)` 提升中间覆盖率，模拟低 DPI stem
+darkening；0/1 端点不变，不影响实心背景和光标。该计算不放在 GPU 片元 shader
+热路径。终端 canvas 自身设为 `#282c34`，不再透出 iced 页面背景。
+
+第二轮所有者截图确认：把 PingFang WIDE 字形强行横向铺满两个 cell 会破坏原始
+宽高比，中文明显被压扁。该缩放已撤销；协议仍用两个 cell 推进列位置，但字形按
+字体原始位图尺寸绘制。宁可保留少量右侧留白，也不能扭曲字形。
 
 光标协议此前已完整传递 `row/col/visible`，但 primitive 没有消费这些字段，
-因此画面完全没有光标。现在按 Ghostty 默认绘制不闪烁的实心方块，并反转块内
-字形颜色。保持不闪烁是刻意选择：不引入常驻 timer，空闲 CPU 仍应为零。
+因此画面完全没有光标。现在按 Ghostty 默认绘制实心方块并反转块内字形颜色；
+终端活跃且设置启用时，以 500ms 周期切换光标相位。任何输入或新帧都会立即恢复
+亮相位。订阅只在终端屏存活，离开终端后 timer 自动销毁。光标 overlay 几何只
+建立一次；闪烁仅更新 16 字节 uniform，不得随相位重建整屏 GPU buffer。
+
+终端字体族、字号和光标闪烁已进入 Settings。因为 Settings 是金库格式的一部分，
+本次将金库 v4 升至 v5，并通过 JSON 层迁移补入 Menlo / 13 / true；GUI 保存时以
+daemon 返回的完整 Settings 为底，只覆盖页面字段，避免清空未展示的 S3 配置。
 
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：

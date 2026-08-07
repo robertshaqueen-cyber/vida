@@ -75,9 +75,12 @@ pub struct TermPrimitive {
     snapshot: Arc<ClientGrid>,
     bounds: Rectangle,
     viewport_metrics: Arc<ViewportMetrics>,
+    appearance: TerminalAppearance,
+    cursor_on: bool,
 }
 
 impl TermPrimitive {
+    #[cfg(test)]
     pub fn new(
         snapshot: Arc<ClientGrid>,
         bounds: Rectangle,
@@ -87,6 +90,61 @@ impl TermPrimitive {
             snapshot,
             bounds,
             viewport_metrics,
+            appearance: TerminalAppearance::default(),
+            cursor_on: true,
+        }
+    }
+
+    pub fn with_appearance(
+        snapshot: Arc<ClientGrid>,
+        bounds: Rectangle,
+        viewport_metrics: Arc<ViewportMetrics>,
+        appearance: TerminalAppearance,
+        cursor_on: bool,
+    ) -> Self {
+        Self {
+            snapshot,
+            bounds,
+            viewport_metrics,
+            appearance: appearance.normalized(),
+            cursor_on,
+        }
+    }
+}
+
+/// 可持久化的终端外观。默认值与本机 Ghostty 接近。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalAppearance {
+    pub font_family: String,
+    pub font_size: f32,
+    pub cursor_blink: bool,
+}
+
+impl Default for TerminalAppearance {
+    fn default() -> Self {
+        Self {
+            font_family: "Menlo".to_string(),
+            font_size: DEFAULT_FONT_SIZE,
+            cursor_blink: true,
+        }
+    }
+}
+
+impl TerminalAppearance {
+    fn normalized(&self) -> Self {
+        let font_family = self.font_family.trim();
+        Self {
+            font_family: if font_family.is_empty() {
+                "Menlo".to_string()
+            } else {
+                font_family.to_string()
+            },
+            font_size: if self.font_size.is_finite() {
+                self.font_size.clamp(8.0, 48.0)
+            } else {
+                DEFAULT_FONT_SIZE
+            },
+            cursor_blink: self.cursor_blink,
         }
     }
 }
@@ -170,6 +228,10 @@ pub struct TermPipeline {
     diag_printed: std::sync::atomic::AtomicU8,
     /// 实际使用的字体族（显式指定 + 回落链解析，不依赖加载顺序）。
     font_family: String,
+    /// 当前管线采用的外观；变化时清空图集并重新测量。
+    appearance: TerminalAppearance,
+    /// 当前闪烁相位；只写入 uniform，不重建几何和 GPU buffer。
+    cursor_on: bool,
 }
 
 impl IcedPrimitive for TermPrimitive {
@@ -198,18 +260,55 @@ impl IcedPrimitive for TermPrimitive {
                 pipeline.metrics.ascent
             );
         }
+        let appearance = self.appearance.normalized();
+        if pipeline.appearance != appearance {
+            let family = {
+                let mut font_system = match pipeline.font_system.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                resolve_font_family(font_system.db_mut(), &appearance.font_family)
+            };
+            if family != appearance.font_family {
+                tracing::warn!(
+                    "字体 {} 不可用，回落为 {}（候选: Menlo → SF Mono → Monaco → 默认）",
+                    appearance.font_family,
+                    family
+                );
+            }
+            pipeline.font_family = family;
+            pipeline.metrics.font_size = appearance.font_size;
+            pipeline.appearance = appearance;
+            reset_render_cache(pipeline, "字体设置变化");
+            pipeline.metrics = measure_font_at(pipeline, scale);
+        }
+        if pipeline.cursor_on != self.cursor_on {
+            pipeline.cursor_on = self.cursor_on;
+        }
+
         // scale 变化（窗口拖到不同 DPI 显示器）：旧字形（按旧 scale 光栅化）
         // 必须全部失效——重置字形缓存/图集/cursor 并强制全量重建。
         // 注意 built_version 比较在 scale 检查之后：scale 变了即使 version
         // 相同也要重建（图集内容变了）。
         if pipeline.metrics.scale != scale {
-            reset_atlas(pipeline, device, queue, scale);
+            reset_render_cache(pipeline, "显示器 scale 变化");
             pipeline.metrics = measure_font_at(pipeline, scale);
         }
         self.viewport_metrics.store(
             pipeline.metrics.cell_width,
             pipeline.metrics.cell_height,
             pipeline.metrics.scale,
+        );
+
+        // 光标闪烁只更新 16 字节 uniform。光标 overlay 几何始终存在，由 shader
+        // 根据第四个 float 决定是否显示，避免每 500ms 重建整屏 GPU buffer。
+        let phys = viewport.physical_size();
+        let gamma = if pipeline.is_srgb { 1.0 } else { 0.0 };
+        let cursor_on = if pipeline.cursor_on { 1.0 } else { 0.0 };
+        queue.write_buffer(
+            &pipeline.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&[phys.width as f32, phys.height as f32, gamma, cursor_on]),
         );
 
         let version = self.snapshot.version;
@@ -234,15 +333,6 @@ impl IcedPrimitive for TermPrimitive {
             upload_atlas_rows(&pipeline.atlas_texture, queue, &geometry.atlas, y, h);
         }
 
-        // 上传 screen 信息到 uniform（物理像素 + sRGB 校正开关）
-        let phys = viewport.physical_size();
-        let gamma = if pipeline.is_srgb { 1.0 } else { 0.0 };
-        queue.write_buffer(
-            &pipeline.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&[phys.width as f32, phys.height as f32, gamma, 0.0]),
-        );
-
         // 上传 quads
         if geometry.quads.is_empty() {
             pipeline.vertex_count = 0;
@@ -252,31 +342,29 @@ impl IcedPrimitive for TermPrimitive {
         // 索引用 u16：quads 超过上限（65535/4≈16383 个 quad）时截断并告警，
         // 防止索引截断后 draw 越界触发 wgpu 校验 panic（连锁 abort）。
         // 正常终端（200×50）远低于此，截断仅作防御。
-        let quad_limit = (u16::MAX as usize / 4) * 4;
-        let quad_count = geometry.quads.len().min(quad_limit);
-        if quad_count < geometry.quads.len() {
+        let vertex_limit = (u16::MAX as usize / 4) * 4;
+        let vertex_count = geometry.quads.len().min(vertex_limit);
+        if vertex_count < geometry.quads.len() {
             tracing::warn!(
-                "终端 quads 超出 u16 索引上限：{} → 截断为 {}",
+                "终端顶点超出 u16 索引上限：{} → 截断为 {}",
                 geometry.quads.len(),
-                quad_count
+                vertex_count
             );
         }
         let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("term quads"),
-            size: (quad_count * std::mem::size_of::<Vertex>()) as u64,
+            size: (vertex_count * std::mem::size_of::<Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         queue.write_buffer(
             &vbuf,
             0,
-            bytemuck::cast_slice(&geometry.quads[..quad_count]),
+            bytemuck::cast_slice(&geometry.quads[..vertex_count]),
         );
         pipeline.vertex_buffer = vbuf;
 
-        let idx: Vec<u16> = (0..quad_count as u16)
-            .flat_map(|i| [i * 4, i * 4 + 1, i * 4 + 2, i * 4, i * 4 + 2, i * 4 + 3])
-            .collect();
+        let idx = quad_indices(vertex_count);
         let ibuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("term indices"),
             size: (idx.len() * 2) as u64,
@@ -361,17 +449,8 @@ fn extract_rows(atlas: &[u8], y: u32, h: u32) -> Vec<u8> {
 
 /// scale 变化时重置图集相关状态：清字形缓存、图集归零、
 /// cursor 重置、全量上传空图集、强制重建（built_version 置 MAX）。
-fn reset_atlas(
-    pipeline: &mut TermPipeline,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    scale: f32,
-) {
-    tracing::info!(
-        "终端渲染 scale 变化: {} → {}",
-        pipeline.metrics.scale,
-        scale
-    );
+fn reset_render_cache(pipeline: &mut TermPipeline, reason: &str) {
+    tracing::info!("终端渲染缓存重置: {}", reason);
     if let Ok(mut guard) = pipeline.glyph_cache.lock() {
         guard.clear();
     }
@@ -386,11 +465,11 @@ fn reset_atlas(
     if let Ok(mut guard) = pipeline.atlas_cursor.lock() {
         *guard = (1, 0, 0);
     }
-    // 全量重传空图集（旧 scale 的字形全部作废）
-    upload_atlas_rows(&pipeline.atlas_texture, queue, &fresh, 0, ATLAS_SIZE);
+    // 不全量上传 4MB 空纹理：旧字形所在 UV 已随 glyph_cache 清空而不可达，
+    // 新字形会按 dirty region 覆盖实际使用区域。macOS Metal 对全纹理
+    // queue.write_texture 会留下约 198MB owned-unmapped graphics 驱动分配。
     // 强制重建：built_version 置 MAX 使其与任何 version 不等
     pipeline.built_version.store(u64::MAX, Ordering::Relaxed);
-    let _ = device;
 }
 
 /// 在真实 scale 下重新测量字体（用 pipeline 的 FontSystem）。
@@ -496,36 +575,28 @@ impl TermPrimitive {
                 let is_cursor =
                     grid.cursor_visible && row == grid.cursor_row && col == grid.cursor_col;
 
-                // Ghostty 风格实心方块光标：用当前有效前景作为块色，块内字形
-                // 使用当前有效背景色，实现真正反色而不是覆盖掉光标下的字符。
+                // 先正常绘制 cell；光标作为带特殊 alpha 标记的 overlay 最后叠加。
+                // shader 在暗相位丢弃 overlay，底下的正常 cell 会自然显现。
                 let effective_bg = resolve_bg(cell);
                 let effective_fg = resolve_text_fg(cell);
-                let painted_bg = if is_cursor {
-                    effective_fg
-                } else {
-                    effective_bg
-                };
-                if is_cursor
-                    || cell.bg != ColorSpec::Default
-                    || cell.flags & frame::flag::REVERSE != 0
-                {
+                if cell.bg != ColorSpec::Default || cell.flags & frame::flag::REVERSE != 0 {
                     push_quad(
                         &mut quads,
                         [cell_x, row_y, cell_x + cw * col_width as f32, row_y + ch],
                         [0.0, 0.0, 0.0, 0.0],
                         [
-                            painted_bg.0 as f32 / 255.0,
-                            painted_bg.1 as f32 / 255.0,
-                            painted_bg.2 as f32 / 255.0,
+                            effective_bg.0 as f32 / 255.0,
+                            effective_bg.1 as f32 / 255.0,
+                            effective_bg.2 as f32 / 255.0,
                             1.0,
                         ],
                     );
                 }
 
                 // 字形：spacer 不画（其前半 cell 已画宽字符）
-                if !is_spacer {
+                let glyph = if !is_spacer {
                     let bold = cell.flags & frame::flag::BOLD != 0;
-                    let glyph = rasterize_char(
+                    rasterize_char(
                         &mut font_system,
                         &mut cache,
                         &mut glyph_cache,
@@ -533,52 +604,38 @@ impl TermPrimitive {
                         ATLAS_SIZE,
                         cell.ch,
                         bold,
+                    )
+                } else {
+                    None
+                };
+                if let Some((gw, gh, u0, v0, u1, v1, left, top)) = glyph {
+                    let fg = [
+                        effective_fg.0 as f32 / 255.0,
+                        effective_fg.1 as f32 / 255.0,
+                        effective_fg.2 as f32 / 255.0,
+                        1.0,
+                    ];
+                    // 整数像素对齐：glyph_x = cell_x + placement.left
+                    // （left 是整数）；基线取整后 - top（top 是整数）。
+                    // 三处全是整数 → 字形 quad 落在整数像素边界。
+                    let gx = cell_x + left;
+                    let y = (row_y + metrics.ascent).round() - top;
+                    push_quad(
+                        &mut quads,
+                        [gx, y, gx + gw as f32, y + gh as f32],
+                        [u0, v0, u1, v1],
+                        fg,
                     );
-                    if let Some((gw, gh, u0, v0, u1, v1, left, top)) = glyph {
-                        let glyph_color = if is_cursor {
-                            effective_bg
-                        } else {
-                            effective_fg
-                        };
-                        let fg = [
-                            glyph_color.0 as f32 / 255.0,
-                            glyph_color.1 as f32 / 255.0,
-                            glyph_color.2 as f32 / 255.0,
-                            1.0,
-                        ];
-                        // 整数像素对齐：glyph_x = cell_x + placement.left
-                        // （left 是整数）；基线取整后 - top（top 是整数）。
-                        // 三处全是整数 → 字形 quad 落在整数像素边界。
-                        let mut gx = cell_x + left;
-                        let y = (row_y + metrics.ascent).round() - top;
-                        let mut rendered_width = gw as f32;
-                        if is_wide {
-                            // CJK 字形占满协议指定的两个 cell，消除逐字累积的空隙。
-                            gx = cell_x;
-                            rendered_width = cw * 2.0;
-                        }
-                        push_quad(
-                            &mut quads,
-                            [gx, y, gx + rendered_width, y + gh as f32],
-                            [u0, v0, u1, v1],
-                            fg,
-                        );
-                    }
                 }
 
                 // 下划线：基线下方 2px，宽度 = cell 列宽。
                 // 高度必须取整像素（1px）——1.5px 会落在非整数像素边界。
                 if cell.flags & frame::flag::UNDERLINE != 0 {
                     let uy = (row_y + metrics.ascent + 2.0).round();
-                    let c = if is_cursor {
-                        effective_bg
-                    } else {
-                        effective_fg
-                    };
                     let lc = [
-                        c.0 as f32 / 255.0,
-                        c.1 as f32 / 255.0,
-                        c.2 as f32 / 255.0,
+                        effective_fg.0 as f32 / 255.0,
+                        effective_fg.1 as f32 / 255.0,
+                        effective_fg.2 as f32 / 255.0,
                         1.0,
                     ];
                     push_quad(
@@ -587,6 +644,37 @@ impl TermPrimitive {
                         [0.0, 0.0, 0.0, 0.0],
                         lc,
                     );
+                }
+
+                if is_cursor {
+                    // alpha=-1 是 cursor overlay 标记；shader 输出前取绝对值，
+                    // 并用 uniform 的 cursor_on 控制可见性。
+                    push_quad(
+                        &mut quads,
+                        [cell_x, row_y, cell_x + cw * col_width as f32, row_y + ch],
+                        [0.0, 0.0, 0.0, 0.0],
+                        [
+                            effective_fg.0 as f32 / 255.0,
+                            effective_fg.1 as f32 / 255.0,
+                            effective_fg.2 as f32 / 255.0,
+                            -1.0,
+                        ],
+                    );
+                    if let Some((gw, gh, u0, v0, u1, v1, left, top)) = glyph {
+                        let gx = cell_x + left;
+                        let y = (row_y + metrics.ascent).round() - top;
+                        push_quad(
+                            &mut quads,
+                            [gx, y, gx + gw as f32, y + gh as f32],
+                            [u0, v0, u1, v1],
+                            [
+                                effective_bg.0 as f32 / 255.0,
+                                effective_bg.1 as f32 / 255.0,
+                                effective_bg.2 as f32 / 255.0,
+                                -1.0,
+                            ],
+                        );
+                    }
                 }
 
                 col += col_width;
@@ -671,6 +759,17 @@ fn push_quad(
         uv: [u0, v1],
         color,
     });
+}
+
+/// 为连续的 quad 顶点生成索引。`vertex_count` 必须是 4 的倍数。
+fn quad_indices(vertex_count: usize) -> Vec<u16> {
+    debug_assert_eq!(vertex_count % 4, 0);
+    (0..vertex_count / 4)
+        .flat_map(|quad| {
+            let base = (quad * 4) as u16;
+            [base, base + 1, base + 2, base, base + 2, base + 3]
+        })
+        .collect()
 }
 
 /// 图集打包状态（跨帧持久的部分由调用方保存/恢复）。
@@ -775,7 +874,7 @@ fn rasterize_char(
                             atlas[idx] = 255;
                             atlas[idx + 1] = 255;
                             atlas[idx + 2] = 255;
-                            atlas[idx + 3] = a;
+                            atlas[idx + 3] = darken_glyph_alpha(a);
                         }
                     }
                 }
@@ -799,7 +898,7 @@ fn rasterize_char(
                             atlas[idx] = 255;
                             atlas[idx + 1] = 255;
                             atlas[idx + 2] = 255;
-                            atlas[idx + 3] = a as u8;
+                            atlas[idx + 3] = darken_glyph_alpha(a as u8);
                         }
                     }
                 }
@@ -845,6 +944,15 @@ fn rasterize_char(
     result
 }
 
+/// 低 DPI stem darkening 在字形首次进入 CPU 图集时完成，避免把 `pow`
+/// 留在每个 GPU 片元上。端点保持不变，仅提升抗锯齿中间覆盖率。
+fn darken_glyph_alpha(alpha: u8) -> u8 {
+    if alpha == 0 || alpha == u8::MAX {
+        return alpha;
+    }
+    ((f32::from(alpha) / 255.0).powf(0.72) * 255.0).round() as u8
+}
+
 impl iced_wgpu::primitive::Pipeline for TermPipeline {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         build_pipeline(device, queue, format)
@@ -885,6 +993,12 @@ fn build_pipeline(
         .and_then(|s| s.parse::<f32>().ok())
         .filter(|v| *v >= 8.0 && *v <= 48.0)
         .unwrap_or(DEFAULT_FONT_SIZE);
+    let appearance = TerminalAppearance {
+        font_family: requested.clone(),
+        font_size,
+        cursor_blink: true,
+    }
+    .normalized();
     if family != requested {
         tracing::warn!(
             "字体 {} 不可用，回落为 {}（候选: Menlo → SF Mono → Monaco → 默认）",
@@ -908,7 +1022,7 @@ fn build_pipeline(
     });
     let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("term screen uniform"),
-        size: 16, // vec2(size) + f32(gamma) + padding
+        size: 16, // vec2(size) + f32(gamma) + f32(cursor_on)
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1099,6 +1213,8 @@ fn build_pipeline(
         is_srgb: format.is_srgb(),
         diag_printed: std::sync::atomic::AtomicU8::new(0),
         font_family: family,
+        appearance,
+        cursor_on: true,
     }
 }
 
@@ -1261,6 +1377,19 @@ mod tests {
         assert!(merge_row_ranges(&[]).is_empty());
     }
 
+    #[test]
+    fn stem_darkening_preserves_endpoints_and_strengthens_edges() {
+        assert_eq!(darken_glyph_alpha(0), 0);
+        assert_eq!(darken_glyph_alpha(255), 255);
+        assert!(darken_glyph_alpha(64) > 64);
+        assert!(darken_glyph_alpha(128) > 128);
+    }
+
+    #[test]
+    fn quad_indices_address_each_vertex_once_per_quad() {
+        assert_eq!(quad_indices(8), vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+    }
+
     /// 图集 cursor 跨帧持久：两次 build_geometry（第二帧含新字符）后，
     /// 第一帧写入的字形不得被覆盖。
     #[test]
@@ -1344,7 +1473,7 @@ mod tests {
     /// 可见光标必须真的进入渲染几何；协议字段存在但 primitive 不消费时，
     /// 所有输入虽正常，用户却完全看不到当前位置。
     #[test]
-    fn visible_cursor_draws_ghostty_style_block() {
+    fn visible_cursor_builds_shader_controlled_overlay() {
         let (device, queue) = headless_device();
         let mut pipeline = build_pipeline(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
         let mut grid = ClientGrid::new(2, 3);
@@ -1372,7 +1501,22 @@ mod tests {
             vertices[2].xy,
             [metrics.cell_width * 3.0, metrics.cell_height * 2.0]
         );
-        assert_eq!(vertices[0].color, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(vertices[0].color, [1.0, 1.0, 1.0, -1.0]);
+
+        let cursor_off = TermPrimitive::with_appearance(
+            primitive.snapshot.clone(),
+            Rectangle::default(),
+            Arc::new(ViewportMetrics::default()),
+            TerminalAppearance::default(),
+            false,
+        )
+        .build_geometry(&mut pipeline, 0.0, 0.0)
+        .expect("暗相位几何应成功");
+        assert_eq!(
+            cursor_off.quads.len(),
+            geometry.quads.len(),
+            "闪烁相位不能重建不同几何；可见性只由 uniform 控制"
+        );
     }
 
     /// 字号对照实验：16/18/20/22 下 cell 尺寸与 'A' 实际字体名。
@@ -1639,10 +1783,9 @@ mod tests {
             .build_geometry(&mut pipeline, 10.7, 5.3)
             .expect("build_geometry 应成功");
         assert!(!geom.quads.is_empty(), "应有 quads");
-        assert_eq!(
-            geom.quads[1].xy[0] - geom.quads[0].xy[0],
-            pipeline.metrics.cell_width * 2.0,
-            "WIDE 字形应横向铺满两个 cell"
+        assert!(
+            geom.quads[1].xy[0] - geom.quads[0].xy[0] < pipeline.metrics.cell_width * 2.0,
+            "WIDE 字形应保持字体原始宽高比，不能强行拉伸到两个 cell"
         );
 
         for v in &geom.quads {

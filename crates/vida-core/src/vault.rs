@@ -13,7 +13,7 @@ pub const PRODUCTION_LOG_N: u8 = 18;
 
 /// Current vault format version. Bump when the struct layout changes.
 /// When bumping, MUST also add migration function and test (see AGENTS.md).
-pub const CURRENT_VAULT_VERSION: u32 = 4;
+pub const CURRENT_VAULT_VERSION: u32 = 5;
 
 /// A string wrapper that zeroizes its contents on drop.
 /// Used for sensitive data (private keys, passphrases, secrets)
@@ -105,6 +105,7 @@ pub enum AuthMethod {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub s3_endpoint: Option<String>,
     pub s3_bucket: Option<String>,
@@ -116,6 +117,12 @@ pub struct Settings {
     /// 回滚行数。默认 3000：3000×200列×24字节(Cell) ≈ 14.4MB。
     /// 用户可调高，每 1000 行约 5MB 内存。
     pub scrollback_lines: usize,
+    /// 终端主字体族。不存在时 GUI 会按 Menlo → SF Mono → Monaco 回落。
+    pub terminal_font_family: String,
+    /// 终端逻辑字号，GUI 接受范围 8–48。
+    pub terminal_font_size: f32,
+    /// 是否闪烁终端光标。
+    pub terminal_cursor_blink: bool,
 }
 
 impl Default for Settings {
@@ -127,6 +134,9 @@ impl Default for Settings {
             s3_secret_key: None,
             sync_local_path: None,
             scrollback_lines: 3000,
+            terminal_font_family: "Menlo".to_string(),
+            terminal_font_size: 13.0,
+            terminal_cursor_blink: true,
         }
     }
 }
@@ -251,6 +261,9 @@ fn migrate_json(plaintext: &[u8], from_version: u32) -> Result<Vec<u8>> {
     if from_version < 4 {
         migrate_json_v3_to_v4(&mut root)?;
     }
+    if from_version < 5 {
+        migrate_json_v4_to_v5(&mut root)?;
+    }
 
     serde_json::to_vec_pretty(&root).context("Failed to serialize migrated vault")
 }
@@ -293,6 +306,9 @@ pub fn migrate_vault_json(plaintext: &[u8], backup_path: &Path) -> Result<Vec<u8
     }
     if version < 4 {
         migrate_json_v3_to_v4(&mut root)?;
+    }
+    if version < 5 {
+        migrate_json_v4_to_v5(&mut root)?;
     }
 
     let migrated =
@@ -362,6 +378,25 @@ fn migrate_json_v3_to_v4(root: &mut serde_json::Value) -> Result<()> {
         && settings.get("sync_local_path").is_none()
     {
         settings["sync_local_path"] = serde_json::Value::Null;
+    }
+
+    Ok(())
+}
+
+/// v4 → v5: Added terminal font and cursor appearance settings.
+fn migrate_json_v4_to_v5(root: &mut serde_json::Value) -> Result<()> {
+    root["version"] = serde_json::json!(5);
+
+    if let Some(settings) = root.get_mut("settings") {
+        if settings.get("terminal_font_family").is_none() {
+            settings["terminal_font_family"] = serde_json::json!("Menlo");
+        }
+        if settings.get("terminal_font_size").is_none() {
+            settings["terminal_font_size"] = serde_json::json!(13.0);
+        }
+        if settings.get("terminal_cursor_blink").is_none() {
+            settings["terminal_cursor_blink"] = serde_json::json!(true);
+        }
     }
 
     Ok(())
@@ -529,6 +564,7 @@ mod tests {
             s3_secret_key: Some(SecureString::new("super-secret-key".to_owned())),
             sync_local_path: None,
             scrollback_lines: 5000,
+            ..Default::default()
         };
         let settings_debug = format!("{:?}", settings);
         assert!(
@@ -634,7 +670,7 @@ mod tests {
 
         // Migrated should deserialize into current Vault
         let vault: Vault = serde_json::from_slice(&migrated_bytes).unwrap();
-        assert_eq!(vault.version, 4);
+        assert_eq!(vault.version, CURRENT_VAULT_VERSION);
         assert_eq!(vault.hosts.len(), 2);
 
         // Verify new v3 fields are populated
@@ -705,7 +741,7 @@ mod tests {
         let backup = dir.path().join("backup.json");
         let migrated = migrate_vault_json(no_version_json.as_bytes(), &backup).unwrap();
         let vault: Vault = serde_json::from_slice(&migrated).unwrap();
-        assert_eq!(vault.version, 4);
+        assert_eq!(vault.version, CURRENT_VAULT_VERSION);
         assert_eq!(vault.hosts[0].name, "old-host");
         assert!(!vault.hosts[0].id.is_empty());
     }
@@ -750,14 +786,17 @@ mod tests {
         let backup = std::fs::read_to_string(&backup_path).unwrap();
         assert!(backup.contains("\"version\": 3"), "backup must preserve v3");
 
-        // Migrated should be v4 with sync_local_path
+        // Migrated should be current with sync_local_path and terminal defaults.
         let vault: Vault = serde_json::from_slice(&migrated_bytes).unwrap();
-        assert_eq!(vault.version, 4);
+        assert_eq!(vault.version, CURRENT_VAULT_VERSION);
         assert!(
             vault.settings.sync_local_path.is_none(),
             "sync_local_path defaults to null"
         );
         assert_eq!(vault.settings.scrollback_lines, 5000);
+        assert_eq!(vault.settings.terminal_font_family, "Menlo");
+        assert_eq!(vault.settings.terminal_font_size, 13.0);
+        assert!(vault.settings.terminal_cursor_blink);
 
         // Existing v3 fields preserved
         assert_eq!(vault.hosts.len(), 1);
@@ -767,6 +806,44 @@ mod tests {
         assert_eq!(
             vault.settings.s3_endpoint.as_deref(),
             Some("https://s3.example.com")
+        );
+    }
+
+    /// v4 的真实 JSON 必须完整迁移到 v5，保留原字段并补齐终端外观。
+    #[test]
+    fn migrate_v4_to_v5_adds_terminal_appearance() {
+        let v4_json = r##"{
+  "version": 4,
+  "revision": 9,
+  "device_id": "v4-device",
+  "modified_at": 1700000000,
+  "hosts": [],
+  "settings": {
+    "s3_endpoint": null,
+    "s3_bucket": null,
+    "s3_access_key": null,
+    "s3_secret_key": null,
+    "sync_local_path": null,
+    "scrollback_lines": 4321
+  }
+}"##;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join("backup-v4.json");
+        let migrated = migrate_vault_json(v4_json.as_bytes(), &backup_path).unwrap();
+        let vault: Vault = serde_json::from_slice(&migrated).unwrap();
+
+        assert_eq!(vault.version, 5);
+        assert_eq!(vault.revision, 9);
+        assert_eq!(vault.device_id, "v4-device");
+        assert_eq!(vault.settings.scrollback_lines, 4321);
+        assert_eq!(vault.settings.terminal_font_family, "Menlo");
+        assert_eq!(vault.settings.terminal_font_size, 13.0);
+        assert!(vault.settings.terminal_cursor_blink);
+        assert!(
+            std::fs::read_to_string(backup_path)
+                .unwrap()
+                .contains("\"version\": 4")
         );
     }
 
@@ -801,13 +878,16 @@ mod tests {
                 s3_secret_key: Some(SecureString::new("SECRET".into())),
                 sync_local_path: Some("/Users/test/VidaSync".into()),
                 scrollback_lines: 8192,
+                terminal_font_family: "SF Mono".into(),
+                terminal_font_size: 15.0,
+                terminal_cursor_blink: false,
             },
         };
 
         let json = serde_json::to_string_pretty(&vault).unwrap();
 
         // Verify key structural markers
-        assert!(json.contains("\"version\": 4"), "version must be 4");
+        assert!(json.contains("\"version\": 5"), "version must be 5");
         assert!(json.contains("\"revision\""), "must have revision field");
         assert!(json.contains("\"device_id\""), "must have device_id field");
         assert!(
@@ -822,6 +902,18 @@ mod tests {
             "settings must have sync_local_path"
         );
         assert!(json.contains("\"s3_secret_key\""), "settings field");
+        assert!(
+            json.contains("\"terminal_font_family\""),
+            "terminal font family field"
+        );
+        assert!(
+            json.contains("\"terminal_font_size\""),
+            "terminal font size field"
+        );
+        assert!(
+            json.contains("\"terminal_cursor_blink\""),
+            "terminal cursor blink field"
+        );
 
         // Verify it roundtrips
         let decoded: Vault = serde_json::from_str(&json).unwrap();

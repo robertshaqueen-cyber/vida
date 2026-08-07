@@ -10,7 +10,7 @@ use iced::{Background, Color, Element, Length};
 
 use crate::app::AppMessage;
 use crate::term::client_grid::ClientGrid;
-use crate::term::primitive::ViewportMetrics;
+use crate::term::primitive::{TerminalAppearance, ViewportMetrics};
 use crate::term::widget;
 
 /// 终端会话状态（调试屏持有）。
@@ -26,10 +26,12 @@ pub struct TerminalSession {
     pub notice: Option<String>,
     /// 渲染器实测的 cell 物理像素尺寸，供交互 widget 计算行列数。
     pub viewport_metrics: Arc<ViewportMetrics>,
+    pub appearance: TerminalAppearance,
+    pub cursor_on: bool,
 }
 
 impl TerminalSession {
-    pub fn new(session_id: String, rows: u16, cols: u16) -> Self {
+    pub fn new(session_id: String, rows: u16, cols: u16, appearance: TerminalAppearance) -> Self {
         Self {
             session_id,
             grid: ClientGrid::new(rows, cols),
@@ -37,6 +39,8 @@ impl TerminalSession {
             exit_code: None,
             notice: None,
             viewport_metrics: Arc::new(ViewportMetrics::default()),
+            appearance,
+            cursor_on: true,
         }
     }
 
@@ -72,6 +76,8 @@ impl TerminalSession {
             AppMessage::TerminalInput,
             AppMessage::TerminalPaste,
             terminal_resize_message,
+            self.appearance.clone(),
+            self.cursor_on,
         ))
         .width(Length::Fill)
         .height(Length::Fill)

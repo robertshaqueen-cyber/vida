@@ -4,7 +4,7 @@
 //! - widget 只负责把平台键盘事件转换为终端字节，不解释命令；
 //! - 输入按 iced 事件顺序发布，WebSocket 客户端同步入队，避免逐键异步任务乱序；
 //! - resize 使用渲染管线实测的物理像素 cell 尺寸，逻辑像素只用于 iced 布局；
-//! - 没有输入或尺寸变化时不产生消息、不设置常驻定时器。
+//! - widget 自身不设置定时器；光标闪烁由终端屏存活期间的 app subscription 驱动。
 
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use iced::keyboard::{self, Key, Modifiers, key};
 use iced::{Element, Event, Length, Rectangle, Size, window};
 
 use super::client_grid::ClientGrid;
-use super::primitive::{TermPrimitive, ViewportMetrics};
+use super::primitive::{TermPrimitive, TerminalAppearance, ViewportMetrics};
 
 const TERMINAL_WIDGET_ID: &str = "vida-terminal-canvas";
 
@@ -70,6 +70,8 @@ pub struct TermCanvas<Message> {
     on_input: fn(Vec<u8>) -> Message,
     on_paste: fn(Vec<u8>) -> Message,
     on_resize: fn(u16, u16) -> Message,
+    appearance: TerminalAppearance,
+    cursor_on: bool,
     width: Length,
     height: Length,
 }
@@ -81,6 +83,8 @@ impl<Message> TermCanvas<Message> {
         on_input: fn(Vec<u8>) -> Message,
         on_paste: fn(Vec<u8>) -> Message,
         on_resize: fn(u16, u16) -> Message,
+        appearance: TerminalAppearance,
+        cursor_on: bool,
     ) -> Self {
         Self {
             snapshot,
@@ -88,6 +92,8 @@ impl<Message> TermCanvas<Message> {
             on_input,
             on_paste,
             on_resize,
+            appearance,
+            cursor_on,
             width: Length::Fill,
             height: Length::Fill,
         }
@@ -258,8 +264,13 @@ where
         if self.snapshot.rows == 0 || self.snapshot.cols == 0 {
             return;
         }
-        let primitive =
-            TermPrimitive::new(self.snapshot.clone(), bounds, self.viewport_metrics.clone());
+        let primitive = TermPrimitive::with_appearance(
+            self.snapshot.clone(),
+            bounds,
+            self.viewport_metrics.clone(),
+            self.appearance.clone(),
+            self.cursor_on,
+        );
         renderer.draw_primitive(bounds, primitive);
     }
 
@@ -286,6 +297,8 @@ pub fn canvas<'a, Message>(
     on_input: fn(Vec<u8>) -> Message,
     on_paste: fn(Vec<u8>) -> Message,
     on_resize: fn(u16, u16) -> Message,
+    appearance: TerminalAppearance,
+    cursor_on: bool,
 ) -> Element<'a, Message>
 where
     Message: 'a,
@@ -296,6 +309,8 @@ where
         on_input,
         on_paste,
         on_resize,
+        appearance,
+        cursor_on,
     ))
 }
 

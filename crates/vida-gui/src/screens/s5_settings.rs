@@ -1,9 +1,11 @@
 use iced::widget::{button, column, container, pick_list, row, rule, text, text_input};
 use iced::{Element, Length};
 use vida_core::i18n::I18n;
+use vida_core::vault::Settings;
 
 use crate::app::AppMessage;
 use crate::screens::s3_main::HostItem;
+use crate::term::primitive::TerminalAppearance;
 
 // ---------------------------------------------------------------------------
 // Sync mode
@@ -161,6 +163,11 @@ pub struct State {
     pub sync_local_path: String,
     // Terminal
     pub scrollback_lines: String,
+    pub terminal_font_family: String,
+    pub terminal_font_size: String,
+    pub terminal_cursor_blink: bool,
+    /// 保存时以 daemon 返回的完整 Settings 为底，避免覆盖未在当前页面展示的字段。
+    pub vault_settings: Settings,
     // Save state
     pub saving: bool,
     pub saved: bool,
@@ -169,18 +176,12 @@ pub struct State {
 
 impl State {
     pub fn from_json(val: &serde_json::Value, _i18n: &I18n) -> Self {
-        let sync_local_path = val
-            .get("sync_local_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let vault_settings: Settings =
+            serde_json::from_value(val.clone()).unwrap_or_else(|_| Settings::default());
+        let sync_local_path = vault_settings.sync_local_path.clone().unwrap_or_default();
         let sync_mode = SyncMode::from_path(&sync_local_path);
 
-        let scrollback_lines = val
-            .get("scrollback_lines")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3000)
-            .to_string();
+        let scrollback_lines = vault_settings.scrollback_lines.to_string();
 
         let language = match vida_core::config::load_language_choice().as_deref() {
             Some("zh-CN") => LangChoice::ZhCn,
@@ -194,9 +195,21 @@ impl State {
             sync_mode,
             sync_local_path,
             scrollback_lines,
+            terminal_font_family: vault_settings.terminal_font_family.clone(),
+            terminal_font_size: vault_settings.terminal_font_size.to_string(),
+            terminal_cursor_blink: vault_settings.terminal_cursor_blink,
+            vault_settings,
             saving: false,
             saved: false,
             error: None,
+        }
+    }
+
+    pub fn terminal_appearance(&self) -> TerminalAppearance {
+        TerminalAppearance {
+            font_family: self.terminal_font_family.clone(),
+            font_size: self.terminal_font_size.parse().unwrap_or(13.0),
+            cursor_blink: self.terminal_cursor_blink,
         }
     }
 
@@ -469,6 +482,22 @@ impl State {
             .width(Length::Fill);
         let scroll_hint = text(i18n.tr("settings_scrollback_hint")).size(11);
 
+        let font_family_label = text(i18n.tr("settings_terminal_font_family")).size(14);
+        let font_family_input = text_input("Menlo", &self.terminal_font_family)
+            .on_input(AppMessage::SettingsTerminalFontFamilyChanged)
+            .width(Length::Fill);
+        let font_family_hint = text(i18n.tr("settings_terminal_font_family_hint")).size(11);
+
+        let font_size_label = text(i18n.tr("settings_terminal_font_size")).size(14);
+        let font_size_input = text_input("13", &self.terminal_font_size)
+            .on_input(AppMessage::SettingsTerminalFontSizeChanged)
+            .width(Length::Fill);
+        let font_size_hint = text(i18n.tr("settings_terminal_font_size_hint")).size(11);
+
+        let cursor_blink = iced::widget::checkbox(self.terminal_cursor_blink)
+            .label(i18n.tr("settings_terminal_cursor_blink"))
+            .on_toggle(AppMessage::SettingsTerminalCursorBlinkChanged);
+
         let can_save = !self.saving;
         let save_btn = if self.saving {
             button(i18n.tr("common_saving")).width(Length::Shrink)
@@ -499,6 +528,13 @@ impl State {
             scroll_label,
             scroll_input,
             scroll_hint,
+            font_family_label,
+            font_family_input,
+            font_family_hint,
+            font_size_label,
+            font_size_input,
+            font_size_hint,
+            cursor_blink,
             save_btn,
             status_text,
             error_text,
@@ -517,5 +553,36 @@ impl State {
         column![title, rule::horizontal(1), export_btn,]
             .spacing(12)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_json_populates_terminal_appearance_and_preserves_full_settings() {
+        let value = serde_json::json!({
+            "s3_endpoint": "https://example.invalid",
+            "s3_bucket": null,
+            "s3_access_key": null,
+            "s3_secret_key": null,
+            "sync_local_path": null,
+            "scrollback_lines": 4096,
+            "terminal_font_family": "SF Mono",
+            "terminal_font_size": 15.0,
+            "terminal_cursor_blink": false
+        });
+        let i18n = I18n::new(vida_core::i18n::Lang::ZhCn);
+        let state = State::from_json(&value, &i18n);
+
+        let appearance = state.terminal_appearance();
+        assert_eq!(appearance.font_family, "SF Mono");
+        assert_eq!(appearance.font_size, 15.0);
+        assert!(!appearance.cursor_blink);
+        assert_eq!(
+            state.vault_settings.s3_endpoint.as_deref(),
+            Some("https://example.invalid")
+        );
     }
 }
