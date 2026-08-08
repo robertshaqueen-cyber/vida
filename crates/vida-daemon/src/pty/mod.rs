@@ -536,10 +536,11 @@ impl PtyManager {
         Ok(())
     }
 
-    /// 粘贴文本：仅当终端应用启用了 bracketed-paste 时加保护边界。
+    /// 粘贴文本：终端应用启用 bracketed-paste 时加保护边界，否则使用安全回退。
     ///
     /// 与 `session_input` 分开，确保普通键盘输入继续严格原始透传。保护模式下
-    /// 移除 ESC，防止剪贴板内容伪造结束边界后注入额外控制序列。
+    /// 移除 ESC，防止剪贴板内容伪造结束边界后注入额外控制序列。未启用保护
+    /// 模式时把换行折叠为空格，避免 shell 把多行剪贴板立即逐行执行。
     pub fn paste_session(&self, session_id: &str, data: &[u8]) -> Result<()> {
         let session = self
             .sessions
@@ -825,7 +826,23 @@ impl PtyManager {
 
 fn encode_paste(data: &[u8], bracketed: bool) -> Vec<u8> {
     if !bracketed {
-        return data.to_vec();
+        let mut encoded = Vec::with_capacity(data.len());
+        let mut line_break = false;
+        for byte in data.iter().copied().filter(|byte| *byte != 0x1b) {
+            if matches!(byte, b'\r' | b'\n') {
+                line_break = true;
+                continue;
+            }
+            if line_break && encoded.last().is_some_and(|last| *last != b' ') {
+                encoded.push(b' ');
+            }
+            line_break = false;
+            encoded.push(byte);
+        }
+        if line_break && encoded.last().is_some_and(|last| *last != b' ') {
+            encoded.push(b' ');
+        }
+        return encoded;
     }
     const START: &[u8] = b"\x1b[200~";
     const END: &[u8] = b"\x1b[201~";
@@ -1016,7 +1033,12 @@ mod tests {
 
     #[test]
     fn paste_encoding_respects_mode_and_blocks_escape_injection() {
-        assert_eq!(encode_paste(b"one\ntwo", false), b"one\ntwo");
+        assert_eq!(encode_paste(b"one\ntwo", false), b"one two");
+        assert_eq!(
+            encode_paste(b"one\r\ntwo\rthree\n", false),
+            b"one two three "
+        );
+        assert_eq!(encode_paste(b"one\x1b[201~two", false), b"one[201~two");
         assert_eq!(
             encode_paste(b"one\n\x1b[201~two", true),
             b"\x1b[200~one\n[201~two\x1b[201~"
