@@ -1159,8 +1159,8 @@ fn native_fallback_glyph_bitmap(
         return None;
     }
 
-    // CoreText 坐标原点在左下；图集坐标原点在左上。先向外取整
-    // 得到像素边界，再把 CoreGraphics 的逐行结果上下翻转。
+    // CoreText 坐标原点在左下；图集坐标原点在左上。向外取整得到像素边界。
+    // CGBitmapContext 的内存行序已经与图集一致，不要再次上下翻转。
     let left = rect.origin.x.floor() as i32;
     let right = (rect.origin.x + rect.size.width).ceil() as i32;
     let bottom = rect.origin.y.floor() as i32;
@@ -1196,15 +1196,6 @@ fn native_fallback_glyph_bitmap(
         &[CGPoint::new(-f64::from(left), -f64::from(bottom))],
         context,
     );
-    for row in 0..height / 2 {
-        let opposite = height - 1 - row;
-        for column in 0..width {
-            alpha.swap(
-                (row * width + column) as usize,
-                (opposite * width + column) as usize,
-            );
-        }
-    }
 
     Some(GlyphBitmap {
         width,
@@ -1862,6 +1853,19 @@ mod tests {
         assert!(
             occupied_rows * 4 >= cjk.height as usize * 3,
             "中文轮廓应覆盖大部分位图高度，避免坐标翻转后只剩横线"
+        );
+
+        // 「上」的底横明显宽于顶部笔画，可稳定识别整张位图是否上下颠倒。
+        let orientation = native_glyph_bitmap(&fonts, '上', cosmic_text::Weight::NORMAL, 13.0)
+            .expect("CoreText 应能光栅化方向探针");
+        let row_ink = orientation
+            .alpha
+            .chunks(orientation.width as usize)
+            .map(|row| row.iter().filter(|alpha| **alpha > 0).count())
+            .collect::<Vec<_>>();
+        assert!(
+            row_ink[row_ink.len() - 1] > row_ink[0],
+            "中文位图不能上下颠倒"
         );
     }
 
