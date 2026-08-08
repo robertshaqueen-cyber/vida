@@ -334,6 +334,17 @@ impl State {
             .on_press(AppMessage::EditHost(host.id.clone()))
             .style(ui::primary_button)
             .padding([9, 12]);
+            let connect_btn = button(
+                row![
+                    icons::icon(icons::TERMINAL, 14),
+                    text(i18n.tr("main_connect")).size(13),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .on_press(AppMessage::OpenSshTerminal(host.id.clone()))
+            .style(ui::primary_button)
+            .padding([9, 12]);
             let reveal_btn = button(
                 row![
                     icons::icon(icons::EYE, 14),
@@ -361,7 +372,7 @@ impl State {
                 row![
                     identity,
                     Space::new().width(Length::Fill),
-                    row![edit_btn, reveal_btn, delete_btn].spacing(8),
+                    row![connect_btn, edit_btn, reveal_btn, delete_btn].spacing(8),
                 ]
                 .align_y(Alignment::Center),
             )

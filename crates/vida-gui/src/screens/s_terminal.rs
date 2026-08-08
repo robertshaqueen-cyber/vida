@@ -1,4 +1,4 @@
-//! 正式终端标签内容（M2b-3）：显示并操作一个本地会话。
+//! 正式终端标签内容：显示并操作本地或 SSH 会话。
 
 use std::sync::Arc;
 
@@ -16,6 +16,10 @@ use crate::ui::{self, icons};
 #[derive(Debug, Clone)]
 pub struct TerminalSession {
     pub session_id: String,
+    /// None 表示本地终端；Some(host_id) 表示 SSH 终端，供 daemon 重启后按原主机恢复。
+    pub remote_host_id: Option<String>,
+    /// 工具栏显示名称（本地终端或主机名称）。
+    pub title: String,
     pub grid: ClientGrid,
     /// 会话是否已结束（session_closed 事件）。
     pub closed: bool,
@@ -30,9 +34,18 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub fn new(session_id: String, rows: u16, cols: u16, appearance: TerminalAppearance) -> Self {
+    pub fn new(
+        session_id: String,
+        remote_host_id: Option<String>,
+        title: String,
+        rows: u16,
+        cols: u16,
+        appearance: TerminalAppearance,
+    ) -> Self {
         Self {
             session_id,
+            remote_host_id,
+            title,
             grid: ClientGrid::new(rows, cols),
             closed: false,
             exit_code: None,
@@ -68,7 +81,7 @@ impl TerminalSession {
         let toolbar = container(
             row![
                 icons::icon(icons::TERMINAL, 15).color(ui::ACCENT),
-                text(i18n.tr("terminal_local_title")).size(13),
+                text(&self.title).size(13),
                 Space::new().width(Length::Fill),
                 status,
             ]

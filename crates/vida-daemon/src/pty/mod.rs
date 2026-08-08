@@ -19,7 +19,9 @@
 pub mod push;
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -30,6 +32,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -60,6 +63,33 @@ struct IoState {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
+#[derive(Default)]
+struct SessionCleanup {
+    askpass: Option<crate::ssh_auth::AskpassBroker>,
+    temp_files: Vec<PathBuf>,
+}
+
+impl SessionCleanup {
+    fn run(&mut self) {
+        if let Some(mut askpass) = self.askpass.take() {
+            askpass.stop();
+        }
+        for path in self.temp_files.drain(..) {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("SSH 临时密钥清理失败: {}", error);
+            }
+        }
+    }
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
 /// 会话内部状态（锁拆分：term + io 两把独立 Mutex）。
 pub(crate) struct SessionInner {
     id: String,
@@ -67,6 +97,7 @@ pub(crate) struct SessionInner {
     rows: u16,
     term: Mutex<TermState>,
     io: Mutex<IoState>,
+    cleanup: Mutex<SessionCleanup>,
     /// shell 是否已退出。
     closed: AtomicBool,
     /// 退出码（shell 自行退出或 CloseSession 时记录）。
@@ -157,6 +188,18 @@ pub struct SessionInfo {
     pub foreground_process: Option<String>,
 }
 
+pub enum SshAuth {
+    Password(SecretString),
+    KeyFile {
+        path: String,
+        passphrase: Option<SecretString>,
+    },
+    InlineKey {
+        private_key: SecretString,
+        passphrase: Option<SecretString>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // PtyManager
 // ---------------------------------------------------------------------------
@@ -204,11 +247,163 @@ fn detect_shell() -> String {
     "/bin/sh".to_string()
 }
 
+fn ssh_args(
+    host: &str,
+    user: &str,
+    port: u16,
+    private_key_path: Option<&str>,
+    password_only: bool,
+) -> Result<Vec<String>> {
+    fn validate(label: &str, value: &str) -> Result<()> {
+        if value.is_empty() || value.starts_with('-') || value.chars().any(char::is_control) {
+            anyhow::bail!("SSH {}无效，请检查主机配置", label);
+        }
+        Ok(())
+    }
+
+    validate("地址", host)?;
+    validate("用户名", user)?;
+    if port == 0 {
+        anyhow::bail!("SSH 端口不能为 0，请检查主机配置");
+    }
+    let mut args = vec![
+        "-p".to_string(),
+        port.to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=30".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+    if password_only {
+        args.extend([
+            "-o".to_string(),
+            "PreferredAuthentications=password,keyboard-interactive".to_string(),
+            "-o".to_string(),
+            "PubkeyAuthentication=no".to_string(),
+        ]);
+    } else if let Some(path) = private_key_path {
+        if path.is_empty() || path.chars().any(char::is_control) {
+            anyhow::bail!("SSH 私钥路径无效，请检查主机配置");
+        }
+        args.extend([
+            "-i".to_string(),
+            path.to_string(),
+            "-o".to_string(),
+            "IdentitiesOnly=yes".to_string(),
+        ]);
+    }
+    args.extend(["-l".to_string(), user.to_string(), host.to_string()]);
+    Ok(args)
+}
+
+fn write_inline_key_in(directory: &std::path::Path, contents: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory).context("无法创建 SSH 临时密钥目录")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = directory.join(format!("{}.key", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).context("无法创建 SSH 临时密钥文件")?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|_| file.flush())
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err(error).context("无法写入 SSH 临时密钥文件");
+    }
+    Ok(path)
+}
+
+fn write_inline_key(contents: &str) -> Result<PathBuf> {
+    write_inline_key_in(&vida_core::config::config_dir()?.join("ssh-keys"), contents)
+}
+
+/// Remove only Vida-owned ephemeral inline-key files left by an unclean prior
+/// daemon exit. Never traverses outside the dedicated `ssh-keys` directory.
+pub fn cleanup_stale_inline_keys() -> Result<usize> {
+    let directory = vida_core::config::config_dir()?.join("ssh-keys");
+    if !directory.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&directory).context("无法检查 SSH 临时密钥目录")? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path.extension().is_some_and(|extension| extension == "key")
+        {
+            std::fs::remove_file(&path).context("无法清理上次遗留的 SSH 临时密钥")?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[allow(unused_mut)]
 impl PtyManager {
     /// 打开本地 shell 会话。命令固定 $SHELL，不接受客户端指定；
     /// cwd 固定 HOME（decisions.md 结论 6）。
     pub fn open_session(&mut self, cols: u16, rows: u16) -> Result<String> {
+        let shell = detect_shell();
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.env("TERM", "xterm-256color");
+        self.open_command_session(cols, rows, cmd, "本地", SessionCleanup::default())
+    }
+
+    /// 通过系统 OpenSSH 打开远程终端。参数直接传给进程，不经过 shell 拼接。
+    pub fn open_ssh_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        host: &str,
+        user: &str,
+        port: u16,
+        auth: SshAuth,
+    ) -> Result<String> {
+        let mut cleanup = SessionCleanup::default();
+        let (private_key_path, password_only, askpass_secret) = match auth {
+            SshAuth::Password(password) => (None, true, Some(password)),
+            SshAuth::KeyFile { path, passphrase } => (Some(path), false, passphrase),
+            SshAuth::InlineKey {
+                private_key,
+                passphrase,
+            } => {
+                let path = write_inline_key(private_key.expose_secret())?;
+                cleanup.temp_files.push(path.clone());
+                (Some(path.to_string_lossy().into_owned()), false, passphrase)
+            }
+        };
+        let args = ssh_args(host, user, port, private_key_path.as_deref(), password_only)?;
+        let mut cmd = CommandBuilder::new("ssh");
+        cmd.args(args);
+        cmd.env("TERM", "xterm-256color");
+        if let Some(secret) = askpass_secret {
+            let (broker, env) = crate::ssh_auth::AskpassBroker::start(secret)?;
+            crate::ssh_auth::apply_env(&mut cmd, &env)?;
+            cleanup.askpass = Some(broker);
+        }
+        self.open_command_session(cols, rows, cmd, "SSH", cleanup)
+            .context("无法启动系统 ssh；请确认 OpenSSH 客户端已安装并可从 PATH 找到")
+    }
+
+    fn open_command_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cmd: CommandBuilder,
+        kind: &str,
+        cleanup: SessionCleanup,
+    ) -> Result<String> {
         validate_size(cols, rows)?;
 
         // --- PTY ---
@@ -221,14 +416,10 @@ impl PtyManager {
             })
             .context("openpty 失败")?;
 
-        // --- shell（固定 $SHELL，cwd=HOME）---
-        let shell = detect_shell();
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.env("TERM", "xterm-256color");
         let child = pair
             .slave
             .spawn_command(cmd)
-            .with_context(|| format!("spawn {} 失败", shell))?;
+            .with_context(|| format!("启动{}会话进程失败", kind))?;
         drop(pair.slave);
 
         // --- Term + Processor ---
@@ -264,6 +455,7 @@ impl PtyManager {
                 master: Some(pair.master),
                 child: Some(child),
             }),
+            cleanup: Mutex::new(cleanup),
             closed: AtomicBool::new(false),
             exit_code: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
@@ -317,7 +509,7 @@ impl PtyManager {
         });
 
         self.sessions.insert(id.clone(), session);
-        info!("会话 {} 已打开 ({}×{})", id, cols, rows);
+        info!("{} 会话 {} 已打开 ({}×{})", kind, id, cols, rows);
         Ok(id)
     }
 
@@ -460,6 +652,10 @@ impl PtyManager {
                 }
                 Err(e) => warn!("会话 {} wait 失败: {}", session_id, e),
             }
+        }
+        drop(io);
+        if let Ok(mut cleanup) = inner.cleanup.lock() {
+            cleanup.run();
         }
         info!("会话 {} 已关闭", session_id);
         Ok(())
@@ -700,6 +896,9 @@ fn finalize_session(session: Arc<Mutex<SessionInner>>) {
     {
         *ec = Some(c);
     }
+    if let Ok(mut cleanup) = inner.cleanup.lock() {
+        cleanup.run();
+    }
 
     // 推送 session_closed 事件到所有订阅者
     let event_payload = PushPayload {
@@ -854,6 +1053,77 @@ mod tests {
         assert_eq!(info.len(), 1);
         assert!(info[0].alive);
         pm.close_session(&id).unwrap();
+    }
+
+    #[test]
+    fn ssh_arguments_are_structured_and_reject_option_injection() {
+        let args = ssh_args(
+            "server.example",
+            "deploy",
+            2222,
+            Some("/tmp/test key"),
+            false,
+        )
+        .expect("valid ssh args");
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "2222",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-i",
+                "/tmp/test key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-l",
+                "deploy",
+                "server.example",
+            ]
+        );
+        assert!(ssh_args("-oProxyCommand=bad", "deploy", 22, None, false).is_err());
+        assert!(ssh_args("server.example", "-V", 22, None, false).is_err());
+        assert!(ssh_args("server.example", "deploy", 0, None, false).is_err());
+
+        let password_args = ssh_args("server.example", "deploy", 22, None, true).unwrap();
+        assert!(
+            password_args
+                .iter()
+                .any(|arg| arg == "PubkeyAuthentication=no")
+        );
+        assert!(
+            password_args
+                .iter()
+                .any(|arg| arg == "PreferredAuthentications=password,keyboard-interactive")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_key_is_private_and_cleanup_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_inline_key_in(directory.path(), "PRIVATE KEY CONTENT").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "PRIVATE KEY CONTENT"
+        );
+
+        let mut cleanup = SessionCleanup {
+            askpass: None,
+            temp_files: vec![path.clone()],
+        };
+        cleanup.run();
+        assert!(!path.exists());
     }
 
     #[test]

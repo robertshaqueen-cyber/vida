@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
-use vida_daemon::protocol::{ConflictChoice, HostRequest};
+use vida_daemon::protocol::{ConflictChoice, HostAuthRequest, HostRequest};
 use vida_daemon::state::DaemonState;
 
 /// Serialize tests that modify VIDA_CONFIG_DIR env var
@@ -39,6 +39,7 @@ fn add_test_host(state: &mut DaemonState, name: &str) {
             group: None,
             color: None,
             password: Some("secret-password-123".to_string()),
+            auth: None,
             notes: None,
         })
         .unwrap();
@@ -640,10 +641,65 @@ fn add_host_with_password() {
             group: Some("servers".to_string()),
             color: Some("#ff0000".to_string()),
             password: Some("mypassword".to_string()),
+            auth: None,
             notes: Some("notes".to_string()),
         })
         .unwrap();
     assert_eq!(summary.name, "web");
+}
+
+#[test]
+fn add_hosts_with_key_file_and_imported_key() {
+    let (mut state, _dir) = test_state("tok");
+    state.create_vault("pass").unwrap();
+
+    let key_file = state
+        .update_host(HostRequest {
+            id: None,
+            name: "key-file".to_string(),
+            host: "server.example".to_string(),
+            user: "deploy".to_string(),
+            port: 2222,
+            tags: vec![],
+            group: None,
+            color: None,
+            password: None,
+            auth: Some(HostAuthRequest::Key {
+                private_key_path: "/secure/id_ed25519".to_string(),
+                passphrase: Some("key-passphrase".to_string()),
+            }),
+            notes: None,
+        })
+        .unwrap();
+    assert_eq!(key_file.auth_kind, "key");
+    assert_eq!(
+        state.reveal_credential(&key_file.id).unwrap(),
+        "key:/secure/id_ed25519"
+    );
+
+    let inline = state
+        .update_host(HostRequest {
+            id: None,
+            name: "imported-key".to_string(),
+            host: "server.example".to_string(),
+            user: "deploy".to_string(),
+            port: 22,
+            tags: vec![],
+            group: None,
+            color: None,
+            password: None,
+            auth: Some(HostAuthRequest::KeyInline {
+                private_key: "PRIVATE KEY CONTENT".to_string(),
+                passphrase: None,
+            }),
+            notes: None,
+        })
+        .unwrap();
+    assert_eq!(inline.auth_kind, "key_inline");
+    assert_eq!(
+        state.reveal_credential(&inline.id).unwrap(),
+        "PRIVATE KEY CONTENT"
+    );
 }
 
 #[test]
@@ -663,6 +719,7 @@ fn update_host_keep_credential() {
             group: None,
             color: None,
             password: None,
+            auth: None,
             notes: None,
         })
         .unwrap();

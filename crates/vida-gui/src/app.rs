@@ -121,10 +121,13 @@ impl SyncState {
 pub enum AppMessage {
     // Formal local terminal tabs (M2b-3)
     OpenLocalTerminal,
+    OpenSshTerminal(String),
     TerminalPush(PushMsg),
     /// 订阅建立完成。
     TerminalOpened {
         session_id: String,
+        title: String,
+        host_id: Option<String>,
     },
     /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
     TerminalDisconnected {
@@ -208,7 +211,12 @@ pub enum AppMessage {
     EditorHostChanged(String),
     EditorUserChanged(String),
     EditorPortChanged(String),
+    EditorAuthChanged(crate::screens::s4_credential::AuthKindItem),
     EditorPasswordChanged(String),
+    EditorKeyPathChanged(String),
+    EditorPickKeyFile,
+    EditorImportKeyFile,
+    EditorKeyPassphraseChanged(String),
     EditorTagsChanged(String),
     EditorGroupChanged(String),
     EditorNotesChanged(String),
@@ -451,6 +459,27 @@ async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
         .send("SubscribeSession", serde_json::json!({"session_id": sid}))
         .await
         .map_err(|e| format!("订阅失败: {}", e.message))?;
+    Ok(sid)
+}
+
+/// 通过 daemon 使用金库中的主机与凭据打开系统 SSH，并订阅终端推送。
+async fn open_ssh_and_subscribe(client: &WsClient, host_id: &str) -> Result<String, String> {
+    let resp = client
+        .send(
+            "OpenSshSession",
+            serde_json::json!({"host_id": host_id, "cols": 100, "rows": 40}),
+        )
+        .await
+        .map_err(|e| format!("打开 SSH 会话失败: {}", e.message))?;
+    let sid = resp
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "OpenSshSession 响应缺少 session_id".to_string())?
+        .to_string();
+    client
+        .send("SubscribeSession", serde_json::json!({"session_id": sid}))
+        .await
+        .map_err(|e| format!("订阅 SSH 会话失败: {}", e.message))?;
     Ok(sid)
 }
 
@@ -742,20 +771,14 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::QuickConnectHost(host_id) => {
-            // Open host tab and close panel
+            // Quick connect is a direct SSH action; the host detail tab remains
+            // available separately in the persistent host tabs.
             app.show_connect_panel = false;
-            let existing = app.tabs.iter().find(|t| t.id == host_id);
-            if existing.is_none()
-                && let Some(h) = app.hosts.iter().find(|h| h.id == host_id)
-            {
-                app.tabs.push(Tab::host(host_id.clone(), h.name.clone()));
-            }
-            app.active_tab_id = host_id.clone();
             // Update recent hosts: move to front, dedup, limit to 10
             app.recent_host_ids.retain(|id| *id != host_id);
-            app.recent_host_ids.insert(0, host_id);
+            app.recent_host_ids.insert(0, host_id.clone());
             app.recent_host_ids.truncate(10);
-            Task::none()
+            update(app, AppMessage::OpenSshTerminal(host_id))
         }
         AppMessage::QuickAddHost => {
             app.show_connect_panel = false;
@@ -814,6 +837,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     h.tags.clone(),
                     h.group.clone(),
                     h.color.clone(),
+                    h.auth_kind.clone(),
                     h.notes.clone(),
                 ));
             }
@@ -980,7 +1004,72 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     s.password_cleared = true;
                 }
                 s.password = v;
+                s.credential_dirty = true;
                 s.password_cleared = false;
+            }
+            Task::none()
+        }
+        AppMessage::EditorAuthChanged(item) => {
+            if let Some(state) = &mut app.editor_state
+                && state.auth_kind != item.kind
+            {
+                state.auth_kind = item.kind;
+                state.password.clear();
+                state.private_key_path.clear();
+                state.inline_key.clear();
+                state.key_passphrase.clear();
+                state.credential_dirty = true;
+            }
+            Task::none()
+        }
+        AppMessage::EditorKeyPathChanged(value) => {
+            if let Some(state) = &mut app.editor_state {
+                state.private_key_path = value;
+                state.credential_dirty = true;
+            }
+            Task::none()
+        }
+        AppMessage::EditorPickKeyFile => {
+            if let Some(state) = &mut app.editor_state
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title(app.i18n.tr("editor_choose_key"))
+                    .pick_file()
+            {
+                state.private_key_path = path.to_string_lossy().into_owned();
+                state.credential_dirty = true;
+                state.error = None;
+            }
+            Task::none()
+        }
+        AppMessage::EditorImportKeyFile => {
+            if let Some(state) = &mut app.editor_state
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title(app.i18n.tr("editor_import_key"))
+                    .pick_file()
+            {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) if !contents.is_empty() => {
+                        state.inline_key = contents;
+                        state.credential_dirty = true;
+                        state.error = None;
+                    }
+                    Ok(_) => {
+                        state.error = Some(app.i18n.tr("editor_key_empty").to_string());
+                    }
+                    Err(error) => {
+                        state.error = Some(
+                            app.i18n
+                                .trf("editor_key_read_failed", &[&error.to_string()]),
+                        );
+                    }
+                }
+            }
+            Task::none()
+        }
+        AppMessage::EditorKeyPassphraseChanged(value) => {
+            if let Some(state) = &mut app.editor_state {
+                state.key_passphrase = value;
+                state.credential_dirty = true;
             }
             Task::none()
         }
@@ -1030,11 +1119,27 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 } else {
                     Some(s.notes.clone())
                 };
-                // Password: empty on edit → None (keep existing); non-empty → Some
-                let password = if s.password.is_empty() {
-                    None // keep existing (edit) or validation catches (add)
+                let auth = if !s.credential_dirty {
+                    None
                 } else {
-                    Some(s.password.clone())
+                    let passphrase =
+                        (!s.key_passphrase.is_empty()).then(|| s.key_passphrase.clone());
+                    Some(match s.auth_kind {
+                        s4_credential::AuthKind::Password => serde_json::json!({
+                            "kind": "password",
+                            "password": s.password,
+                        }),
+                        s4_credential::AuthKind::KeyFile => serde_json::json!({
+                            "kind": "key",
+                            "private_key_path": s.private_key_path,
+                            "passphrase": passphrase,
+                        }),
+                        s4_credential::AuthKind::KeyInline => serde_json::json!({
+                            "kind": "key_inline",
+                            "private_key": s.inline_key,
+                            "passphrase": passphrase,
+                        }),
+                    })
                 };
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
@@ -1049,7 +1154,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                                 "tags": tags,
                                 "group": group,
                                 "color": null,
-                                "password": password,
+                                "password": null,
+                                "auth": auth,
                                 "notes": notes,
                             }
                         });
@@ -1906,14 +2012,51 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::perform(
                 async move {
                     match open_and_subscribe(&client).await {
-                        Ok(sid) => AppMessage::TerminalOpened { session_id: sid },
+                        Ok(sid) => AppMessage::TerminalOpened {
+                            session_id: sid,
+                            title: "".to_string(),
+                            host_id: None,
+                        },
                         Err(e) => AppMessage::TerminalSetupError(e),
                     }
                 },
                 |msg| msg,
             )
         }
-        AppMessage::TerminalOpened { session_id } => {
+        AppMessage::OpenSshTerminal(host_id) => {
+            if app.terminal_opening || !matches!(app.screen, Screen::Main(_)) {
+                return Task::none();
+            }
+            let Some(host) = app.hosts.iter().find(|host| host.id == host_id) else {
+                app.terminal_error = Some(app.i18n.tr("main_host_not_found").to_string());
+                return Task::none();
+            };
+            let title = host.name.clone();
+            let client = match app.ws_client.as_ref() {
+                Some(client) => client.clone(),
+                None => return Task::none(),
+            };
+            app.terminal_opening = true;
+            app.terminal_error = None;
+            Task::perform(
+                async move {
+                    match open_ssh_and_subscribe(&client, &host_id).await {
+                        Ok(session_id) => AppMessage::TerminalOpened {
+                            session_id,
+                            title,
+                            host_id: Some(host_id),
+                        },
+                        Err(error) => AppMessage::TerminalSetupError(error),
+                    }
+                },
+                |message| message,
+            )
+        }
+        AppMessage::TerminalOpened {
+            session_id,
+            title,
+            host_id,
+        } => {
             app.terminal_opening = false;
             if !matches!(app.screen, Screen::Main(_)) {
                 if let Some(client) = app.ws_client.as_ref() {
@@ -1927,15 +2070,21 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             let number = app.next_terminal_number;
             app.next_terminal_number = app.next_terminal_number.saturating_add(1);
-            let name = app
-                .i18n
-                .trf("terminal_local_numbered", &[&number.to_string()]);
+            let local_title = app.i18n.tr("terminal_local_title").to_string();
+            let name = if host_id.is_some() {
+                title.clone()
+            } else {
+                app.i18n
+                    .trf("terminal_local_numbered", &[&number.to_string()])
+            };
             let tab = Tab::terminal(session_id.clone(), number, name);
             let tab_id = tab.id.clone();
             app.terminal_sessions.insert(
                 tab_id.clone(),
                 s_terminal::TerminalSession::new(
                     session_id,
+                    host_id,
+                    if title.is_empty() { local_title } else { title },
                     40,
                     100,
                     app.terminal_appearance.clone(),
@@ -1955,7 +2104,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             }
 
-            let snapshots: Vec<(String, u16, u16)> = app
+            let snapshots: Vec<(String, u16, u16, Option<String>)> = app
                 .terminal_sessions
                 .values()
                 .filter(|session| !session.closed)
@@ -1964,6 +2113,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                         session.session_id.clone(),
                         session.grid.rows,
                         session.grid.cols,
+                        session.remote_host_id.clone(),
                     )
                 })
                 .collect();
@@ -1995,7 +2145,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                         }
                     };
                     let mut mappings = Vec::with_capacity(snapshots.len());
-                    for (old_session_id, rows, cols) in snapshots {
+                    for (old_session_id, rows, cols, remote_host_id) in snapshots {
                         match client
                             .send(
                                 "SubscribeSession",
@@ -2017,7 +2167,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                                 mappings.push((old_session_id.clone(), old_session_id, false));
                             }
                             Err(error) if error.message.contains("会话不存在") => {
-                                match open_and_subscribe(&client).await {
+                                let reopened = match remote_host_id {
+                                    Some(host_id) => {
+                                        open_ssh_and_subscribe(&client, &host_id).await
+                                    }
+                                    None => open_and_subscribe(&client).await,
+                                };
+                                match reopened {
                                     Ok(new_session_id) => {
                                         let _ = client
                                             .send(
@@ -2502,6 +2658,8 @@ mod tests {
                 tab.id.clone(),
                 s_terminal::TerminalSession::new(
                     session_id.to_string(),
+                    None,
+                    format!("Local terminal {number}"),
                     40,
                     100,
                     TerminalAppearance::default(),
