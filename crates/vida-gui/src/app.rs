@@ -220,6 +220,8 @@ pub enum AppMessage {
     EditorTagsChanged(String),
     EditorGroupChanged(String),
     EditorNotesChanged(String),
+    EditorFocusNext,
+    EditorFocusPrevious,
     EditorSave,
     EditorSaved,
     EditorCancel,
@@ -421,8 +423,23 @@ fn close_all_terminal_sessions(app: &mut VidaApp) {
 /// active terminal requests cursor blinking.
 fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     let mut subscriptions = Vec::new();
+
+    let editor_is_active = app
+        .tabs
+        .iter()
+        .find(|tab| tab.id == app.active_tab_id)
+        .is_some_and(|tab| {
+            matches!(
+                tab.kind,
+                crate::screens::TabKind::AddHost | crate::screens::TabKind::EditHost { .. }
+            )
+        });
+    if editor_is_active {
+        subscriptions.push(iced::event::listen_with(editor_focus_event));
+    }
+
     let Some(ws) = app.ws_client.as_ref() else {
-        return iced::Subscription::none();
+        return iced::Subscription::batch(subscriptions);
     };
 
     for (tab_id, session) in &app.terminal_sessions {
@@ -467,6 +484,30 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     }
 
     iced::Subscription::batch(subscriptions)
+}
+
+fn editor_focus_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<AppMessage> {
+    use iced::keyboard::{Key, key};
+
+    match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: Key::Named(key::Named::Tab),
+            modifiers,
+            repeat: false,
+            ..
+        }) if !modifiers.command() && !modifiers.control() && !modifiers.alt() => {
+            Some(if modifiers.shift() {
+                AppMessage::EditorFocusPrevious
+            } else {
+                AppMessage::EditorFocusNext
+            })
+        }
+        _ => None,
+    }
 }
 
 /// 打开本地会话并订阅推送，返回 session_id。
@@ -1120,6 +1161,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
+        AppMessage::EditorFocusNext => iced::widget::operation::focus_next(),
+        AppMessage::EditorFocusPrevious => iced::widget::operation::focus_previous(),
         AppMessage::EditorSave => {
             if let Some(s) = &mut app.editor_state {
                 s.saving = true;
@@ -2670,11 +2713,54 @@ fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, parse_backup_bytes, update,
+        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, editor_focus_event,
+        parse_backup_bytes, update,
     };
     use crate::screens::{s_terminal, s3_main};
     use crate::term::primitive::TerminalAppearance;
     use crate::ws_client::PushMsg;
+
+    fn tab_key_event(modifiers: iced::keyboard::Modifiers) -> iced::Event {
+        use iced::keyboard::{Key, Location, key};
+
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: Key::Named(key::Named::Tab),
+            modified_key: Key::Named(key::Named::Tab),
+            physical_key: key::Physical::Code(key::Code::Tab),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn editor_tab_event_maps_forward_and_reverse_focus() {
+        let forward = editor_focus_event(
+            tab_key_event(iced::keyboard::Modifiers::NONE),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+        let reverse = editor_focus_event(
+            tab_key_event(iced::keyboard::Modifiers::SHIFT),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+
+        assert!(matches!(forward, Some(AppMessage::EditorFocusNext)));
+        assert!(matches!(reverse, Some(AppMessage::EditorFocusPrevious)));
+    }
+
+    #[test]
+    fn editor_tab_event_does_not_capture_command_tab() {
+        let result = editor_focus_event(
+            tab_key_event(iced::keyboard::Modifiers::COMMAND),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+
+        assert!(result.is_none());
+    }
 
     fn app_with_two_terminal_tabs() -> VidaApp {
         let (mut app, _) = super::new();

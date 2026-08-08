@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, pick_list, row, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length};
 use vida_core::i18n::I18n;
 
@@ -348,14 +348,18 @@ impl State {
 
         let content = container(card)
             .padding(22)
-            .width(Length::Fixed(620.0))
+            .width(Length::Fill)
+            .max_width(620)
             .style(ui::surface);
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .padding(iced::padding::Padding::new(0.0).top(62))
-            .into()
+        scrollable(
+            container(content)
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .padding(iced::padding::Padding::new(20.0).top(36).bottom(36)),
+        )
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .into()
     }
 }
