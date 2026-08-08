@@ -854,11 +854,23 @@ Regular 下显得过细、像被横向压扁。宽字符普通输出改用字体
 只保留 `monospaced` family，避免比例字体破坏固定 cell；字号使用一组常用整数选项。
 配置中已不存在的字体回落到已安装的 Menlo，再回落到列表第一项。
 
-连续输出验收显示原实现还把终端设置的 13pt 错当成了 13px，Menlo `A` 最终只有
-8×9px，低分辨率 hinting 让笔画像被随机切掉。终端字号现在明确使用 pt 语义，
-光栅化前按 `96/72` 转成 cosmic-text 的 px；行高仍按设置点数的 1.4 倍计算。
-Menlo 13pt 在 scale=1 下为 cell 10×18、ascent 15，`A` 位图 10×12，PingFang
-Medium 中文位图 17×17。诊断测试断言这些位图的上下界都位于 cell 内。
+后续与同机 Ghostty、iced 原生界面逐像素对照，确认 macOS 的 pt 已是逻辑像素；
+再乘 `96/72` 会把 13pt 中文放大为 17×17px，几乎占满 18px 行高。此前还对所有
+宽字符强制使用 Medium，并以 `pow(0.72)` 加深灰度覆盖率，三者叠加造成中文像粗体、
+行距拥挤且抗锯齿边缘接近位图字体。
+
+终端布局和 wgpu 图集保持不变，字形光栅化改由 `font-kit 0.14.3` 调用平台原生后端：
+macOS CoreText、Windows DirectWrite、Linux FreeType；只有原生字体缺字或加载失败时
+才回落到 Swash。选择字体时先按 PostScript 名精确匹配 Regular/Bold，避免 CoreText
+family 枚举把 Menlo Regular 误选成 Italic。`font-kit` 读取 PingFang 字体集合会让
+Physical footprint 从约 248MB 激增到 552MB，因此原生后端只加载用户选择的等宽
+字体；CJK 固定由已有 Swash 数据库回退，不复制大型字体集合。普通宽字符保持
+Regular，alpha 原样上传；Menlo 13pt 在 scale=1 下为 cell 8×18、ascent 14，CoreText
+`A` 位图 8×10、Swash 中文位图 13×13。最终隔离 release 实测 scale=1 Physical
+footprint 257.3MB（峰值 257.8MB），相对旧版 247.9MB 增加约 9.4MB。默认前景由
+纯白降为 `#dcdee1`。
+测试同时断言原生遮罩包含非零实心像素和 0—255 之间的抗锯齿覆盖率，且普通、粗体、
+CJK 位图上下界都位于 cell 内。
 图集增量上传测试会把跨行探针写入 GPU 纹理，再复制回 MAP_READ buffer 与 CPU 图集
 逐字节比较；因此本次缺笔已确认不是 atlas 行距、上传范围或 GPU 数据损坏。
 

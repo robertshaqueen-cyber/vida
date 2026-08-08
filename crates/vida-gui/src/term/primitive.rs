@@ -16,9 +16,16 @@ use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use font_kit::canvas::{Canvas as FontCanvas, Format, RasterizationOptions};
+use font_kit::family_name::FamilyName;
+use font_kit::font::Font as NativeFont;
+use font_kit::hinting::HintingOptions;
+use font_kit::properties::{Properties, Weight as NativeWeight};
+use font_kit::source::SystemSource;
 use iced::Rectangle;
 use iced_graphics::Viewport;
 use iced_wgpu::Primitive as IcedPrimitive;
+use pathfinder_geometry::transform2d::Transform2F;
 
 use super::client_grid::{ClientGrid, ColorSpec, cell_flags};
 use super::frame;
@@ -51,12 +58,12 @@ struct FontMetrics {
 }
 
 /// 终端默认配色（主题色）。
-const DEFAULT_FG: (u8, u8, u8) = (255, 255, 255);
+// 避免低 DPI 下纯白前景产生类似位图字体的强烈反差；接近 iced 原生界面文字。
+const DEFAULT_FG: (u8, u8, u8) = (220, 222, 225);
 const DEFAULT_BG: (u8, u8, u8) = (40, 44, 52);
 const DEFAULT_FONT_SIZE: f32 = 13.0;
-/// 终端设置沿用 Ghostty 等终端的 pt 语义；cosmic-text 的 size 单位是 px。
-const POINTS_TO_PIXELS: f32 = 96.0 / 72.0;
-/// Ghostty 风格的默认行高：13pt 字号对应约 18px 行高。
+/// macOS 的 pt 是逻辑像素；光栅化时只乘显示器 scale，不能再乘 96/72。
+/// Ghostty 风格的默认行高：13pt 在 scale=1 时对应约 18px 行高。
 const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
 
 /// 字形缓存条目：(宽, 高, u0, v0, u1, v1, placement.left, placement.top)。
@@ -71,6 +78,22 @@ struct BuiltGeometry {
     /// 本次新增字形的图集区域（用于增量上传）。
     dirty_regions: Vec<(u32, u32, u32, u32)>, // (x, y, w, h)
     quads: Vec<Vertex>,
+}
+
+/// 平台原生字体栅格器。macOS/Windows/Linux 分别由 font-kit 转到
+/// CoreText/DirectWrite/FreeType；cosmic-text 仍负责兜底和字体度量。
+#[derive(Clone)]
+struct NativeFontSet {
+    regular: NativeFont,
+    bold: NativeFont,
+}
+
+struct GlyphBitmap {
+    width: u32,
+    height: u32,
+    alpha: Vec<u8>,
+    left: f32,
+    top: f32,
 }
 
 /// 终端 Primitive：持有一个不可变 grid 快照（Arc 共享）。
@@ -197,9 +220,7 @@ impl ViewportMetrics {
             .filter(|value| *value >= 8.0 && *value <= 48.0)
             .unwrap_or(DEFAULT_FONT_SIZE);
         (
-            (font_size * POINTS_TO_PIXELS * 0.6 * scale)
-                .round()
-                .max(1.0),
+            (font_size * 0.6 * scale).round().max(1.0),
             (font_size * LINE_HEIGHT_MULTIPLIER * scale)
                 .round()
                 .max(1.0),
@@ -210,6 +231,7 @@ impl ViewportMetrics {
 /// 跨帧共享的渲染状态（iced 对每种 Primitive 类型只建一次）。
 pub struct TermPipeline {
     font_system: Mutex<FontSystem>,
+    native_fonts: Option<NativeFontSet>,
     metrics: FontMetrics,
     render_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
@@ -285,6 +307,7 @@ impl IcedPrimitive for TermPrimitive {
                 );
             }
             pipeline.font_family = family;
+            pipeline.native_fonts = load_native_font_set(&pipeline.font_family);
             pipeline.metrics.font_size = appearance.font_size;
             pipeline.appearance = appearance;
             reset_render_cache(pipeline, "字体设置变化");
@@ -554,6 +577,7 @@ impl TermPrimitive {
             font_family: pipeline.font_family.clone(),
         };
 
+        let native_fonts = pipeline.native_fonts.clone();
         let mut font_system = match pipeline.font_system.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -608,8 +632,8 @@ impl TermPrimitive {
                         &mut font_system,
                         &mut cache,
                         &mut glyph_cache,
+                        native_fonts.as_ref(),
                         &mut atlas_state,
-                        ATLAS_SIZE,
                         cell.ch,
                         glyph_weight(bold, is_wide),
                     )
@@ -801,8 +825,8 @@ fn rasterize_char(
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
     glyph_cache: &mut std::collections::HashMap<(char, u16, u32), GlyphEntry>,
+    native_fonts: Option<&NativeFontSet>,
     state: &mut AtlasState,
-    atlas_size: u32,
     ch: char,
     weight: cosmic_text::Weight,
 ) -> Option<GlyphEntry> {
@@ -811,165 +835,161 @@ fn rasterize_char(
     if let Some(cached) = glyph_cache.get(&key) {
         return Some(*cached);
     }
-    let atlas = &mut state.data;
-    let next_x = &mut state.next_x;
-    let next_y = &mut state.next_y;
-    let row_h = &mut state.row_h;
-    let dirty = &mut state.dirty;
+    let bitmap = native_fonts
+        .and_then(|fonts| native_glyph_bitmap(fonts, ch, weight, state.font_size * scale))
+        .or_else(|| {
+            swash_glyph_bitmap(
+                font_system,
+                cache,
+                ch,
+                weight,
+                &state.font_family,
+                state.font_size * scale,
+                state.font_size * LINE_HEIGHT_MULTIPLIER * scale,
+            )
+        })?;
 
-    // 字号 × scale（方式 B）：位图与 advance 都是物理像素。
-    // 字体族显式指定（不依赖 fallback 顺序——Courier New 曾排在
-    // Menlo 前导致 ASCII 用了旧式打字机衬线体）。
-    let mut buf = Buffer::new_empty(Metrics::new(
-        state.font_size * POINTS_TO_PIXELS * scale,
-        state.font_size * LINE_HEIGHT_MULTIPLIER * scale,
-    ));
-    buf.set_size(font_system, Some(100.0), None);
-    let mut attrs = Attrs::new().family(cosmic_text::Family::Name(&state.font_family));
-    attrs = attrs.weight(weight);
-    let text: String = ch.to_string();
-    buf.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
+    let gw = bitmap.width;
+    let gh = bitmap.height;
+    if state.next_x + gw > ATLAS_SIZE {
+        state.next_x = 1;
+        state.next_y += state.row_h.max(1);
+        state.row_h = 0;
+    }
+    if state.next_y + gh > ATLAS_SIZE {
+        tracing::warn!("图集溢出: ch={:?} w={} h={}", ch, gw, gh);
+        return None;
+    }
 
-    let mut result = None;
-    for line in buf.layout_runs() {
-        for glyph in line.glyphs {
-            let physical = glyph.physical((0.0, 0.0), 1.0);
-            let img = match cache.get_image(font_system, physical.cache_key) {
-                Some(img) => img,
-                None => continue,
-            };
-            let gw = img.placement.width;
-            let gh = img.placement.height;
-            if gw == 0 || gh == 0 {
-                continue;
-            }
-            if *next_x + gw > atlas_size {
-                *next_x = 1;
-                *next_y += (*row_h).max(1);
-                *row_h = 0;
-            }
-            if *next_y + gh > atlas_size {
-                tracing::warn!("图集溢出: ch={:?} w={} h={}", ch, gw, gh);
-                continue;
-            }
-            // 按 img.content 分支处理像素格式（不再假定单通道）：
-            // - Mask: 1 字节/像素（cosmic_text 硬编码 Format::Alpha，主路径）
-            // - SubpixelMask: 4 字节/像素 RGBA 子像素抗锯齿，取 RGB 均值作
-            //   alpha（终端灰度渲染即可，不做子像素）
-            // - Color: 彩色字形（emoji），本轮不支持 → warn + 跳过
-            // 显式长度校验，不用钳位——钳位会把越界变成「重复读最后一字节」，
-            // 让错误信号消失、只表现为画错。
-            let mut incomplete = false;
-            match img.content {
-                cosmic_text::SwashContent::Mask => {
-                    for py in 0..gh {
-                        for px in 0..gw {
-                            let src = (py * gw + px) as usize;
-                            let Some(&a) = img.data.get(src) else {
-                                tracing::warn!(
-                                    "Mask 字形数据不完整: ch={:?} w={} h={} len={}",
-                                    ch,
-                                    gw,
-                                    gh,
-                                    img.data.len()
-                                );
-                                incomplete = true;
-                                break;
-                            };
-                            let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
-                            atlas[idx] = 255;
-                            atlas[idx + 1] = 255;
-                            atlas[idx + 2] = 255;
-                            atlas[idx + 3] = darken_glyph_alpha(a);
-                        }
-                    }
-                }
-                cosmic_text::SwashContent::SubpixelMask => {
-                    for py in 0..gh {
-                        for px in 0..gw {
-                            let src = (py * gw + px) as usize * 4;
-                            let Some(slice) = img.data.get(src..src + 4) else {
-                                tracing::warn!(
-                                    "SubpixelMask 字形数据不完整: ch={:?} w={} h={} len={}",
-                                    ch,
-                                    gw,
-                                    gh,
-                                    img.data.len()
-                                );
-                                incomplete = true;
-                                break;
-                            };
-                            let a = (slice[0] as u32 + slice[1] as u32 + slice[2] as u32) / 3;
-                            let idx = (((*next_y + py) * atlas_size + (*next_x + px)) as usize) * 4;
-                            atlas[idx] = 255;
-                            atlas[idx + 1] = 255;
-                            atlas[idx + 2] = 255;
-                            atlas[idx + 3] = darken_glyph_alpha(a as u8);
-                        }
-                    }
-                }
-                cosmic_text::SwashContent::Color => {
-                    // 彩色字形（如 emoji）：本轮不支持，跳过该字形（背景照画）。
-                    // decisions.md 已记录已知限制。
-                    tracing::warn!("彩色字形暂不支持，跳过: ch={:?}", ch);
-                    continue;
-                }
-            }
-            if incomplete {
-                // 数据不完整：跳过该字形，不推进 cursor、不记录 dirty
-                continue;
-            }
-            let u0 = *next_x as f32 / atlas_size as f32;
-            let v0 = *next_y as f32 / atlas_size as f32;
-            let u1 = (*next_x + gw) as f32 / atlas_size as f32;
-            let v1 = (*next_y + gh) as f32 / atlas_size as f32;
-            let entry = (
-                gw,
-                gh,
-                u0,
-                v0,
-                u1,
-                v1,
-                img.placement.left as f32,
-                img.placement.top as f32,
-            );
-            dirty.push((*next_x, *next_y, gw, gh));
-            *next_x += gw;
-            *row_h = (*row_h).max(gh);
-            result = Some(entry);
-            break;
-        }
-        if result.is_some() {
-            break;
+    for py in 0..gh {
+        for px in 0..gw {
+            let src = (py * gw + px) as usize;
+            let &alpha = bitmap.alpha.get(src)?;
+            let idx = (((state.next_y + py) * ATLAS_SIZE + (state.next_x + px)) as usize) * 4;
+            state.data[idx..idx + 4].copy_from_slice(&[255, 255, 255, alpha]);
         }
     }
 
-    if let Some(r) = result {
-        glyph_cache.insert(key, r);
-    }
-    result
+    let u0 = state.next_x as f32 / ATLAS_SIZE as f32;
+    let v0 = state.next_y as f32 / ATLAS_SIZE as f32;
+    let u1 = (state.next_x + gw) as f32 / ATLAS_SIZE as f32;
+    let v1 = (state.next_y + gh) as f32 / ATLAS_SIZE as f32;
+    let entry = (gw, gh, u0, v0, u1, v1, bitmap.left, bitmap.top);
+    state.dirty.push((state.next_x, state.next_y, gw, gh));
+    state.next_x += gw;
+    state.row_h = state.row_h.max(gh);
+    glyph_cache.insert(key, entry);
+    Some(entry)
 }
 
-/// zsh 的输入行通常带 bold，而普通命令输出不带；中文回退字体在小字号
-/// Regular 下笔画明显收窄，造成“输入正常、输出被压扁”的观感。宽字符的
-/// 普通字重使用 Medium，英文仍保持所选等宽字体的原始 Regular。
-fn glyph_weight(bold: bool, wide: bool) -> cosmic_text::Weight {
+fn native_glyph_bitmap(
+    fonts: &NativeFontSet,
+    ch: char,
+    weight: cosmic_text::Weight,
+    pixel_size: f32,
+) -> Option<GlyphBitmap> {
+    let bold = weight.0 >= cosmic_text::Weight::BOLD.0;
+    let primary = if bold { &fonts.bold } else { &fonts.regular };
+    let glyph_id = primary.glyph_for_char(ch)?;
+    let transform = Transform2F::default();
+    let bounds = primary
+        .raster_bounds(
+            glyph_id,
+            pixel_size,
+            transform,
+            HintingOptions::None,
+            RasterizationOptions::GrayscaleAa,
+        )
+        .ok()?;
+    if bounds.width() <= 0 || bounds.height() <= 0 {
+        return None;
+    }
+    let mut canvas = FontCanvas::new(bounds.size(), Format::A8);
+    primary
+        .rasterize_glyph(
+            &mut canvas,
+            glyph_id,
+            pixel_size,
+            Transform2F::from_translation(-bounds.origin().to_f32()),
+            HintingOptions::None,
+            RasterizationOptions::GrayscaleAa,
+        )
+        .ok()?;
+    Some(GlyphBitmap {
+        width: bounds.width() as u32,
+        height: bounds.height() as u32,
+        alpha: canvas.pixels,
+        left: bounds.origin_x() as f32,
+        top: -bounds.origin_y() as f32,
+    })
+}
+
+fn swash_glyph_bitmap(
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    ch: char,
+    weight: cosmic_text::Weight,
+    family: &str,
+    pixel_size: f32,
+    line_height: f32,
+) -> Option<GlyphBitmap> {
+    let mut buf = Buffer::new_empty(Metrics::new(pixel_size, line_height));
+    buf.set_size(font_system, Some(100.0), None);
+    let attrs = Attrs::new()
+        .family(cosmic_text::Family::Name(family))
+        .weight(weight);
+    buf.set_text(
+        font_system,
+        &ch.to_string(),
+        &attrs,
+        Shaping::Advanced,
+        None,
+    );
+    let glyph = buf.layout_runs().next()?.glyphs.first()?;
+    let physical = glyph.physical((0.0, 0.0), 1.0);
+    let image = cache.get_image(font_system, physical.cache_key).as_ref()?;
+    if image.placement.width == 0 || image.placement.height == 0 {
+        return None;
+    }
+    let expected = (image.placement.width * image.placement.height) as usize;
+    let alpha = match image.content {
+        cosmic_text::SwashContent::Mask => {
+            if image.data.len() != expected {
+                return None;
+            }
+            image.data.clone()
+        }
+        cosmic_text::SwashContent::SubpixelMask => {
+            if image.data.len() != expected * 4 {
+                return None;
+            }
+            image
+                .data
+                .chunks_exact(4)
+                .map(|rgba| {
+                    ((u16::from(rgba[0]) + u16::from(rgba[1]) + u16::from(rgba[2])) / 3) as u8
+                })
+                .collect()
+        }
+        cosmic_text::SwashContent::Color => return None,
+    };
+    Some(GlyphBitmap {
+        width: image.placement.width,
+        height: image.placement.height,
+        alpha,
+        left: image.placement.left as f32,
+        top: image.placement.top as f32,
+    })
+}
+
+/// 严格遵循终端属性：只有协议明确给出 bold 才用 Bold。
+/// 中文不能因 WIDE 标志擅自升为 Medium，否则普通输出会像粗体。
+fn glyph_weight(bold: bool, _wide: bool) -> cosmic_text::Weight {
     if bold {
         cosmic_text::Weight::BOLD
-    } else if wide {
-        cosmic_text::Weight::MEDIUM
     } else {
         cosmic_text::Weight::NORMAL
     }
-}
-
-/// 低 DPI stem darkening 在字形首次进入 CPU 图集时完成，避免把 `pow`
-/// 留在每个 GPU 片元上。端点保持不变，仅提升抗锯齿中间覆盖率。
-fn darken_glyph_alpha(alpha: u8) -> u8 {
-    if alpha == 0 || alpha == u8::MAX {
-        return alpha;
-    }
-    ((f32::from(alpha) / 255.0).powf(0.72) * 255.0).round() as u8
 }
 
 impl iced_wgpu::primitive::Pipeline for TermPipeline {
@@ -978,6 +998,55 @@ impl iced_wgpu::primitive::Pipeline for TermPipeline {
     }
 
     fn trim(&mut self) {}
+}
+
+fn load_native_face(source: &SystemSource, family: &str, bold: bool) -> Option<NativeFont> {
+    let compact_family: String = family.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let exact_candidates = if bold {
+        [
+            format!("{compact_family}-Bold"),
+            format!("{compact_family}Bold"),
+        ]
+    } else {
+        [
+            format!("{compact_family}-Regular"),
+            format!("{compact_family}Regular"),
+        ]
+    };
+    if let Some(font) = exact_candidates.iter().find_map(|postscript_name| {
+        source
+            .select_by_postscript_name(postscript_name)
+            .ok()?
+            .load()
+            .ok()
+    }) {
+        return Some(font);
+    }
+    let mut properties = Properties::new();
+    properties.weight(if bold {
+        NativeWeight::BOLD
+    } else {
+        NativeWeight::NORMAL
+    });
+    source
+        .select_best_match(&[FamilyName::Title(family.to_string())], &properties)
+        .ok()?
+        .load()
+        .ok()
+}
+
+fn load_native_font_set(family: &str) -> Option<NativeFontSet> {
+    let source = SystemSource::new();
+    let regular = load_native_face(&source, family, false)?;
+    let bold = load_native_face(&source, family, true).unwrap_or_else(|| regular.clone());
+    tracing::info!(
+        "终端原生栅格器: regular={} bold={}；缺字由 Swash 回退",
+        regular
+            .postscript_name()
+            .unwrap_or_else(|| family.to_string()),
+        bold.postscript_name().unwrap_or_else(|| family.to_string())
+    );
+    Some(NativeFontSet { regular, bold })
 }
 
 /// 建立渲染管线（iced 首次遇到 TermPrimitive 时调用一次）。
@@ -1216,6 +1285,7 @@ fn build_pipeline(
 
     TermPipeline {
         font_system: Mutex::new(font_system),
+        native_fonts: load_native_font_set(&family),
         metrics,
         render_pipeline,
         uniform_buffer,
@@ -1256,10 +1326,7 @@ fn resolve_font_family(db: &fontdb::Database, requested: &str) -> String {
 /// 打印 'A' 与 '你' 实际使用的字体名（启动日志，便于一眼确认）。
 fn log_face_names(font_system: &mut FontSystem, font_size: f32, family: &str) {
     for ch in ['A', '你'] {
-        let metrics = Metrics::new(
-            font_size * POINTS_TO_PIXELS,
-            font_size * LINE_HEIGHT_MULTIPLIER,
-        );
+        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_MULTIPLIER);
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
         let attrs = Attrs::new()
@@ -1301,17 +1368,15 @@ fn measure_font(
 ) -> FontMetrics {
     // 行高 = 设置点数 × 1.4：13pt → 18px，接近 Ghostty 默认视觉密度。
     let line_height = font_size * LINE_HEIGHT_MULTIPLIER;
-    let metrics = Metrics::new(font_size * POINTS_TO_PIXELS * scale, line_height * scale);
+    let metrics = Metrics::new(font_size * scale, line_height * scale);
     let mut buf = Buffer::new_empty(metrics);
     let attrs = Attrs::new().family(cosmic_text::Family::Name(family));
     buf.set_size(font_system, Some(100.0), None);
     buf.set_text(font_system, "M", &attrs, Shaping::Advanced, None);
     let fallback = FontMetrics {
-        cell_width: (font_size * POINTS_TO_PIXELS * 0.6 * scale)
-            .round()
-            .max(1.0),
+        cell_width: (font_size * 0.6 * scale).round().max(1.0),
         cell_height: (line_height * scale).round().max(1.0),
-        ascent: (font_size * POINTS_TO_PIXELS * 0.8 * scale).round(),
+        ascent: (font_size * 0.8 * scale).round(),
         scale,
         font_size,
     };
@@ -1444,18 +1509,31 @@ mod tests {
     }
 
     #[test]
-    fn stem_darkening_preserves_endpoints_and_strengthens_edges() {
-        assert_eq!(darken_glyph_alpha(0), 0);
-        assert_eq!(darken_glyph_alpha(255), 255);
-        assert!(darken_glyph_alpha(64) > 64);
-        assert!(darken_glyph_alpha(128) > 128);
+    fn regular_wide_glyph_keeps_regular_weight() {
+        assert_eq!(glyph_weight(false, false), cosmic_text::Weight::NORMAL);
+        assert_eq!(glyph_weight(false, true), cosmic_text::Weight::NORMAL);
+        assert_eq!(glyph_weight(true, true), cosmic_text::Weight::BOLD);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn regular_wide_glyph_uses_medium_weight() {
-        assert_eq!(glyph_weight(false, false), cosmic_text::Weight::NORMAL);
-        assert_eq!(glyph_weight(false, true), cosmic_text::Weight::MEDIUM);
-        assert_eq!(glyph_weight(true, true), cosmic_text::Weight::BOLD);
+    fn core_text_rasterizer_produces_regular_antialiased_masks() {
+        let fonts = load_native_font_set("Menlo").expect("macOS 应能加载 Menlo");
+        assert_eq!(
+            fonts.regular.postscript_name().as_deref(),
+            Some("Menlo-Regular")
+        );
+        assert_eq!(fonts.bold.postscript_name().as_deref(), Some("Menlo-Bold"));
+
+        let latin = native_glyph_bitmap(&fonts, 'A', cosmic_text::Weight::NORMAL, 13.0)
+            .expect("CoreText 应能光栅化 Menlo A");
+        assert!(latin.alpha.iter().any(|alpha| *alpha > 0));
+        assert!(latin.alpha.iter().any(|alpha| *alpha > 0 && *alpha < 255));
+
+        assert!(
+            native_glyph_bitmap(&fonts, '你', cosmic_text::Weight::NORMAL, 13.0).is_none(),
+            "主等宽字体缺少中文时应交给 Swash 回退，避免复制大型 CJK 字体集合"
+        );
     }
 
     #[test]
@@ -1574,7 +1652,15 @@ mod tests {
             vertices[2].xy,
             [metrics.cell_width * 3.0, metrics.cell_height * 2.0]
         );
-        assert_eq!(vertices[0].color, [1.0, 1.0, 1.0, -1.0]);
+        assert_eq!(
+            vertices[0].color,
+            [
+                DEFAULT_FG.0 as f32 / 255.0,
+                DEFAULT_FG.1 as f32 / 255.0,
+                DEFAULT_FG.2 as f32 / 255.0,
+                -1.0,
+            ]
+        );
 
         let cursor_off = TermPrimitive::with_appearance(
             primitive.snapshot.clone(),
@@ -1625,8 +1711,8 @@ mod tests {
                     &mut font_system,
                     &mut cache,
                     &mut glyph_cache,
+                    pipeline.native_fonts.as_ref(),
                     &mut state,
-                    ATLAS_SIZE,
                     ch,
                     glyph_weight(bold, wide),
                 );
@@ -1648,9 +1734,9 @@ mod tests {
                             metrics.cell_height
                         );
                         if size == DEFAULT_FONT_SIZE {
-                            assert_eq!(metrics.cell_width, 10.0);
+                            assert_eq!(metrics.cell_width, 8.0);
                             assert_eq!(metrics.cell_height, 18.0);
-                            assert_eq!(metrics.ascent, 15.0);
+                            assert_eq!(metrics.ascent, 14.0);
                         }
                         eprintln!(
                             "[diag] 字号 {}: cell={}x{} asc={} '{}' bold={} 位图={}x{} left={} top={} bottom={} 字体={}",
@@ -1683,10 +1769,7 @@ mod tests {
         font_size: f32,
         family: &str,
     ) -> String {
-        let metrics = Metrics::new(
-            font_size * POINTS_TO_PIXELS,
-            font_size * LINE_HEIGHT_MULTIPLIER,
-        );
+        let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_MULTIPLIER);
         let mut buf = Buffer::new_empty(metrics);
         buf.set_size(font_system, Some(100.0), None);
         let mut attrs = Attrs::new().family(cosmic_text::Family::Name(family));
@@ -1746,8 +1829,8 @@ mod tests {
                 &mut font_system,
                 &mut cache,
                 &mut glyph_cache,
+                pipeline.native_fonts.as_ref(),
                 &mut state,
-                ATLAS_SIZE,
                 'A',
                 glyph_weight(false, false),
             );
@@ -1807,8 +1890,8 @@ mod tests {
                 &mut font_system,
                 &mut cache,
                 &mut glyph_cache,
+                pipeline.native_fonts.as_ref(),
                 &mut state,
-                ATLAS_SIZE,
                 *ch,
                 weight,
             );
