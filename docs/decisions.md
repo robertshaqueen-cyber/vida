@@ -1007,3 +1007,15 @@ session id，而标签身份和用户所在位置不变。`Screen` 只保留连�
 关闭标签通过现有有序发送队列提交 `CloseSession`，保证此前的人类按键先到达 daemon；
 锁库先关闭所有终端标签再发送 `Lock`。M3 接入 SSH 时应复用这套标签/订阅/关闭模型，
 只替换 daemon 的会话打开方式，不另建第二套远程终端 UI 状态。
+
+### 鼠标选择、回滚与右键菜单
+
+回滚历史继续只由 daemon 的 alacritty `Term` 持有。GUI 滚轮发送 `ScrollSession`，daemon
+改变真实 `display_offset` 后通过现有推送通道发送当前 viewport 全量帧；因此 GUI 仍只
+保存可见网格，多个标签不会各自复制设置中的全部回滚行。人在历史中阅读时新输出沿用
+alacritty 的锚定语义，键盘输入或粘贴前由同一有序队列先回到底部。
+
+选择状态只属于终端 widget，不进入 daemon，也不进入日志。跨行复制跳过宽字符 spacer
+并清除行尾未选中的填充空格。右键菜单由 iced canvas 使用 Vida 的深色表面绘制，复制
+直接写系统剪贴板，粘贴仍发布 `TerminalPaste` 并由 daemon 查询真实 bracketed-paste
+模式；右键菜单不能绕过人的输入路径或把剪贴板内容交给 AI。

@@ -641,6 +641,11 @@ async fn handle_pty_request(
             pty.resize_session(session_id, *cols, *rows)?;
             Ok(serde_json::json!({"ok": true}))
         }
+        PtyRequest::ScrollSession { session_id, lines } => {
+            let pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let display_offset = pty.scroll_session(session_id, *lines)?;
+            Ok(serde_json::json!({"ok": true, "display_offset": display_offset}))
+        }
         PtyRequest::CloseSession { session_id } => {
             let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             pty.close_session(session_id)?;

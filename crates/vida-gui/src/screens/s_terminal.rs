@@ -80,13 +80,21 @@ impl TerminalSession {
         .width(Length::Fill)
         .style(ui::chrome);
         let canvas = container(widget::canvas(
+            self.session_id.clone(),
             self.snapshot(),
             self.viewport_metrics.clone(),
-            AppMessage::TerminalInput,
-            AppMessage::TerminalPaste,
-            terminal_resize_message,
+            widget::Callbacks {
+                input: AppMessage::TerminalInput,
+                paste: AppMessage::TerminalPaste,
+                resize: terminal_resize_message,
+                scroll: AppMessage::TerminalScroll,
+            },
             self.appearance.clone(),
             self.cursor_on,
+            widget::ContextLabels {
+                copy: i18n.tr("terminal_context_copy").to_string(),
+                paste: i18n.tr("terminal_context_paste").to_string(),
+            },
         ))
         .width(Length::Fill)
         .height(Length::Fill)

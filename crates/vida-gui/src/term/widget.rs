@@ -32,6 +32,9 @@ use super::primitive::{
 };
 
 const TERMINAL_WIDGET_ID: &str = "vida-terminal-canvas";
+const CONTEXT_MENU_WIDTH: f32 = 148.0;
+const CONTEXT_ITEM_HEIGHT: f32 = 34.0;
+const SCROLL_TO_BOTTOM: i32 = -1_000_000;
 
 /// 供进入终端屏时自动聚焦。
 pub fn id() -> iced::widget::Id {
@@ -39,6 +42,7 @@ pub fn id() -> iced::widget::Id {
 }
 
 struct State {
+    session_key: String,
     focused: bool,
     window_focused: bool,
     scale_factor: f32,
@@ -46,6 +50,45 @@ struct State {
     last_grid_size: Option<(u16, u16)>,
     geometry_cache: canvas::Cache,
     last_render_key: Cell<Option<RenderKey>>,
+    selecting: bool,
+    selection: Option<Selection>,
+    context_menu: Option<Point>,
+    context_hover: Option<ContextItem>,
+    wheel_remainder: f32,
+    scrolled: bool,
+    interaction_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CellPosition {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: CellPosition,
+    head: CellPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextItem {
+    Copy,
+    Paste,
+}
+
+impl Selection {
+    fn ordered(self) -> (CellPosition, CellPosition) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn is_non_empty(self) -> bool {
+        self.anchor != self.head
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +97,13 @@ struct RenderKey {
     font: Font,
     font_size_bits: u32,
     cursor_on: bool,
+    interaction_version: u64,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
+            session_key: String::new(),
             focused: false,
             window_focused: true,
             scale_factor: 1.0,
@@ -66,6 +111,13 @@ impl Default for State {
             last_grid_size: None,
             geometry_cache: canvas::Cache::new(),
             last_render_key: Cell::new(None),
+            selecting: false,
+            selection: None,
+            context_menu: None,
+            context_hover: None,
+            wheel_remainder: 0.0,
+            scrolled: false,
+            interaction_version: 0,
         }
     }
 }
@@ -85,39 +137,80 @@ impl Focusable for State {
     }
 }
 
+impl State {
+    fn reset_for_session(&mut self, session_key: &str) {
+        self.session_key.clear();
+        self.session_key.push_str(session_key);
+        self.selecting = false;
+        self.selection = None;
+        self.context_menu = None;
+        self.context_hover = None;
+        self.wheel_remainder = 0.0;
+        self.scrolled = false;
+        self.interaction_version = self.interaction_version.wrapping_add(1);
+    }
+
+    fn clear_transient_interaction(&mut self) {
+        self.selecting = false;
+        self.context_menu = None;
+        self.context_hover = None;
+        self.interaction_version = self.interaction_version.wrapping_add(1);
+    }
+}
+
 /// 终端画面 widget：持有 grid 快照、渲染器实测度量和消息构造器。
+pub struct Callbacks<Message> {
+    pub input: fn(Vec<u8>) -> Message,
+    pub paste: fn(Vec<u8>) -> Message,
+    pub resize: fn(u16, u16) -> Message,
+    pub scroll: fn(i32) -> Message,
+}
+
+pub struct ContextLabels {
+    pub copy: String,
+    pub paste: String,
+}
+
 pub struct TermCanvas<Message> {
+    session_key: String,
     snapshot: Arc<ClientGrid>,
     viewport_metrics: Arc<ViewportMetrics>,
     on_input: fn(Vec<u8>) -> Message,
     on_paste: fn(Vec<u8>) -> Message,
     on_resize: fn(u16, u16) -> Message,
+    on_scroll: fn(i32) -> Message,
     appearance: TerminalAppearance,
     cursor_on: bool,
     width: Length,
     height: Length,
+    copy_label: String,
+    paste_label: String,
 }
 
 impl<Message> TermCanvas<Message> {
     pub fn new(
+        session_key: String,
         snapshot: Arc<ClientGrid>,
         viewport_metrics: Arc<ViewportMetrics>,
-        on_input: fn(Vec<u8>) -> Message,
-        on_paste: fn(Vec<u8>) -> Message,
-        on_resize: fn(u16, u16) -> Message,
+        callbacks: Callbacks<Message>,
         appearance: TerminalAppearance,
         cursor_on: bool,
+        labels: ContextLabels,
     ) -> Self {
         Self {
+            session_key,
             snapshot,
             viewport_metrics,
-            on_input,
-            on_paste,
-            on_resize,
+            on_input: callbacks.input,
+            on_paste: callbacks.paste,
+            on_resize: callbacks.resize,
+            on_scroll: callbacks.scroll,
             appearance,
             cursor_on,
             width: Length::Fill,
             height: Length::Fill,
+            copy_label: labels.copy,
+            paste_label: labels.paste,
         }
     }
 }
@@ -173,16 +266,127 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
         let state = tree.state.downcast_mut::<State>();
         let bounds = layout.bounds();
 
+        if state.session_key != self.session_key {
+            state.reset_for_session(&self.session_key);
+        }
+
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                if cursor.is_over(bounds) {
-                    state.focused = true;
-                    shell.request_redraw();
-                    shell.capture_event();
-                } else {
+                if !cursor.is_over(bounds) {
                     state.focused = false;
                     state.preedit = None;
+                    state.clear_transient_interaction();
+                    return;
                 }
+
+                state.focused = true;
+                let Some(position) = cursor.position_in(bounds) else {
+                    return;
+                };
+                if let Some(menu_at) = state.context_menu {
+                    let menu = context_menu_rect(menu_at, bounds.size());
+                    if menu.contains(position) {
+                        let copy = position.y < menu.y + CONTEXT_ITEM_HEIGHT;
+                        if copy {
+                            if let Some(content) = selected_text(&self.snapshot, state.selection) {
+                                clipboard.write(clipboard::Kind::Standard, content);
+                            }
+                        } else if let Some(content) = clipboard
+                            .read(clipboard::Kind::Standard)
+                            .filter(|value| !value.is_empty())
+                        {
+                            if state.scrolled {
+                                shell.publish((self.on_scroll)(SCROLL_TO_BOTTOM));
+                                state.scrolled = false;
+                            }
+                            shell.publish((self.on_paste)(content.into_bytes()));
+                        }
+                        state.clear_transient_interaction();
+                        shell.request_redraw();
+                        shell.capture_event();
+                        return;
+                    }
+                }
+
+                let cell = point_to_cell(position, &self.appearance, &self.snapshot);
+                state.selection = cell.map(|anchor| Selection {
+                    anchor,
+                    head: anchor,
+                });
+                state.selecting = cell.is_some();
+                state.context_menu = None;
+                state.context_hover = None;
+                state.interaction_version = state.interaction_version.wrapping_add(1);
+                shell.request_redraw();
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
+                if let Some(position) = cursor.position_in(bounds)
+                    && let Some(head) = point_to_cell(position, &self.appearance, &self.snapshot)
+                    && let Some(selection) = state.selection.as_mut()
+                    && selection.head != head
+                {
+                    selection.head = head;
+                    state.interaction_version = state.interaction_version.wrapping_add(1);
+                    shell.request_redraw();
+                }
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.context_menu.is_some() => {
+                let hovered = state.context_menu.and_then(|menu_at| {
+                    let item = cursor
+                        .position_in(bounds)
+                        .and_then(|position| context_item_at(menu_at, bounds.size(), position));
+                    match item {
+                        Some(ContextItem::Copy)
+                            if selected_text(&self.snapshot, state.selection).is_none() =>
+                        {
+                            None
+                        }
+                        item => item,
+                    }
+                });
+                if state.context_hover != hovered {
+                    state.context_hover = hovered;
+                    state.interaction_version = state.interaction_version.wrapping_add(1);
+                    shell.request_redraw();
+                }
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.selecting => {
+                state.selecting = false;
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+                if cursor.is_over(bounds) =>
+            {
+                state.focused = true;
+                state.selecting = false;
+                state.context_menu = cursor.position_in(bounds);
+                state.context_hover = None;
+                state.interaction_version = state.interaction_version.wrapping_add(1);
+                shell.request_redraw();
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
+                let cell_height = self.appearance.normalized().font_size * 1.15;
+                let movement = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y * 3.0,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / cell_height.max(1.0),
+                };
+                state.wheel_remainder += movement;
+                let lines = state.wheel_remainder.trunc() as i32;
+                if lines != 0 {
+                    state.wheel_remainder -= lines as f32;
+                    state.scrolled = true;
+                    state.selection = None;
+                    state.context_menu = None;
+                    state.context_hover = None;
+                    state.interaction_version = state.interaction_version.wrapping_add(1);
+                    shell.publish((self.on_scroll)(lines));
+                    shell.request_redraw();
+                }
+                shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -193,15 +397,43 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
             }) if state.focused && state.window_focused => {
                 match translate_key(key, *physical_key, *modifiers, text.as_deref()) {
                     KeyAction::Bytes(bytes) => {
+                        if state.scrolled {
+                            shell.publish((self.on_scroll)(SCROLL_TO_BOTTOM));
+                            state.scrolled = false;
+                        }
+                        state.selection = None;
+                        state.context_menu = None;
+                        state.context_hover = None;
+                        state.interaction_version = state.interaction_version.wrapping_add(1);
                         shell.publish((self.on_input)(bytes));
+                        shell.request_redraw();
                         shell.capture_event();
                     }
                     KeyAction::Paste => {
                         if let Some(content) = clipboard.read(clipboard::Kind::Standard)
                             && !content.is_empty()
                         {
+                            if state.scrolled {
+                                shell.publish((self.on_scroll)(SCROLL_TO_BOTTOM));
+                                state.scrolled = false;
+                            }
                             shell.publish((self.on_paste)(content.into_bytes()));
                         }
+                        state.selection = None;
+                        state.context_menu = None;
+                        state.context_hover = None;
+                        state.interaction_version = state.interaction_version.wrapping_add(1);
+                        shell.request_redraw();
+                        shell.capture_event();
+                    }
+                    KeyAction::Copy => {
+                        if let Some(content) = selected_text(&self.snapshot, state.selection) {
+                            clipboard.write(clipboard::Kind::Standard, content);
+                        }
+                        state.context_menu = None;
+                        state.context_hover = None;
+                        state.interaction_version = state.interaction_version.wrapping_add(1);
+                        shell.request_redraw();
                         shell.capture_event();
                     }
                     KeyAction::Ignore => {}
@@ -299,6 +531,11 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
             font: base_font,
             font_size_bits: appearance.font_size.to_bits(),
             cursor_on: self.cursor_on,
+            interaction_version: if state.session_key == self.session_key {
+                state.interaction_version
+            } else {
+                0
+            },
         };
         if state.last_render_key.get() != Some(key) {
             state.last_render_key.set(Some(key));
@@ -308,11 +545,24 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
             draw_grid(
                 frame,
                 &self.snapshot,
-                base_font,
-                appearance.font_size,
-                cell_width,
-                cell_height,
-                self.cursor_on,
+                DrawOptions {
+                    base_font,
+                    font_size: appearance.font_size,
+                    cell_width,
+                    cell_height,
+                    cursor_on: self.cursor_on,
+                    selection: (state.session_key == self.session_key)
+                        .then_some(state.selection)
+                        .flatten(),
+                    context_menu: (state.session_key == self.session_key)
+                        .then_some(state.context_menu)
+                        .flatten(),
+                    context_hover: (state.session_key == self.session_key)
+                        .then_some(state.context_hover)
+                        .flatten(),
+                    copy_label: &self.copy_label,
+                    paste_label: &self.paste_label,
+                },
             );
         });
         renderer.with_translation(Vector::new(bounds.x, bounds.y), |renderer| {
@@ -322,16 +572,27 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(layout.bounds()) {
-            mouse::Interaction::Text
-        } else {
+        let bounds = layout.bounds();
+        if !cursor.is_over(bounds) {
+            return mouse::Interaction::None;
+        }
+        let state = tree.state.downcast_ref::<State>();
+        let over_context_menu = state.session_key == self.session_key
+            && state.context_menu.is_some_and(|menu_at| {
+                cursor.position_in(bounds).is_some_and(|position| {
+                    context_menu_rect(menu_at, bounds.size()).contains(position)
+                })
+            });
+        if over_context_menu {
             mouse::Interaction::None
+        } else {
+            mouse::Interaction::Text
         }
     }
 }
@@ -430,16 +691,34 @@ fn draw_text(
     });
 }
 
-fn draw_grid(
-    canvas: &mut Frame<iced::Renderer>,
-    grid: &ClientGrid,
+struct DrawOptions<'a> {
     base_font: Font,
     font_size: f32,
     cell_width: f32,
     cell_height: f32,
     cursor_on: bool,
-) {
+    selection: Option<Selection>,
+    context_menu: Option<Point>,
+    context_hover: Option<ContextItem>,
+    copy_label: &'a str,
+    paste_label: &'a str,
+}
+
+fn draw_grid(canvas: &mut Frame<iced::Renderer>, grid: &ClientGrid, options: DrawOptions<'_>) {
+    let DrawOptions {
+        base_font,
+        font_size,
+        cell_width,
+        cell_height,
+        cursor_on,
+        selection,
+        context_menu,
+        context_hover,
+        copy_label,
+        paste_label,
+    } = options;
     canvas.fill_rectangle(Point::ORIGIN, canvas.size(), color(DEFAULT_BG));
+    let menu_rect = context_menu.map(|position| context_menu_rect(position, canvas.size()));
 
     // Canvas 的文字层始终在形状层之上，所以先画背景、光标和装饰线。
     for row in 0..grid.rows {
@@ -498,6 +777,25 @@ fn draw_grid(
         }
     }
 
+    if let Some(selection) = selection.filter(|selection| selection.is_non_empty()) {
+        let (start, end) = selection.ordered();
+        for row in start.row..=end.row {
+            let start_col = if row == start.row { start.col } else { 0 };
+            let end_col = if row == end.row {
+                end.col
+            } else {
+                grid.cols.saturating_sub(1)
+            };
+            if start_col <= end_col {
+                canvas.fill_rectangle(
+                    Point::new(start_col as f32 * cell_width, row as f32 * cell_height),
+                    Size::new((end_col - start_col + 1) as f32 * cell_width, cell_height),
+                    Color::from_rgba8(0x20, 0x9c, 0x91, 0.58),
+                );
+            }
+        }
+    }
+
     struct Run {
         row: u16,
         start_col: u16,
@@ -527,6 +825,14 @@ fn draw_grid(
             };
             let is_spacer = cell.flags & super::client_grid::cell_flags::WIDE_SPACER != 0;
             let hidden = cell.flags & super::frame::flag::HIDDEN != 0;
+            let cell_x = col as f32 * cell_width;
+            let cell_y = row as f32 * cell_height;
+            let covered_by_menu = menu_rect.is_some_and(|menu| {
+                cell_x < menu.x + menu.width
+                    && cell_x + cell_width > menu.x
+                    && cell_y < menu.y + menu.height
+                    && cell_y + cell_height > menu.y
+            });
             let is_cursor = cursor_on
                 && grid.cursor_visible
                 && row == grid.cursor_row
@@ -546,6 +852,7 @@ fn draw_grid(
             );
             let batchable = !is_spacer
                 && !hidden
+                && !covered_by_menu
                 && !is_cursor
                 && cell.ch.is_ascii_graphic()
                 && cell.flags & super::frame::flag::WIDE == 0;
@@ -576,7 +883,8 @@ fn draw_grid(
                     font: cell_font,
                     content: cell.ch.to_string(),
                 });
-            } else if !is_spacer && !hidden && cell.ch != ' ' && cell.ch != '\0' {
+            } else if !is_spacer && !hidden && !covered_by_menu && cell.ch != ' ' && cell.ch != '\0'
+            {
                 draw_text(
                     canvas,
                     cell.ch.to_string(),
@@ -591,29 +899,148 @@ fn draw_grid(
             flush(canvas, run);
         }
     }
+
+    if let Some(menu) = menu_rect {
+        canvas.fill_rectangle(
+            Point::new(menu.x + 4.0, menu.y + 5.0),
+            Size::new(menu.width, menu.height),
+            Color::from_rgba8(0, 0, 0, 0.28),
+        );
+        canvas.fill_rectangle(
+            Point::new(menu.x, menu.y),
+            Size::new(menu.width, menu.height),
+            Color::from_rgb8(0x19, 0x24, 0x22),
+        );
+        if let Some(item) = context_hover {
+            let y = menu.y
+                + match item {
+                    ContextItem::Copy => 0.0,
+                    ContextItem::Paste => CONTEXT_ITEM_HEIGHT,
+                };
+            canvas.fill_rectangle(
+                Point::new(menu.x + 3.0, y + 2.0),
+                Size::new(menu.width - 6.0, CONTEXT_ITEM_HEIGHT - 4.0),
+                Color::from_rgb8(0x20, 0x4a, 0x45),
+            );
+        }
+        canvas.fill_rectangle(
+            Point::new(menu.x, menu.y + CONTEXT_ITEM_HEIGHT),
+            Size::new(menu.width, 1.0),
+            Color::from_rgb8(0x31, 0x45, 0x42),
+        );
+        let copy_color = if selected_text(grid, selection).is_some() {
+            Color::from_rgb8(0xe4, 0xeb, 0xe9)
+        } else {
+            Color::from_rgb8(0x65, 0x76, 0x73)
+        };
+        draw_text(
+            canvas,
+            copy_label.to_string(),
+            Point::new(menu.x + 14.0, menu.y + 8.0),
+            copy_color,
+            13.0,
+            Font::DEFAULT,
+        );
+        draw_text(
+            canvas,
+            paste_label.to_string(),
+            Point::new(menu.x + 14.0, menu.y + CONTEXT_ITEM_HEIGHT + 8.0),
+            Color::from_rgb8(0xe4, 0xeb, 0xe9),
+            13.0,
+            Font::DEFAULT,
+        );
+    }
+}
+
+fn context_menu_rect(position: Point, bounds: Size) -> Rectangle {
+    let height = CONTEXT_ITEM_HEIGHT * 2.0;
+    Rectangle {
+        x: position.x.min((bounds.width - CONTEXT_MENU_WIDTH).max(0.0)),
+        y: position.y.min((bounds.height - height).max(0.0)),
+        width: CONTEXT_MENU_WIDTH,
+        height,
+    }
+}
+
+fn context_item_at(menu_at: Point, bounds: Size, position: Point) -> Option<ContextItem> {
+    let menu = context_menu_rect(menu_at, bounds);
+    if !menu.contains(position) {
+        return None;
+    }
+    if position.y < menu.y + CONTEXT_ITEM_HEIGHT {
+        Some(ContextItem::Copy)
+    } else {
+        Some(ContextItem::Paste)
+    }
+}
+
+fn point_to_cell(
+    position: Point,
+    appearance: &TerminalAppearance,
+    grid: &ClientGrid,
+) -> Option<CellPosition> {
+    if grid.rows == 0 || grid.cols == 0 || position.x < 0.0 || position.y < 0.0 {
+        return None;
+    }
+    let appearance = appearance.normalized();
+    let font = terminal_font(&appearance.font_family, false, false);
+    let cell_width = cell_advance(font, appearance.font_size).max(1.0);
+    let cell_height = (appearance.font_size * 1.15).max(1.0);
+    Some(CellPosition {
+        row: ((position.y / cell_height).floor() as u16).min(grid.rows - 1),
+        col: ((position.x / cell_width).floor() as u16).min(grid.cols - 1),
+    })
+}
+
+fn selected_text(grid: &ClientGrid, selection: Option<Selection>) -> Option<String> {
+    let selection = selection.filter(|selection| selection.is_non_empty())?;
+    let (start, end) = selection.ordered();
+    let mut output = String::new();
+    for row in start.row..=end.row.min(grid.rows.saturating_sub(1)) {
+        let start_col = if row == start.row { start.col } else { 0 };
+        let end_col = if row == end.row {
+            end.col.min(grid.cols.saturating_sub(1))
+        } else {
+            grid.cols.saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in start_col..=end_col {
+            let Some(cell) = grid.cell(row, col) else {
+                continue;
+            };
+            if cell.flags & super::client_grid::cell_flags::WIDE_SPACER == 0 {
+                line.push(cell.ch);
+            }
+        }
+        output.push_str(line.trim_end_matches([' ', '\0']));
+        if row != end.row {
+            output.push('\n');
+        }
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 /// 把 TermCanvas 变成 Element。
 pub fn canvas<'a, Message>(
+    session_key: String,
     snapshot: Arc<ClientGrid>,
     viewport_metrics: Arc<ViewportMetrics>,
-    on_input: fn(Vec<u8>) -> Message,
-    on_paste: fn(Vec<u8>) -> Message,
-    on_resize: fn(u16, u16) -> Message,
+    callbacks: Callbacks<Message>,
     appearance: TerminalAppearance,
     cursor_on: bool,
+    labels: ContextLabels,
 ) -> Element<'a, Message>
 where
     Message: 'a,
 {
     Element::new(TermCanvas::new(
+        session_key,
         snapshot,
         viewport_metrics,
-        on_input,
-        on_paste,
-        on_resize,
+        callbacks,
         appearance,
         cursor_on,
+        labels,
     ))
 }
 
@@ -621,6 +1048,7 @@ where
 enum KeyAction {
     Bytes(Vec<u8>),
     Paste,
+    Copy,
     Ignore,
 }
 
@@ -632,6 +1060,9 @@ fn translate_key(
 ) -> KeyAction {
     if is_paste_shortcut(key, physical_key, modifiers) {
         return KeyAction::Paste;
+    }
+    if is_copy_shortcut(key, physical_key, modifiers) {
+        return KeyAction::Copy;
     }
 
     // Command/Windows 键的其他组合交给系统；Ctrl 仍是终端控制键。
@@ -725,6 +1156,20 @@ fn is_paste_shortcut(key: &Key, physical_key: key::Physical, modifiers: Modifier
     }
 }
 
+fn is_copy_shortcut(key: &Key, physical_key: key::Physical, modifiers: Modifiers) -> bool {
+    let is_c = key
+        .to_latin(physical_key)
+        .is_some_and(|ch| ch.eq_ignore_ascii_case(&'c'));
+    #[cfg(target_os = "macos")]
+    {
+        is_c && modifiers.logo() && !modifiers.control() && !modifiers.alt()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        is_c && modifiers.control() && modifiers.shift() && !modifiers.alt()
+    }
+}
+
 fn control_byte(ch: char) -> Option<u8> {
     let upper = ch.to_ascii_uppercase();
     match upper {
@@ -786,6 +1231,37 @@ mod tests {
     use super::*;
     use iced::keyboard::key::{Code, Physical};
 
+    fn grid_with_text(lines: &[&str], cols: u16) -> ClientGrid {
+        let mut grid = ClientGrid::new(lines.len() as u16, cols);
+        let updates = lines
+            .iter()
+            .enumerate()
+            .map(|(row, line)| crate::term::frame::LineUpdate {
+                row: row as u16,
+                start_col: 0,
+                end_col: cols - 1,
+                runs: line
+                    .chars()
+                    .map(|ch| crate::term::frame::Run {
+                        len: 1,
+                        flags: 0,
+                        fg: super::super::client_grid::ColorSpec::Default,
+                        bg: super::super::client_grid::ColorSpec::Default,
+                        ch,
+                    })
+                    .collect(),
+            })
+            .collect();
+        grid.apply_frame(&crate::term::frame::TerminalFrame {
+            seq: 1,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            lines: updates,
+        });
+        grid
+    }
+
     fn physical(code: Code) -> Physical {
         Physical::Code(code)
     }
@@ -834,6 +1310,53 @@ mod tests {
             None,
         );
         assert_eq!(ctrl_bracket, KeyAction::Bytes(vec![27]));
+    }
+
+    #[test]
+    fn selection_extracts_rows_and_trims_unselected_padding() {
+        let grid = grid_with_text(&["hello ", "world "], 6);
+        let selection = Selection {
+            anchor: CellPosition { row: 0, col: 1 },
+            head: CellPosition { row: 1, col: 4 },
+        };
+        assert_eq!(
+            selected_text(&grid, Some(selection)).as_deref(),
+            Some("ello\nworld")
+        );
+        assert_eq!(
+            selected_text(
+                &grid,
+                Some(Selection {
+                    anchor: selection.head,
+                    head: selection.anchor,
+                })
+            ),
+            Some("ello\nworld".to_string())
+        );
+    }
+
+    #[test]
+    fn context_menu_is_clamped_inside_terminal() {
+        let rect = context_menu_rect(Point::new(990.0, 740.0), Size::new(1000.0, 750.0));
+        assert_eq!(rect.x, 852.0);
+        assert_eq!(rect.y, 682.0);
+        assert_eq!(rect.width, CONTEXT_MENU_WIDTH);
+        assert_eq!(
+            context_item_at(
+                Point::new(990.0, 740.0),
+                Size::new(1000.0, 750.0),
+                Point::new(860.0, 690.0)
+            ),
+            Some(ContextItem::Copy)
+        );
+        assert_eq!(
+            context_item_at(
+                Point::new(990.0, 740.0),
+                Size::new(1000.0, 750.0),
+                Point::new(860.0, 725.0)
+            ),
+            Some(ContextItem::Paste)
+        );
     }
 
     #[test]

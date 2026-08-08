@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::{Context, Result};
@@ -409,6 +409,26 @@ impl PtyManager {
 
         info!("会话 {} resize → {}×{}", session_id, cols, rows);
         Ok(())
+    }
+
+    /// Scroll the daemon-owned terminal history and force a new visible snapshot.
+    /// Positive values move toward older output; negative values move toward the bottom.
+    pub fn scroll_session(&self, session_id: &str, lines: i32) -> Result<usize> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("会话不存在: {}", session_id))?;
+        let inner = session.lock().map_err(|_| anyhow::anyhow!("会话锁异常"))?;
+        if inner.closed.load(Ordering::Relaxed) {
+            anyhow::bail!("会话已结束: {}", session_id);
+        }
+        let mut term = inner
+            .term
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Term 锁异常"))?;
+        term.term
+            .scroll_display(Scroll::Delta(lines.clamp(-1_000_000, 1_000_000)));
+        Ok(term.term.grid().display_offset())
     }
 
     /// 关闭会话：kill 子进程 + wait 回收。
@@ -833,6 +853,23 @@ mod tests {
         let info = pm.list_sessions();
         assert_eq!(info.len(), 1);
         assert!(info[0].alive);
+        pm.close_session(&id).unwrap();
+    }
+
+    #[test]
+    fn scroll_session_uses_real_history_and_can_return_to_bottom() {
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(40, 4).unwrap();
+        pm.session_input(
+            &id,
+            b"printf 'line1\\nline2\\nline3\\nline4\\nline5\\nline6\\n'\r",
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(300));
+
+        let offset = pm.scroll_session(&id, 3).unwrap();
+        assert!(offset > 0, "有历史输出时应能向上滚动");
+        assert_eq!(pm.scroll_session(&id, -1_000_000).unwrap(), 0);
         pm.close_session(&id).unwrap();
     }
 

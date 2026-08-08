@@ -148,6 +148,8 @@ pub enum AppMessage {
         cols: u16,
         rows: u16,
     },
+    /// Mouse wheel scroll in daemon-owned terminal history; positive moves up.
+    TerminalScroll(i32),
     TerminalCursorBlink,
 
     // Connection
@@ -2156,6 +2158,30 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     "session_id": session.session_id,
                     "cols": cols,
                     "rows": rows,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
+            Task::none()
+        }
+        AppMessage::TerminalScroll(lines) => {
+            if lines == 0 {
+                return Task::none();
+            }
+            let Some(client) = app.ws_client.as_ref().cloned() else {
+                return Task::none();
+            };
+            let Some(session) = active_terminal_mut(app) else {
+                return Task::none();
+            };
+            if session.closed {
+                return Task::none();
+            }
+            if let Err(error) = client.send_queued(
+                "ScrollSession",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "lines": lines,
                 }),
             ) {
                 session.notice = Some(error.message);
