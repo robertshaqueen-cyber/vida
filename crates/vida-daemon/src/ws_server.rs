@@ -599,6 +599,11 @@ async fn handle_pty_request(
             pty.session_input(session_id, data)?;
             Ok(serde_json::json!({"ok": true}))
         }
+        PtyRequest::PasteSession { session_id, data } => {
+            let pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            pty.paste_session(session_id, data)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
         PtyRequest::ResizeSession {
             session_id,
             cols,

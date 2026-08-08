@@ -146,26 +146,25 @@ impl ClientGrid {
     }
 }
 
-/// 标准 xterm 256 色表（0-15 基础色 + 16-231 立方体 + 232-255 灰度）。
-/// 与 alacritty 默认配色一致，Indexed 颜色索引查此表。
+/// Ghostty 默认 256 色表（0-15 为 Ghostty 默认主题，后续为 xterm 色立方与灰阶）。
 pub fn indexed_color(idx: u8) -> (u8, u8, u8) {
     const BASIC: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00), // 0 black
-        (0x80, 0x00, 0x00), // 1 red
-        (0x00, 0x80, 0x00), // 2 green
-        (0x80, 0x80, 0x00), // 3 yellow
-        (0x00, 0x00, 0x80), // 4 blue
-        (0x80, 0x00, 0x80), // 5 magenta
-        (0x00, 0x80, 0x80), // 6 cyan
-        (0xc0, 0xc0, 0xc0), // 7 white
-        (0x80, 0x80, 0x80), // 8 bright black
-        (0xff, 0x00, 0x00), // 9 bright red
-        (0x00, 0xff, 0x00), // 10 bright green
-        (0xff, 0xff, 0x00), // 11 bright yellow
-        (0x00, 0x00, 0xff), // 12 bright blue
-        (0xff, 0x00, 0xff), // 13 bright magenta
-        (0x00, 0xff, 0xff), // 14 bright cyan
-        (0xff, 0xff, 0xff), // 15 bright white
+        (0x1d, 0x1f, 0x21), // 0 black
+        (0xcc, 0x66, 0x66), // 1 red
+        (0xb5, 0xbd, 0x68), // 2 green
+        (0xf0, 0xc6, 0x74), // 3 yellow
+        (0x81, 0xa2, 0xbe), // 4 blue
+        (0xb2, 0x94, 0xbb), // 5 magenta
+        (0x8a, 0xbe, 0xb7), // 6 cyan
+        (0xc5, 0xc8, 0xc6), // 7 white
+        (0x66, 0x66, 0x66), // 8 bright black
+        (0xd5, 0x4e, 0x53), // 9 bright red
+        (0xb9, 0xca, 0x4a), // 10 bright green
+        (0xe7, 0xc5, 0x47), // 11 bright yellow
+        (0x7a, 0xa6, 0xda), // 12 bright blue
+        (0xc3, 0x97, 0xd8), // 13 bright magenta
+        (0x70, 0xc0, 0xb1), // 14 bright cyan
+        (0xea, 0xea, 0xea), // 15 bright white
     ];
     if idx < 16 {
         return BASIC[idx as usize];
@@ -180,4 +179,18 @@ pub fn indexed_color(idx: u8) -> (u8, u8, u8) {
     }
     let gray = 8 + (idx - 232) * 10;
     (gray, gray, gray)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::indexed_color;
+
+    #[test]
+    fn indexed_palette_matches_ghostty_defaults() {
+        assert_eq!(indexed_color(0), (0x1d, 0x1f, 0x21));
+        assert_eq!(indexed_color(8), (0x66, 0x66, 0x66));
+        assert_eq!(indexed_color(15), (0xea, 0xea, 0xea));
+        assert_eq!(indexed_color(16), (0, 0, 0));
+        assert_eq!(indexed_color(231), (255, 255, 255));
+    }
 }

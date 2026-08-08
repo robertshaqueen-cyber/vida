@@ -335,11 +335,29 @@ pub(crate) fn encode_flags(cell_flags: &Flags) -> u8 {
 }
 
 fn encode_color_spec(color: &alacritty_terminal::vte::ansi::Color) -> ColorSpec {
-    use alacritty_terminal::vte::ansi::Color;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
     match color {
         Color::Spec(rgb) => ColorSpec::Rgb(rgb.r, rgb.g, rgb.b),
         Color::Indexed(idx) => ColorSpec::Indexed(*idx),
-        Color::Named(_) => ColorSpec::Default,
+        Color::Named(named) => match named {
+            NamedColor::Black => ColorSpec::Indexed(0),
+            NamedColor::Red => ColorSpec::Indexed(1),
+            NamedColor::Green => ColorSpec::Indexed(2),
+            NamedColor::Yellow => ColorSpec::Indexed(3),
+            NamedColor::Blue => ColorSpec::Indexed(4),
+            NamedColor::Magenta => ColorSpec::Indexed(5),
+            NamedColor::Cyan => ColorSpec::Indexed(6),
+            NamedColor::White => ColorSpec::Indexed(7),
+            NamedColor::BrightBlack => ColorSpec::Indexed(8),
+            NamedColor::BrightRed => ColorSpec::Indexed(9),
+            NamedColor::BrightGreen => ColorSpec::Indexed(10),
+            NamedColor::BrightYellow => ColorSpec::Indexed(11),
+            NamedColor::BrightBlue => ColorSpec::Indexed(12),
+            NamedColor::BrightMagenta => ColorSpec::Indexed(13),
+            NamedColor::BrightCyan => ColorSpec::Indexed(14),
+            NamedColor::BrightWhite => ColorSpec::Indexed(15),
+            _ => ColorSpec::Default,
+        },
     }
 }
 
@@ -498,6 +516,24 @@ mod tests {
         let seq_bytes: &[u8] = &bytes[12..20];
         let seq_val: u64 = u64::from_be_bytes(seq_bytes.try_into().unwrap());
         assert_eq!(seq_val, 1);
+    }
+
+    #[test]
+    fn named_ansi_colors_keep_their_palette_index() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+        assert_eq!(
+            encode_color_spec(&Color::Named(NamedColor::Black)),
+            ColorSpec::Indexed(0)
+        );
+        assert_eq!(
+            encode_color_spec(&Color::Named(NamedColor::BrightBlack)),
+            ColorSpec::Indexed(8)
+        );
+        assert_eq!(
+            encode_color_spec(&Color::Named(NamedColor::Foreground)),
+            ColorSpec::Default
+        );
     }
 
     /// 规格约束 1：限频窗口内多次变化 → 客户端最终收到最终状态。

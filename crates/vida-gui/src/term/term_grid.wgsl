@@ -7,7 +7,8 @@ struct ScreenInfo {
     /// >0.5 表示 surface 为 sRGB 格式：片元颜色需在输出前转 linear，
     /// 由 GPU 在写入时做 linear→sRGB 编码（iced 自身文字管线同样如此）。
     gamma: f32,
-    _pad: f32,
+    /// 1 = 显示 cursor overlay，0 = 丢弃；只更新 uniform，不重建几何。
+    cursor_on: f32,
 }
 
 @group(0) @binding(0) var<uniform> screen: ScreenInfo;
@@ -41,9 +42,9 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // stem darkening 已在 CPU 写入字形图集时完成；片元路径只采样一次。
     let alpha = textureSample(glyph_atlas, glyph_sampler, in.uv).a;
-    // A/B 版本 B：不做 gamma 校正，直接输出 sRGB 值。
-    // 文字抗锯齿在线性空间混合会让深色背景上的字更细（已知现象），
-    // 大多数文字渲染器直接在 sRGB 空间混合。对比 A（pow 2.2）后定。
-    return vec4<f32>(in.color.rgb, in.color.a * alpha);
+    let is_cursor_overlay = in.color.a < 0.0;
+    let cursor_visibility = select(1.0, screen.cursor_on, is_cursor_overlay);
+    return vec4<f32>(in.color.rgb, abs(in.color.a) * alpha * cursor_visibility);
 }

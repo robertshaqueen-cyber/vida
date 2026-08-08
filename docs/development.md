@@ -463,3 +463,48 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
    subscribe 命令订阅同一会话（若 CLI 支持）；否则由 daemon 集成测试
    `single_connection_multi_subscribe` 覆盖（同一连接订阅两会话、
    取消一个后另一个正常）
+
+## M2b-2 可交互终端 — 验收清单（检查点 C）
+
+### 自动与 GUI 实测（2026-08-08，1920×1080 非 HiDPI，scale=1）
+
+- 键盘输入：`printf 'M2B2_INPUT_OK\n'` → 正确输出；Ctrl+C 可中止 `sleep 30`。
+- 导航键：方向键上可取回并重新执行上一条命令。
+- 中文多行粘贴：粘贴后两行停留在 shell 编辑缓冲区，没有立即执行；按 Enter 后
+  输出两行中文。该路径同时验证 `PasteSession` 与 bracketed-paste 模式。
+- resize：窗口缩小后 `stty size` 从 `30 100` 变为 `22 77`，GUI grid、Term 与
+  PTY ioctl 三层一致。
+- 中文输入法候选窗：自动化无法切换真实系统输入法，保留给所有者按 README 清单确认。
+
+### 内存与 CPU
+
+| 指标 | 实测值 |
+|---|---|
+| 显示器 scale factor | **1** |
+| 空闲 CPU | **0.0%**（终端打开、无输入/输出，release） |
+| 主界面 Physical footprint | **36.3M**（release，金库已解锁） |
+| 打开单终端后 Physical footprint | **53.0M**（release，100×30） |
+| 单终端增量 | **16.7M** |
+
+唯一内存指标仍为 `vmmap --summary <pid>` 的 `Physical footprint`，禁止用 RSS。
+
+### 所有者视觉验收修正
+
+- 默认字体为内置 JetBrains Mono 13pt，JetBrains Mono 2.304 Regular/Bold 以 OFL-1.1
+  随应用分发；字体下拉同时保留系统等宽字体。根据 Oryxis 的成熟做法，文字不再经过
+  Vida 自建的 CoreText 位图、字形图集与采样器，而是由 iced canvas/cosmic-text 直接
+  渲染。ASCII 合并为不超过 32 字符的 run，CJK 由系统字体自然回退并保持逐 cell 定位；
+  cell advance 用 iced Paragraph 实测，行高为字号的 1.15 倍。前景 `#ffffff`、终端背景
+  `#282c34`。隔离 release 窗口在 scale=1、输出中英文并输入未执行的 `ls --color` 后，
+  `vmmap --summary` Physical footprint **264.8MB**（峰值 265.2MB）。
+- 增加 500ms 闪烁的实心方块光标；timer 仅在终端屏且用户启用闪烁时存在。
+- WIDE 字符仍推进两个 cell，中文交给 iced/cosmic-text 的系统字体回退，不做单轴拉伸
+  或人工覆盖率处理。
+- 「设置 → 终端」从内置 JetBrains Mono 与系统等宽字体中选择字体，并从固定列表选择字号；
+  可持久化字体、字号与光标闪烁，保存后新开的终端生效。
+- ANSI 0—15 色使用 Ghostty 默认调色板，NamedColor 在 daemon 推帧时保留对应索引。
+  `-` 不再作为 1px 位图单独上传，而是与相邻 ASCII 一起交给 iced 文本管线塑形，
+  输入态和执行后的渲染路径完全相同。
+- M2b-2 调试终端仍是临时 Screen；点击真实标签或设置时会先关闭调试会话并恢复
+  Main，再执行标签切换，避免 active tab 已变化但终端仍覆盖内容。
+- 自动 GUI 首轮已看到提示符处方块光标；最终字体视觉观感仍以所有者截图验收为准。

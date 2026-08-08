@@ -83,7 +83,7 @@ pub enum Screen {
     ConflictFile(s7_conflict_file::State),
     RemoteMissing(s8_remote_missing::State),
     Backup(s9_backup::State),
-    /// 调试终端（M2b-1 只读渲染，M2b-3 起并入标签页体系）。
+    /// 可交互调试终端（M2b-2，M2b-3 起并入标签页体系）。
     Terminal(s_terminal::TerminalSession),
 }
 

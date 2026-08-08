@@ -20,6 +20,8 @@ pub fn run() -> Result<(), iced::Error> {
         .init();
 
     iced::application(new, update, view)
+        .font(crate::term::primitive::BUNDLED_REGULAR)
+        .font(crate::term::primitive::BUNDLED_BOLD)
         .subscription(subscription)
         .title(|_: &VidaApp| "vida".to_string())
         .theme(|_: &VidaApp| Theme::Dark)
@@ -63,6 +65,8 @@ pub struct VidaApp {
     terminal_reconnect_cooldown: Option<std::time::Instant>,
     /// 进入终端屏时备份的 Main 屏状态（返回时恢复，不丢失主界面状态）。
     main_state_backup: Option<s3_main::State>,
+    /// 当前持久化的终端外观；业务设置不放在 Screen 内。
+    terminal_appearance: crate::term::primitive::TerminalAppearance,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -111,7 +115,7 @@ impl SyncState {
 
 #[derive(Debug, Clone)]
 pub enum AppMessage {
-    // Debug terminal (M2b-1)
+    // Interactive debug terminal (M2b-2)
     OpenDebugTerminal,
     CloseDebugTerminal,
     TerminalPush(PushMsg),
@@ -135,6 +139,16 @@ pub enum AppMessage {
     /// 自动重连失败（等待冷却后由用户手动重试）。
     TerminalReconnectFailed(String),
     TerminalSetupError(String),
+    /// 人在终端 widget 中产生的原始输入字节。
+    TerminalInput(Vec<u8>),
+    /// 剪贴板文本；daemon 会按当前终端模式安全封装 bracketed paste。
+    TerminalPaste(Vec<u8>),
+    /// 终端画布按真实物理像素 cell 换算出的尺寸。
+    TerminalResize {
+        cols: u16,
+        rows: u16,
+    },
+    TerminalCursorBlink,
 
     // Connection
     WsConnected(WsClient),
@@ -208,6 +222,9 @@ pub enum AppMessage {
     SettingsSyncPickFolder,
     SettingsSyncQuickLocation(crate::screens::s5_settings::QuickLocation),
     SettingsScrollbackChanged(String),
+    SettingsTerminalFontFamilyChanged(String),
+    SettingsTerminalFontSizeChanged(u16),
+    SettingsTerminalCursorBlinkChanged(bool),
     SettingsLanguageChanged(crate::screens::s5_settings::LangChoice),
     SettingsSectionChanged(crate::screens::s5_settings::SettingsSection),
     SettingsSave,
@@ -257,6 +274,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         debug_terminal_sid: None,
         terminal_reconnect_cooldown: None,
         main_state_backup: None,
+        terminal_appearance: crate::term::primitive::TerminalAppearance::default(),
     };
 
     let connect = Task::perform(
@@ -305,20 +323,44 @@ impl VidaApp {
     }
 }
 
-/// 订阅：只有调试终端活跃时挂起推送接收 stream。
-/// 帧到达 → TerminalPush；无推送时 recv().await 挂起 → 空闲 CPU ≈ 0%。
+/// 退出 M2b-2 的临时调试终端并恢复主界面。
+/// M2b-3 把终端并入正式标签页后删除这条兼容路径。
+fn leave_debug_terminal(app: &mut VidaApp) {
+    if !matches!(app.screen, Screen::Terminal(_)) {
+        return;
+    }
+
+    if let Some(session_id) = app.debug_terminal_sid.take()
+        && let Some(client) = app.ws_client.as_ref()
+    {
+        client.unsubscribe(&session_id);
+        if let Err(error) = client.send_queued(
+            "CloseSession",
+            serde_json::json!({"session_id": session_id}),
+        ) {
+            tracing::warn!("退出调试终端时未能关闭会话：{}", error.message);
+        }
+    }
+    app.terminal_reconnect_cooldown = None;
+    let main_state = app.main_state_backup.take().unwrap_or(s3_main::State {
+        revealed_credential: None,
+        credential_copied: false,
+    });
+    app.screen = Screen::Main(main_state);
+}
+
+/// 订阅：调试终端活跃时挂起推送接收 stream；启用光标闪烁时另加 500ms tick。
+/// 帧到达 → TerminalPush；推送本身在无数据时 recv().await 挂起。
 /// 连接断开（sender drop）→ recv 返回 None → TerminalDisconnected。
 fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
-    let Some(ws) = app.ws_client.as_ref() else {
-        return iced::Subscription::none();
-    };
-    let Some(sid) = app.debug_terminal_sid.as_ref() else {
+    let mut subscriptions = Vec::new();
+    let (Some(ws), Some(sid)) = (app.ws_client.as_ref(), app.debug_terminal_sid.as_ref()) else {
         return iced::Subscription::none();
     };
     // data 的 identity = (sid, WsClient 的 Arc 指针)：
     // 重连（新连接）自动换 identity → iced 重启订阅 stream → 重新 SubscribeSession 拿全量帧。
     let data = (sid.clone(), ws.clone());
-    iced::Subscription::run_with(data, |d| {
+    subscriptions.push(iced::Subscription::run_with(data, |d| {
         let sid = d.0.clone();
         let ws = d.1.clone();
         // unfold 状态 = (ws, sid, rx)：全部随状态传递，闭包零捕获。
@@ -345,7 +387,16 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
                 Some((AppMessage::TerminalPush(msg), Some((ws, sid, Some(rx)))))
             },
         )
-    })
+    }));
+
+    if matches!(&app.screen, Screen::Terminal(s) if s.appearance.cursor_blink) {
+        subscriptions.push(
+            iced::time::every(std::time::Duration::from_millis(500))
+                .map(|_| AppMessage::TerminalCursorBlink),
+        );
+    }
+
+    iced::Subscription::batch(subscriptions)
 }
 
 /// 重连成功后恢复会话尺寸（从断线前的 grid 快照）。
@@ -587,6 +638,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- Tab management ----
         AppMessage::SwitchTab(tab_id) => {
+            // 调试终端还不是正式 tab；点击任一真实 tab 时先退出临时屏，
+            // 否则 active_tab_id 虽变化，最上层仍会继续渲染终端。
+            leave_debug_terminal(app);
             app.active_tab_id = tab_id;
             // Invalidate any pending credential-hide timer and clear the
             // revealed credential: it belongs to the previous host.
@@ -609,6 +663,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::OpenSettingsTab => {
+            leave_debug_terminal(app);
             // Add settings tab if not already present, or switch to it
             let existing = app.tabs.iter().find(|t| t.id == "settings");
             if existing.is_none() {
@@ -696,7 +751,20 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 revealed_credential: None,
                 credential_copied: false,
             });
-            Task::none()
+            if app.settings_state.is_none() {
+                let client = app.ws_client.as_ref().unwrap().clone();
+                Task::perform(
+                    async move {
+                        match client.get_settings().await {
+                            Ok(val) => AppMessage::SettingsLoaded(val),
+                            Err(e) => AppMessage::WsError(e.to_string()),
+                        }
+                    },
+                    |r| r,
+                )
+            } else {
+                Task::none()
+            }
         }
         AppMessage::EditHost(host_id) => {
             // Find host data and open editor in a new tab
@@ -1159,6 +1227,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         // ---- S5: Settings ----
         AppMessage::SettingsLoaded(val) => {
             let settings = s5_settings::State::from_json(&val, &app.i18n);
+            app.terminal_appearance = settings.terminal_appearance();
             app.settings_state = Some(settings);
             Task::none()
         }
@@ -1270,26 +1339,55 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
+        AppMessage::SettingsTerminalFontFamilyChanged(v) => {
+            if let Some(s) = &mut app.settings_state {
+                s.terminal_font_family = v;
+                s.saved = false;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsTerminalFontSizeChanged(v) => {
+            if let Some(s) = &mut app.settings_state {
+                s.terminal_font_size = v;
+                s.saved = false;
+            }
+            Task::none()
+        }
+        AppMessage::SettingsTerminalCursorBlinkChanged(v) => {
+            if let Some(s) = &mut app.settings_state {
+                s.terminal_cursor_blink = v;
+                s.saved = false;
+            }
+            Task::none()
+        }
         AppMessage::SettingsSave => {
             if let Some(s) = &mut app.settings_state {
-                s.saving = true;
                 s.error = None;
                 let scrollback = s.scrollback_lines.parse::<usize>().unwrap_or(3000);
+                let font_family = s.terminal_font_family.clone();
+                let font_size = s.terminal_font_size as f32;
+                s.saving = true;
                 let sync_path = if s.sync_local_path.is_empty() {
                     None
                 } else {
                     Some(s.sync_local_path.clone())
                 };
+                let mut settings = s.vault_settings.clone();
+                settings.sync_local_path = sync_path;
+                settings.scrollback_lines = scrollback;
+                settings.terminal_font_family = font_family;
+                settings.terminal_font_size = font_size;
+                settings.terminal_cursor_blink = s.terminal_cursor_blink;
+                s.vault_settings = settings.clone();
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
                     async move {
-                        let settings = serde_json::json!({
-                            "sync_local_path": sync_path,
-                            "scrollback_lines": scrollback,
-                        });
-                        match client.update_settings(settings).await {
-                            Ok(_) => AppMessage::SettingsSaved,
-                            Err(e) => AppMessage::WsError(e.to_string()),
+                        match serde_json::to_value(settings) {
+                            Ok(settings) => match client.update_settings(settings).await {
+                                Ok(_) => AppMessage::SettingsSaved,
+                                Err(e) => AppMessage::WsError(e.to_string()),
+                            },
+                            Err(e) => AppMessage::WsError(format!("设置序列化失败：{}", e)),
                         }
                     },
                     |r| r,
@@ -1302,6 +1400,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             if let Some(s) = &mut app.settings_state {
                 s.saving = false;
                 s.saved = true;
+                app.terminal_appearance = s.terminal_appearance();
+                s.vault_settings.terminal_font_family = app.terminal_appearance.font_family.clone();
+                s.vault_settings.terminal_font_size = app.terminal_appearance.font_size;
+                s.vault_settings.terminal_cursor_blink = app.terminal_appearance.cursor_blink;
             }
             Task::none()
         }
@@ -1512,7 +1614,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
 
-        // ---- Debug terminal (M2b-1) ----
+        // ---- Interactive debug terminal (M2b-2) ----
         AppMessage::OpenDebugTerminal => {
             let client = match app.ws_client.as_ref() {
                 Some(c) => c.clone(),
@@ -1535,8 +1637,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             if let Screen::Main(s) = &app.screen {
                 app.main_state_backup = Some(s.clone());
             }
-            app.screen = Screen::Terminal(s_terminal::TerminalSession::new(session_id, 40, 100));
-            Task::none()
+            app.screen = Screen::Terminal(s_terminal::TerminalSession::new(
+                session_id,
+                40,
+                100,
+                app.terminal_appearance.clone(),
+            ));
+            iced::widget::operation::focus::<AppMessage>(crate::term::widget::id())
         }
         AppMessage::TerminalDisconnected => {
             // 主动取消（点返回 → unsubscribe → rx 关闭）也会走到这里：
@@ -1643,6 +1750,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 session_id,
                 old_rows_or_default(app),
                 old_cols_or_default(app),
+                app.terminal_appearance.clone(),
             );
             if let Some(n) = notice {
                 session.notice = Some(n);
@@ -1674,6 +1782,86 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             tracing::error!("终端调试屏打开失败: {}", msg);
             Task::none()
         }
+        AppMessage::TerminalInput(data) => {
+            if data.is_empty() {
+                return Task::none();
+            }
+            let Some(client) = app.ws_client.as_ref() else {
+                return Task::none();
+            };
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.closed {
+                session.notice = Some("会话已结束，无法继续输入。请返回后重新打开终端。".into());
+                return Task::none();
+            }
+            session.cursor_on = true;
+            // 同步入队保证逐键顺序；绝不记录 data（其中可能包含口令）。
+            if let Err(error) = client.send_queued(
+                "SessionInput",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "data": data,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
+            Task::none()
+        }
+        AppMessage::TerminalPaste(data) => {
+            if data.is_empty() {
+                return Task::none();
+            }
+            let Some(client) = app.ws_client.as_ref() else {
+                return Task::none();
+            };
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.closed {
+                session.notice = Some("会话已结束，无法粘贴。请返回后重新打开终端。".into());
+                return Task::none();
+            }
+            session.cursor_on = true;
+            // 与普通输入分流：daemon 依据真实 TermMode 决定 bracketed paste。
+            // 绝不记录 data（剪贴板可能包含口令或私钥）。
+            if let Err(error) = client.send_queued(
+                "PasteSession",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "data": data,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
+            Task::none()
+        }
+        AppMessage::TerminalResize { cols, rows } => {
+            let Some(client) = app.ws_client.as_ref() else {
+                return Task::none();
+            };
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.closed || (session.grid.cols == cols && session.grid.rows == rows) {
+                return Task::none();
+            }
+
+            // 先让 GUI grid 与新尺寸一致；daemon 随后的 Full damage 会填满它。
+            session.grid.reset(rows, cols);
+            if let Err(error) = client.send_queued(
+                "ResizeSession",
+                serde_json::json!({
+                    "session_id": session.session_id,
+                    "cols": cols,
+                    "rows": rows,
+                }),
+            ) {
+                session.notice = Some(error.message);
+            }
+            Task::none()
+        }
         AppMessage::TerminalPush(PushMsg::Frame { session_id, bytes }) => {
             let Screen::Terminal(session) = &mut app.screen else {
                 return Task::none();
@@ -1693,10 +1881,22 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                         session.grid.reset(rows, cols);
                     }
                     session.apply_frame(&f);
+                    session.cursor_on = true;
                 }
                 None => {
                     tracing::warn!("终端帧解码失败（丢弃）");
                 }
+            }
+            Task::none()
+        }
+        AppMessage::TerminalCursorBlink => {
+            let Screen::Terminal(session) = &mut app.screen else {
+                return Task::none();
+            };
+            if session.appearance.cursor_blink && session.grid.cursor_visible && !session.closed {
+                session.cursor_on = !session.cursor_on;
+            } else {
+                session.cursor_on = true;
             }
             Task::none()
         }
@@ -1720,19 +1920,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::CloseDebugTerminal => {
-            // 取消订阅 + 恢复 Main 屏
-            if let Some(client) = app.ws_client.as_ref()
-                && let Screen::Terminal(s) = &app.screen
-            {
-                client.unsubscribe(&s.session_id);
-            }
-            app.debug_terminal_sid = None;
-            app.terminal_reconnect_cooldown = None;
-            let main_state = app.main_state_backup.take().unwrap_or(s3_main::State {
-                revealed_credential: None,
-                credential_copied: false,
-            });
-            app.screen = Screen::Main(main_state);
+            leave_debug_terminal(app);
             Task::none()
         }
     }

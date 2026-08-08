@@ -821,14 +821,99 @@ M2b-1 接入协议后，daemon 推送的 start_col / end_col 都是列号，
   package 名（"vida_gui"）——module_path! 以 bin 名为前缀；
   RUST_LOG 被 shell 设置时可能吞掉全部 GUI 日志（改用 VIDA_LOG）
 
-**已知渲染差异（不在 M2b-1 处理，M2b-3 或后续）**：
-1. **CJK 字距被撑开**：cell_width=10（Menlo 16px advance 取整），
-   宽字符分配 2×10=20px，但 PingFang 16px 字形实际宽约 16px，
-   靠左绘制右侧空 4px → 中文字间有空隙。Ghostty/Alacritty 的做法：
-   CJK 字形缩放填满 2 cell，或选 advance=2×ASCII 的 CJK 字体
-2. **笔画偏细，缺 stem darkening**：16px Menlo 在 1080p 非 HiDPI
-   下笔画偏细。Ghostty/Alacritty 在低 DPI 对字形 alpha 做轻微膨胀
-   补偿视觉重量。我们未做
+**M2b-2 所有者视觉验收修正（2026-08-08）**：初次验收确认 Menlo 16、
+灰色前景与 CJK 字距在 scale=1 下无法接受。读取本机 Ghostty 默认配置后，
+默认值改为 Menlo 13、前景 `#ffffff`、背景 `#282c34`。
+`VIDA_FONT_SIZE` / `VIDA_FONT_FAMILY` 覆盖仍保留。
+
+scale=1 的真实 GUI 截图仍显示灰度抗锯齿边缘偏碎、偏细，因此字形首次写入 CPU
+图集时对 alpha 使用 `pow(alpha, 0.72)` 提升中间覆盖率，模拟低 DPI stem
+darkening；0/1 端点不变，不影响实心背景和光标。该计算不放在 GPU 片元 shader
+热路径。终端 canvas 自身设为 `#282c34`，不再透出 iced 页面背景。
+
+第二轮所有者截图确认：把 PingFang WIDE 字形强行横向铺满两个 cell 会破坏原始
+宽高比，中文明显被压扁。该缩放已撤销；协议仍用两个 cell 推进列位置，但字形按
+字体原始位图尺寸绘制。宁可保留少量右侧留白，也不能扭曲字形。
+
+光标协议此前已完整传递 `row/col/visible`，但 primitive 没有消费这些字段，
+因此画面完全没有光标。现在按 Ghostty 默认绘制实心方块并反转块内字形颜色；
+终端活跃且设置启用时，以 500ms 周期切换光标相位。任何输入或新帧都会立即恢复
+亮相位。订阅只在终端屏存活，离开终端后 timer 自动销毁。光标 overlay 几何只
+建立一次；闪烁仅更新 16 字节 uniform，不得随相位重建整屏 GPU buffer。
+
+终端字体族、字号和光标闪烁已进入 Settings。因为 Settings 是金库格式的一部分，
+本次将金库 v4 升至 v5，并通过 JSON 层迁移补入 Menlo / 13 / true；GUI 保存时以
+daemon 返回的完整 Settings 为底，只覆盖页面字段，避免清空未展示的 S3 配置。
+
+所有者后续截图确认，zsh 输入行的 bold 中文观感正常，但普通输出的中文在小字号
+Regular 下显得过细、像被横向压扁。宽字符普通输出改用字体的 Medium face；bold
+仍使用 Bold，英文普通输出仍使用所选等宽字体的 Regular。该修正只改变字重，不对
+字形做单轴缩放，因此不会再次破坏中文宽高比。
+
+字体名称与字号禁止自由输入：字体下拉在打开设置时从 fontdb 的系统字体库生成，
+只保留 `monospaced` family，避免比例字体破坏固定 cell；字号使用一组常用整数选项。
+配置中已不存在的字体回落到已安装的 Menlo，再回落到列表第一项。
+
+后续与同机 Ghostty、iced 原生界面逐像素对照，确认 macOS 的 pt 已是逻辑像素；
+再乘 `96/72` 会把 13pt 中文放大为 17×17px，几乎占满 18px 行高。此前还对所有
+宽字符强制使用 Medium，并以 `pow(0.72)` 加深灰度覆盖率，三者叠加造成中文像粗体、
+行距拥挤且抗锯齿边缘接近位图字体。
+
+终端布局和 wgpu 图集保持不变，字形光栅化改由 `font-kit 0.14.3` 调用平台原生后端：
+macOS CoreText、Windows DirectWrite、Linux FreeType；只有原生字体缺字或加载失败时
+才回落到 Swash。选择字体时先按 PostScript 名精确匹配 Regular/Bold，避免 CoreText
+family 枚举把 Menlo Regular 误选成 Italic。`font-kit` 读取 PingFang 字体集合会让
+Physical footprint 从约 248MB 激增到 552MB，因此原生后端只加载用户选择的等宽
+字体；CJK 固定由已有 Swash 数据库回退，不复制大型字体集合。普通宽字符保持
+Regular，alpha 原样上传；Menlo 13pt 在 scale=1 下为 cell 8×18、ascent 14，CoreText
+`A` 位图 8×10、Swash 中文位图 13×13。最终隔离 release 实测 scale=1 Physical
+footprint 257.3MB（峰值 257.8MB），相对旧版 247.9MB 增加约 9.4MB。
+
+第四轮与同机 Ghostty 截图逐像素对照后确认：Ghostty 零配置并不使用
+Menlo，而是内置 JetBrains Mono 13pt、纯白前景和原生 alpha 混合。Vida 因此
+内置 JetBrains Mono 2.304 Regular/Bold（OFL-1.1），同时保留系统等宽字体选择。
+拉丁字形由平台原生后端直接从内置字体光栅化，CJK 仍走 Swash 系统回退；
+默认前景恢复 `#ffffff`。金库 v5 升至 v6，仅将与旧默认完全一致的
+Menlo/13pt/闪烁设置迁移为 JetBrains Mono，保留其他用户选择。
+
+第五轮所有者截图确认英文正常、中文仍偏小偏细。Ghostty 1.3.1 的
+`+show-face --string='中文水测试'` 在本机明确返回 `PingFang SC`；源码进一步确认
+macOS 通过 `CTFontCreateForString` 按系统语言发现 CJK 回退，并以 `ic_width`
+调和回退字体尺寸。Vida 改为直接持有 CoreText 返回的 CTFont 句柄，不再用
+Swash 光栅化中文，也不读取/复制整个 PingFang TTC。本机实际选择为
+`PingFangSC-Regular` / `PingFangSC-Semibold`；JetBrains Mono → 苹方的 `ic_width`
+系数约 1.05，13pt 中文实际光栅化约 13.65pt。scale=1 位图由 Swash 13×13
+改为 CoreText 常规 13×14、中粗 14×14，均位于 8×18 cell 内。原生 CTFont
+发布版窗口输出中英文和 `ls` 后 Physical footprint 为 252.0MB（峰值 252.8MB）；
+测试同时检查中文轮廓覆盖至少四分之三的位图行，并以「上」的非对称轮廓校验
+位图方向，防止坐标错误导致缺笔或上下颠倒。
+测试同时断言原生遮罩包含非零实心像素和 0—255 之间的抗锯齿覆盖率，且普通、粗体、
+CJK 位图上下界都位于 cell 内。
+图集增量上传测试会把跨行探针写入 GPU 纹理，再复制回 MAP_READ buffer 与 CPU 图集
+逐字节比较；因此本次缺笔已确认不是 atlas 行距、上传范围或 GPU 数据损坏。
+
+第六轮所有者截图指出：输入态 `ls --color` 的 `--` 过暗，且中英文都像粗体、
+缺少平滑抗锯齿。对照本机 Ghostty 1.3.1 的有效配置与 CoreText 源码后确认，
+Ghostty 默认 `font-thicken=false`，使用 `linearGray`、亚像素定位且关闭亚像素量化；
+Vida 此前经 font-kit/自有 CJK 路径把 font smoothing 打开，实际产生了额外加粗。
+macOS 的拉丁与 CJK 现统一走 CTFont 句柄，使用 linearGray 灰度遮罩并关闭 smoothing；
+ANSI 0—15 色同步为 Ghostty 默认调色板，daemon 也不再把 NamedColor 丢成默认白色。
+CoreText 位图上传前裁掉全透明边界；低 DPI 的单像素横/竖笔画只归一化峰值覆盖，
+不扩张轮廓，避免 `-` 首次出现时被窗口合成稀释到近乎不可见。scale=1 发布版
+输出中英文与 `ls --color` 后 Physical footprint 为 251.5MB（峰值 252.2MB）。
+
+第七轮所有者截图证明上述自建位图修正仍不可靠：输入态 `ls --color` 的两枚
+短横线仍会被采样到几乎不可见，CJK 视觉高度也再次偏小。对照 Oryxis 当前源码后，
+关键差异不是某个 CoreText 开关，而是架构：Oryxis 不维护独立字形位图、基线换算
+和纹理采样器，而是使用 iced canvas 的 `fill_text`，让 iced/cosmic-text 负责字体
+回退与 GPU 文本缓存；ASCII 合并为短 run，宽字符保持逐 cell 定位。Vida 因此删除
+自建 wgpu 字形图集，按同一原则独立实现文字层：cell advance 由 iced Paragraph 对
+40 个 `0` 的真实宽度测量并缓存，ASCII 最多 32 字符一批，CJK 按协议 WIDE 起始列
+单独绘制，行高为字号的 1.15 倍。背景、反色、光标和装饰线仍按 cell 绘制，PTY、
+网格协议与人的输入路径均未改变。启用 iced `canvas` feature 会引入其官方 lyon
+几何依赖，这是使用 iced 原生文字路径所必需，不是新增终端栈。scale=1 隔离发布版
+实测：首次输入但未执行的 `ls --color` 两枚短横线清晰可见，`echo 中文测试` 未压扁；
+Physical footprint 为 264.8MB（峰值 265.2MB）。
 
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
@@ -855,3 +940,43 @@ Weight::BOLD，下划线画 1.5px 线，反色用黑字+白底）。
 
 **验证要点**：row 2 的 `你好世界abc你好`，4 个中文 = 8 列，
 `abc` 起始应在第 16 列——所有者截图确认对齐。
+
+## M2b-2 终端输入、粘贴与 resize（2026-08-08）
+
+### 人的输入路径
+
+`TermCanvas` 是 iced focusable widget。进入终端屏时自动聚焦，点击画布也会聚焦；
+只有 focused 且窗口 focused 时才消费键盘和 IME 事件。普通字符使用 iced
+`KeyPressed.text` 的 UTF-8，中文等组合输入使用 `InputMethod::Commit`，并持续请求
+`Purpose::Terminal`，候选窗锚点取终端光标所在 cell。
+
+普通字符、Ctrl+A-Z/Ctrl+[ 等控制字节、方向键/Home/End/Delete/Page/F1-F12
+在 GUI 内转换为标准终端字节。`SessionInput` 的 daemon 语义不变：收到什么就原样
+写入 PTY，不做命令解释或换行转换，AI 也不进入人的输入路径。
+
+逐键输入禁止使用“一键一个异步 Task”：多个 Task 的调度顺序不等于键盘事件顺序。
+`WsClient::send_queued` 在 iced update 内同步进入单一 mpsc，后台 WebSocket writer
+按队列顺序发送；它只用于不读取响应的输入和 resize，不用于业务请求。
+
+### 粘贴必须与普通输入分流
+
+GUI 实测发现：把多行剪贴板直接走 `SessionInput` 会让 shell 逐行立即执行，这是
+终端安全问题。新增 `PasteSession`，daemon 查询 alacritty `TermMode::BRACKETED_PASTE`：
+
+- 启用时写入 `ESC[200~ + 内容 + ESC[201~`，多行先进入 shell 编辑缓冲区，用户按
+  Enter 后才执行；同时删除内容中的 ESC，防止伪造结束边界后注入控制序列。
+- 未启用时保持原内容，兼容不支持 bracketed paste 的程序。
+
+不得为了省接口而把所有输入都包成 paste；这会破坏控制键和 TUI。密码、私钥和
+剪贴板内容均不得写日志。
+
+### resize 使用同一份真实字体度量
+
+渲染管线把当前 scale 下实测的物理像素 `cell_width/cell_height` 原子回传给 widget。
+行列计算为 `floor(logical_bounds × scale / physical_cell)`，范围限制 1–1000。
+窗口变化只有跨过一个完整 cell、行列数真的改变时才发送 `ResizeSession`，因此无需
+常驻 debounce timer，空闲 CPU 仍为零。
+
+GUI 收到新尺寸时先重建 `ClientGrid`，daemon 随后在同一个请求中同时执行
+`Term::resize` 与 PTY ioctl。scale 变化时先用同公式的保守值，渲染器给出真实度量后
+下一帧自动校正，避免 Retina/跨显示器时逻辑像素与物理像素混用。

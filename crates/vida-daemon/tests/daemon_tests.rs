@@ -648,6 +648,9 @@ fn update_settings_persists() {
     state.create_vault("pass").unwrap();
     let settings = vida_core::vault::Settings {
         scrollback_lines: 10000,
+        terminal_font_family: "SF Mono".into(),
+        terminal_font_size: 16.0,
+        terminal_cursor_blink: false,
         ..Default::default()
     };
     state.update_settings(settings).unwrap();
@@ -655,6 +658,9 @@ fn update_settings_persists() {
     let ct = std::fs::read(&state.vault_path).unwrap();
     let vault = vida_core::vault::decrypt(&ct, "pass").unwrap();
     assert_eq!(vault.settings.scrollback_lines, 10000);
+    assert_eq!(vault.settings.terminal_font_family, "SF Mono");
+    assert_eq!(vault.settings.terminal_font_size, 16.0);
+    assert!(!vault.settings.terminal_cursor_blink);
 }
 
 #[test]
@@ -1054,6 +1060,9 @@ async fn get_settings_returns_vault_settings() {
         result["sync_local_path"].is_null(),
         "default sync_local_path is null"
     );
+    assert_eq!(result["terminal_font_family"], "JetBrains Mono");
+    assert_eq!(result["terminal_font_size"], 13.0);
+    assert_eq!(result["terminal_cursor_blink"], true);
 }
 
 #[tokio::test]

@@ -86,6 +86,8 @@ pub enum PtyRequest {
     OpenLocalSession { cols: u16, rows: u16 },
     /// Send raw bytes to a session (no line/byte conversion).
     SessionInput { session_id: String, data: Vec<u8> },
+    /// Paste text, honoring the terminal's bracketed-paste mode.
+    PasteSession { session_id: String, data: Vec<u8> },
     /// Resize a session (both PTY ioctl and Term).
     ResizeSession {
         session_id: String,
@@ -245,6 +247,17 @@ mod tests {
                 assert_eq!(data, b"echo");
             }
             other => panic!("expected Pty(SessionInput), got {:?}", other),
+        }
+
+        // PasteSession 与 SessionInput 分流，daemon 才能查询真实 TermMode。
+        let json = r#"{"method":"PasteSession","params":{"session_id":"abc","data":[97,10,98]}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Pty(PtyRequest::PasteSession { session_id, data }) => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(data, b"a\nb");
+            }
+            other => panic!("expected Pty(PasteSession), got {:?}", other),
         }
 
         // 非 PTY 请求不受影响

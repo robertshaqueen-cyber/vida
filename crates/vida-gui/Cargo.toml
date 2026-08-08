@@ -22,7 +22,7 @@ rfd = "0.17"
 
 [dependencies.iced]
 version = "= 0.14.0"
-features = ["tokio", "wgpu", "advanced"]
+features = ["tokio", "wgpu", "advanced", "canvas"]
 
 [dependencies.cosmic-text]
 version = "0.15"
@@ -38,14 +38,8 @@ features = ["std", "fs"]
 version = "1"
 features = ["derive"]
 
-[dependencies.iced_wgpu]
-version = "= 0.14.0"
-
 [dependencies.wgpu]
 version = "27"
-
-[dependencies.iced_graphics]
-version = "= 0.14.0"
 
 [dev-dependencies]
 winit = "0.30"
