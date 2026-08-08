@@ -493,20 +493,21 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
 - 默认字体与密度改为 Ghostty 零配置默认值：内置 JetBrains Mono 13pt。macOS 的点数就是逻辑
   像素，光栅化时只乘显示器 scale，不再额外乘 `96/72`；scale=1 实测 cell
   **8×18**、ascent **14**。所选等宽字体由 `font-kit` 调用平台原生栅格器（macOS
-  CoreText、Windows DirectWrite、Linux FreeType），缺字回落到 Swash；为避免
-  `font-kit` 复制大型 CJK 字体集合，中文固定走轻量回退。实测 CoreText `A` 位图
-  8×10、Swash 中文 13×13。普通中英文均保持 Regular，覆盖率不做人工加深；前景
+  CoreText、Windows DirectWrite、Linux FreeType）。macOS 中文使用与 Ghostty 相同的
+  `CTFontCreateForString` 按系统语言发现苹方，只保留 CTFont 句柄，不复制大型
+  PingFang TTC；回退字号按 `ic_width` 与主字体调和。实测 CoreText `A` 位图
+  8×10、苹方常规 13×14、中粗 14×14。普通中英文均不人工加深覆盖率；前景
   `#ffffff`、终端背景 `#282c34`。JetBrains Mono 2.304 Regular/Bold 以 OFL-1.1
   随应用分发；字体下拉同时保留系统等宽字体。隔离 release 窗口在 scale=1、输出中英文和 `ls`
-  后，`vmmap --summary` Physical footprint **257.3MB**（峰值 257.8MB）；同机旧版本
-  约 247.9MB，原生拉丁栅格化增量约 9.4MB。
+  后，`vmmap --summary` Physical footprint **252.0MB**（峰值 252.8MB）；同机旧版本
+  约 247.9MB，原生中英文栅格化增量约 4.1MB。
 - 增加 500ms 闪烁的实心方块光标；timer 仅在终端屏且用户启用闪烁时存在。
 - WIDE 字符仍推进两个 cell，但按原始字形宽高比绘制，不再横向拉伸中文；
-  低 DPI 灰度字形覆盖补偿保留。
+  灰度覆盖率由平台原生光栅器直接产生，不做人工加深。
 - 「设置 → 终端」从内置 JetBrains Mono 与系统等宽字体中选择字体，并从固定列表选择字号；
   可持久化字体、字号与光标闪烁，保存后新开的终端生效。
-- 普通宽字符使用 Medium 字重，消除 zsh bold 输入正常、Regular 输出偏瘦的差异；
-  字形仍按原始宽高比绘制，不做单轴拉伸。
+- 普通中文由 `PingFangSC-Regular` 绘制，bold 中文由 `PingFangSC-Semibold`
+  绘制；字形按原始宽高比绘制，不做单轴拉伸。
 - M2b-2 调试终端仍是临时 Screen；点击真实标签或设置时会先关闭调试会话并恢复
   Main，再执行标签切换，避免 active tab 已变化但终端仍覆盖内容。
 - 自动 GUI 首轮已看到提示符处方块光标；最终字体视觉观感仍以所有者截图验收为准。

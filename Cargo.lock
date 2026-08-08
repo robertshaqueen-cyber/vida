@@ -5116,6 +5116,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "core-foundation 0.9.4",
+ "core-graphics",
+ "core-text",
  "cosmic-text",
  "font-kit",
  "fontdb",

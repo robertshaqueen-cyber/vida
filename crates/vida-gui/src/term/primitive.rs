@@ -27,6 +27,25 @@ use iced_graphics::Viewport;
 use iced_wgpu::Primitive as IcedPrimitive;
 use pathfinder_geometry::transform2d::Transform2F;
 
+#[cfg(target_os = "macos")]
+use core_foundation::base::{CFRange, TCFType};
+#[cfg(target_os = "macos")]
+use core_foundation::string::{CFString, CFStringRef};
+#[cfg(target_os = "macos")]
+use core_graphics::color_space::CGColorSpace;
+#[cfg(target_os = "macos")]
+use core_graphics::context::CGContext;
+#[cfg(target_os = "macos")]
+use core_graphics::font::CGGlyph;
+#[cfg(target_os = "macos")]
+use core_graphics::geometry::{CG_ZERO_POINT, CG_ZERO_SIZE};
+#[cfg(target_os = "macos")]
+use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+#[cfg(target_os = "macos")]
+use core_text::font::{CTFont, CTFontRef};
+#[cfg(target_os = "macos")]
+use core_text::font_descriptor::kCTFontDefaultOrientation;
+
 use super::client_grid::{ClientGrid, ColorSpec, cell_flags};
 use super::frame;
 
@@ -88,6 +107,17 @@ struct BuiltGeometry {
 struct NativeFontSet {
     regular: NativeFont,
     bold: NativeFont,
+    fallback_regular: Option<NativeFallback>,
+    fallback_bold: Option<NativeFallback>,
+}
+
+#[derive(Clone)]
+struct NativeFallback {
+    #[cfg(target_os = "macos")]
+    font: CTFont,
+    /// 按主字体与回退字体的汉字宽度指标调和字号。
+    /// Ghostty 1.3.1 同样使用 ic-width 调整。
+    size_scale: f32,
 }
 
 struct GlyphBitmap {
@@ -892,7 +922,14 @@ fn native_glyph_bitmap(
 ) -> Option<GlyphBitmap> {
     let bold = weight.0 >= cosmic_text::Weight::BOLD.0;
     let primary = if bold { &fonts.bold } else { &fonts.regular };
-    let glyph_id = primary.glyph_for_char(ch)?;
+    let Some(glyph_id) = primary.glyph_for_char(ch) else {
+        let fallback = if bold {
+            fonts.fallback_bold.as_ref()
+        } else {
+            fonts.fallback_regular.as_ref()
+        }?;
+        return native_fallback_glyph_bitmap(fallback, ch, pixel_size);
+    };
     let transform = Transform2F::default();
     let bounds = primary
         .raster_bounds(
@@ -1037,13 +1074,243 @@ fn load_native_face(source: &SystemSource, family: &str, bold: bool) -> Option<N
         .ok()
 }
 
+#[cfg(target_os = "macos")]
+#[link(name = "CoreText", kind = "framework")]
+unsafe extern "C" {
+    fn CTFontCreateForString(
+        current_font: CTFontRef,
+        string: CFStringRef,
+        range: CFRange,
+    ) -> CTFontRef;
+}
+
+/// 使用与 Ghostty 相同的 CoreText API 按当前系统语言选择回退字体。
+/// 只持有 CTFont 句柄，不读取并复制整个 PingFang TTC 集合。
+#[cfg(target_os = "macos")]
+fn load_native_fallback(primary: &NativeFont, sample: char) -> Option<NativeFallback> {
+    let primary_ct = primary.native_font();
+    let text = CFString::new(&sample.to_string());
+    let range = CFRange {
+        location: 0,
+        length: text.char_len(),
+    };
+    // SAFETY: primary_ct/text 在调用期间有效；range 覆盖完整 CFString。
+    // Create 规则返回 +1 引用，立即交给 CTFont 托管。
+    let raw = unsafe {
+        CTFontCreateForString(
+            primary_ct.as_concrete_TypeRef(),
+            text.as_concrete_TypeRef(),
+            range,
+        )
+    };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: raw 非空且遵循 Core Foundation Create Rule。我们直接保留
+    // CTFont 句柄；不交给 font-kit，避免其从 URL 复制整个 TTC。
+    let fallback = unsafe { CTFont::wrap_under_create_rule(raw) };
+    let size_scale = fallback_ic_width_scale(primary, &fallback);
+    Some(NativeFallback {
+        font: fallback,
+        size_scale,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_native_fallback(_primary: &NativeFont, _sample: char) -> Option<NativeFallback> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn core_text_glyph(font: &CTFont, ch: char) -> Option<CGGlyph> {
+    let mut utf16 = [0u16; 2];
+    let encoded = ch.encode_utf16(&mut utf16);
+    let mut glyphs = [0u16; 2];
+    // SAFETY: 两个 slice 在调用期间有效，count 与 UTF-16 长度一致。
+    let found = unsafe {
+        font.get_glyphs_for_characters(
+            encoded.as_ptr(),
+            glyphs.as_mut_ptr(),
+            encoded.len() as isize,
+        )
+    };
+    if found && glyphs[0] != 0 {
+        Some(glyphs[0])
+    } else {
+        None
+    }
+}
+
+/// 直接用 CoreGraphics 光栅化 CTFont，不经 font-kit 的 `from_native_font`。
+/// 后者会根据 CTFont URL 把整个 PingFang TTC 读入内存。
+#[cfg(target_os = "macos")]
+fn native_fallback_glyph_bitmap(
+    fallback: &NativeFallback,
+    ch: char,
+    pixel_size: f32,
+) -> Option<GlyphBitmap> {
+    const K_CG_IMAGE_ALPHA_ONLY: u32 = 7;
+
+    let raster_size = pixel_size * fallback.size_scale;
+    let font = fallback.font.clone_with_font_size(raster_size as f64);
+    let glyph_id = core_text_glyph(&font, ch)?;
+    let rect = font.get_bounding_rects_for_glyphs(kCTFontDefaultOrientation, &[glyph_id]);
+    if rect.size.width < 0.25 || rect.size.height < 0.25 {
+        return None;
+    }
+
+    // CoreText 坐标原点在左下；图集坐标原点在左上。先向外取整
+    // 得到像素边界，再把 CoreGraphics 的逐行结果上下翻转。
+    let left = rect.origin.x.floor() as i32;
+    let right = (rect.origin.x + rect.size.width).ceil() as i32;
+    let bottom = rect.origin.y.floor() as i32;
+    let top = (rect.origin.y + rect.size.height).ceil() as i32;
+    let width = u32::try_from(right - left).ok()?;
+    let height = u32::try_from(top - bottom).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut alpha = vec![0u8; (width * height) as usize];
+    let color_space = CGColorSpace::create_device_gray();
+    let context = CGContext::create_bitmap_context(
+        Some(alpha.as_mut_ptr().cast()),
+        width as usize,
+        height as usize,
+        8,
+        width as usize,
+        &color_space,
+        K_CG_IMAGE_ALPHA_ONLY,
+    );
+    context.set_gray_fill_color(0.0, 0.0);
+    context.fill_rect(CGRect::new(
+        &CG_ZERO_POINT,
+        &CGSize::new(width as f64, height as f64),
+    ));
+    context.set_allows_font_smoothing(true);
+    context.set_should_smooth_fonts(true);
+    context.set_should_antialias(true);
+    context.set_gray_fill_color(1.0, 1.0);
+    font.draw_glyphs(
+        &[glyph_id],
+        &[CGPoint::new(-f64::from(left), -f64::from(bottom))],
+        context,
+    );
+    for row in 0..height / 2 {
+        let opposite = height - 1 - row;
+        for column in 0..width {
+            alpha.swap(
+                (row * width + column) as usize,
+                (opposite * width + column) as usize,
+            );
+        }
+    }
+
+    Some(GlyphBitmap {
+        width,
+        height,
+        alpha,
+        left: left as f32,
+        top: top as f32,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_fallback_glyph_bitmap(
+    _fallback: &NativeFallback,
+    _ch: char,
+    _pixel_size: f32,
+) -> Option<GlyphBitmap> {
+    None
+}
+
+/// 复制 Ghostty 的默认 fallback adjustment: `ic_width`。
+/// 主字体不含「水」时，以 ASCII 实际高度和两个 cell 宽度的较小值
+/// 估算 ideograph width，再与回退字体「水」的 advance 对齐。
+#[cfg(target_os = "macos")]
+fn fallback_ic_width_scale(primary: &NativeFont, fallback: &CTFont) -> f32 {
+    let primary_metrics = primary.metrics();
+    let primary_em = primary_metrics.units_per_em as f32;
+    let fallback_em = fallback.units_per_em() as f32;
+    if primary_em <= 0.0 || fallback_em <= 0.0 {
+        return 1.0;
+    }
+
+    let mut ascii_min_y = f32::INFINITY;
+    let mut ascii_max_y = f32::NEG_INFINITY;
+    for ch in ' '..='~' {
+        let Some(glyph_id) = primary.glyph_for_char(ch) else {
+            continue;
+        };
+        let Ok(bounds) = primary.typographic_bounds(glyph_id) else {
+            continue;
+        };
+        ascii_min_y = ascii_min_y.min(bounds.min_y());
+        ascii_max_y = ascii_max_y.max(bounds.max_y());
+    }
+    let ascii_height = (ascii_max_y - ascii_min_y) / primary_em;
+    let cell_width = primary
+        .glyph_for_char('M')
+        .and_then(|glyph_id| primary.advance(glyph_id).ok())
+        .map(|advance| advance.x() / primary_em);
+    let water_width = core_text_glyph(fallback, '水').map(|glyph_id| {
+        let mut advance = CG_ZERO_SIZE;
+        // SAFETY: glyph/advance 都是单元素有效缓冲区。
+        unsafe {
+            fallback.get_advances_for_glyphs(kCTFontDefaultOrientation, &glyph_id, &mut advance, 1);
+        }
+        advance.width as f32 / fallback.pt_size() as f32
+    });
+    let (Some(cell_width), Some(water_width)) = (cell_width, water_width) else {
+        return 1.0;
+    };
+    if !ascii_height.is_finite() || ascii_height <= 0.0 || water_width <= 0.0 {
+        return 1.0;
+    }
+    (ascii_height.min(2.0 * cell_width) / water_width).clamp(0.75, 1.5)
+}
+
+fn log_native_fallback(regular: &Option<NativeFallback>, bold: &Option<NativeFallback>) {
+    let describe = |fallback: &Option<NativeFallback>| match fallback {
+        Some(fallback) => format!(
+            "{} x{:.3}",
+            fallback_postscript_name(fallback).unwrap_or_else(|| "未知".to_string()),
+            fallback.size_scale
+        ),
+        None => "Swash".to_string(),
+    };
+    tracing::info!(
+        "终端回退字体: regular={} bold={}",
+        describe(regular),
+        describe(bold)
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_postscript_name(fallback: &NativeFallback) -> Option<String> {
+    Some(fallback.font.postscript_name())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fallback_postscript_name(_fallback: &NativeFallback) -> Option<String> {
+    None
+}
+
 fn load_native_font_set(family: &str) -> Option<NativeFontSet> {
     if family.eq_ignore_ascii_case(DEFAULT_TERMINAL_FONT_FAMILY) {
         let regular = NativeFont::from_bytes(Arc::new(BUNDLED_REGULAR.to_vec()), 0).ok()?;
         let bold = NativeFont::from_bytes(Arc::new(BUNDLED_BOLD.to_vec()), 0)
             .unwrap_or_else(|_| regular.clone());
+        let fallback_regular = load_native_fallback(&regular, '水');
+        let fallback_bold = load_native_fallback(&bold, '水');
+        log_native_fallback(&fallback_regular, &fallback_bold);
         tracing::info!("终端原生栅格器: 使用内置 JetBrains Mono Regular/Bold");
-        return Some(NativeFontSet { regular, bold });
+        return Some(NativeFontSet {
+            regular,
+            bold,
+            fallback_regular,
+            fallback_bold,
+        });
     }
     let source = SystemSource::new();
     let regular = load_native_face(&source, family, false)?;
@@ -1055,7 +1322,15 @@ fn load_native_font_set(family: &str) -> Option<NativeFontSet> {
             .unwrap_or_else(|| family.to_string()),
         bold.postscript_name().unwrap_or_else(|| family.to_string())
     );
-    Some(NativeFontSet { regular, bold })
+    let fallback_regular = load_native_fallback(&regular, '水');
+    let fallback_bold = load_native_fallback(&bold, '水');
+    log_native_fallback(&fallback_regular, &fallback_bold);
+    Some(NativeFontSet {
+        regular,
+        bold,
+        fallback_regular,
+        fallback_bold,
+    })
 }
 
 /// 建立渲染管线（iced 首次遇到 TermPrimitive 时调用一次）。
@@ -1542,21 +1817,51 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn core_text_rasterizer_produces_regular_antialiased_masks() {
-        let fonts = load_native_font_set("Menlo").expect("macOS 应能加载 Menlo");
+        let fonts = load_native_font_set(DEFAULT_TERMINAL_FONT_FAMILY)
+            .expect("macOS 应能加载内置 JetBrains Mono");
         assert_eq!(
             fonts.regular.postscript_name().as_deref(),
-            Some("Menlo-Regular")
+            Some("JetBrainsMono-Regular")
         );
-        assert_eq!(fonts.bold.postscript_name().as_deref(), Some("Menlo-Bold"));
+        assert_eq!(
+            fonts.bold.postscript_name().as_deref(),
+            Some("JetBrainsMono-Bold")
+        );
 
         let latin = native_glyph_bitmap(&fonts, 'A', cosmic_text::Weight::NORMAL, 13.0)
-            .expect("CoreText 应能光栅化 Menlo A");
+            .expect("CoreText 应能光栅化 JetBrains Mono A");
         assert!(latin.alpha.iter().any(|alpha| *alpha > 0));
         assert!(latin.alpha.iter().any(|alpha| *alpha > 0 && *alpha < 255));
 
+        let fallback = fonts
+            .fallback_regular
+            .as_ref()
+            .expect("CoreText 应能按系统语言找到中文回退字体");
         assert!(
-            native_glyph_bitmap(&fonts, '你', cosmic_text::Weight::NORMAL, 13.0).is_none(),
-            "主等宽字体缺少中文时应交给 Swash 回退，避免复制大型 CJK 字体集合"
+            fallback_postscript_name(fallback).is_some_and(|name| name.contains("PingFang")),
+            "简体中文 macOS 应由苹方回退"
+        );
+        assert!((0.9..=1.2).contains(&fallback.size_scale));
+        assert!(
+            fonts
+                .fallback_bold
+                .as_ref()
+                .and_then(fallback_postscript_name)
+                .is_some_and(|name| name.contains("PingFang")),
+            "粗体中文也应由 CoreText 选择苹方字重"
+        );
+        let cjk = native_glyph_bitmap(&fonts, '你', cosmic_text::Weight::NORMAL, 13.0)
+            .expect("中文应由 CoreText 原生回退光栅化");
+        assert!(cjk.alpha.iter().any(|alpha| *alpha > 0));
+        assert!(cjk.alpha.iter().any(|alpha| *alpha > 0 && *alpha < 255));
+        let occupied_rows = cjk
+            .alpha
+            .chunks(cjk.width as usize)
+            .filter(|row| row.iter().any(|alpha| *alpha > 0))
+            .count();
+        assert!(
+            occupied_rows * 4 >= cjk.height as usize * 3,
+            "中文轮廓应覆盖大部分位图高度，避免坐标翻转后只剩横线"
         );
     }
 
@@ -1729,8 +2034,12 @@ mod tests {
                 font_size: size,
                 font_family: pipeline.font_family.clone(),
             };
-            for (ch, bold, wide) in [('A', false, false), ('A', true, false), ('你', false, true)]
-            {
+            for (ch, bold, wide) in [
+                ('A', false, false),
+                ('A', true, false),
+                ('你', false, true),
+                ('你', true, true),
+            ] {
                 let r = rasterize_char(
                     &mut font_system,
                     &mut cache,
@@ -1740,15 +2049,21 @@ mod tests {
                     ch,
                     glyph_weight(bold, wide),
                 );
-                // 字体名：从 cache_key 的 font_id 查
-                let face_name = rasterize_face_name(
-                    &mut font_system,
+                let face_name = native_raster_face_name(
+                    pipeline.native_fonts.as_ref(),
                     ch,
-                    bold,
-                    wide,
-                    size,
-                    &pipeline.font_family,
-                );
+                    glyph_weight(bold, wide),
+                )
+                .unwrap_or_else(|| {
+                    rasterize_face_name(
+                        &mut font_system,
+                        ch,
+                        bold,
+                        wide,
+                        size,
+                        &pipeline.font_family,
+                    )
+                });
                 match r {
                     Some((gw, gh, _, _, _, _, left, top)) => {
                         let glyph_y = metrics.ascent - top;
@@ -1782,6 +2097,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn native_raster_face_name(
+        fonts: Option<&NativeFontSet>,
+        ch: char,
+        weight: cosmic_text::Weight,
+    ) -> Option<String> {
+        let fonts = fonts?;
+        let bold = weight.0 >= cosmic_text::Weight::BOLD.0;
+        let primary = if bold { &fonts.bold } else { &fonts.regular };
+        if primary.glyph_for_char(ch).is_some() {
+            return primary.postscript_name();
+        }
+        let fallback = if bold {
+            fonts.fallback_bold.as_ref()
+        } else {
+            fonts.fallback_regular.as_ref()
+        }?;
+        #[cfg(target_os = "macos")]
+        {
+            core_text_glyph(&fallback.font, ch)?;
+            fallback_postscript_name(fallback)
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
     }
 
     /// 查 'A' 光栅化时实际使用的字体名（post script name）。

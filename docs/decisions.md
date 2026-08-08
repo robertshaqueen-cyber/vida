@@ -875,6 +875,17 @@ Menlo，而是内置 JetBrains Mono 13pt、纯白前景和原生 alpha 混合。
 拉丁字形由平台原生后端直接从内置字体光栅化，CJK 仍走 Swash 系统回退；
 默认前景恢复 `#ffffff`。金库 v5 升至 v6，仅将与旧默认完全一致的
 Menlo/13pt/闪烁设置迁移为 JetBrains Mono，保留其他用户选择。
+
+第五轮所有者截图确认英文正常、中文仍偏小偏细。Ghostty 1.3.1 的
+`+show-face --string='中文水测试'` 在本机明确返回 `PingFang SC`；源码进一步确认
+macOS 通过 `CTFontCreateForString` 按系统语言发现 CJK 回退，并以 `ic_width`
+调和回退字体尺寸。Vida 改为直接持有 CoreText 返回的 CTFont 句柄，不再用
+Swash 光栅化中文，也不读取/复制整个 PingFang TTC。本机实际选择为
+`PingFangSC-Regular` / `PingFangSC-Semibold`；JetBrains Mono → 苹方的 `ic_width`
+系数约 1.05，13pt 中文实际光栅化约 13.65pt。scale=1 位图由 Swash 13×13
+改为 CoreText 常规 13×14、中粗 14×14，均位于 8×18 cell 内。原生 CTFont
+发布版窗口输出中英文和 `ls` 后 Physical footprint 为 252.0MB（峰值 252.8MB）；
+测试同时检查中文轮廓覆盖至少四分之三的位图行，防止坐标翻转错误只留下横线。
 测试同时断言原生遮罩包含非零实心像素和 0—255 之间的抗锯齿覆盖率，且普通、粗体、
 CJK 位图上下界都位于 cell 内。
 图集增量上传测试会把跨行探针写入 GPU 纹理，再复制回 MAP_READ buffer 与 CPU 图集
