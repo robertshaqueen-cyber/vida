@@ -92,6 +92,28 @@ impl ClientGrid {
         self.version = self.version.wrapping_add(1);
     }
 
+    /// Visible terminal text for classifying a just-finished process error.
+    /// This is UI-only and is never logged, because terminal output can contain
+    /// sensitive data.
+    pub fn plain_text(&self) -> String {
+        let mut lines = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let mut line = String::with_capacity(self.cols as usize);
+            for col in 0..self.cols {
+                if let Some(cell) = self.cell(row, col)
+                    && cell.flags & cell_flags::WIDE_SPACER == 0
+                {
+                    line.push(cell.ch);
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// 应用一帧（全量帧由调用方先 reset 再 apply_line；增量帧直接 apply_line）。
     pub fn apply_frame(&mut self, frame: &crate::term::frame::TerminalFrame) {
         // 丢帧检测：seq 不连续时记录一次（状态栏/日志），直接应用最新帧。

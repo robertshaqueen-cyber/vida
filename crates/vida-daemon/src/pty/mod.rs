@@ -465,7 +465,7 @@ impl PtyManager {
         // 泵线程：消费 PTY 输出 → advance Term
         let pump_session = Arc::clone(&session);
         let pump_id = id.clone();
-        thread::spawn(move || {
+        let pump_handle = thread::spawn(move || {
             for bytes in rx {
                 let inner = match pump_session.lock() {
                     Ok(g) => g,
@@ -504,6 +504,11 @@ impl PtyManager {
                     Err(_) => break, // 读错误（PTY 关闭）
                 }
             }
+            // All bytes read before EOF must reach the terminal model before
+            // SessionClosed is emitted. Otherwise short-lived failures such as
+            // `ssh: connect ... refused` can disappear behind exit_code=255.
+            drop(tx);
+            let _ = pump_handle.join();
             // EOF 到达：回收会话
             finalize_session(reader_session);
         });
@@ -900,13 +905,26 @@ fn finalize_session(session: Arc<Mutex<SessionInner>>) {
         cleanup.run();
     }
 
+    // Package one authoritative final screen with SessionClosed after the pump
+    // has consumed every PTY byte. The WebSocket layer writes these bytes first,
+    // so a short-lived SSH error cannot disappear behind exit_code=255.
+    let (final_seq, final_bytes) = {
+        let term = match inner.term.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = build_full_frame(&term.term, seq);
+        (seq, encode_frame(&inner.id, &frame))
+    };
+
     // 推送 session_closed 事件到所有订阅者
     let event_payload = PushPayload {
-        frame_seq: inner.next_seq.load(Ordering::Relaxed),
+        frame_seq: final_seq,
         kind: push::PushKind::SessionClosed {
             exit_code: exit_code.unwrap_or(0),
         },
-        bytes: Vec::new(),
+        bytes: final_bytes,
     };
     let mut subs = match inner.subscribers.lock() {
         Ok(g) => g,
@@ -1389,6 +1407,10 @@ mod tests {
                 Some(payload) => {
                     if let push::PushKind::SessionClosed { exit_code } = payload.kind {
                         assert_eq!(exit_code, 0, "exit 应返回 0");
+                        assert!(
+                            !payload.bytes.is_empty(),
+                            "结束事件必须携带最终屏幕，WebSocket 会先发送该帧"
+                        );
                         got_event = true;
                     }
                 }
@@ -1399,6 +1421,33 @@ mod tests {
 
         // 3. 无僵尸：child 已被 wait（try_wait 返回 Some）
         // 通过再次 close 验证：若已回收，close 直接成功（幂等分支）
+        pm.close_session(&id).unwrap();
+    }
+
+    #[test]
+    fn short_lived_process_output_is_applied_before_session_closes() {
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(80, 24).unwrap();
+        pm.session_input(&id, b"printf 'FINAL_SSH_ERROR_MARKER\\n' >&2; exit 255\r")
+            .unwrap();
+        thread::sleep(Duration::from_millis(1000));
+
+        let screen = pm.read_screen(&id).unwrap();
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("FINAL_SSH_ERROR_MARKER")),
+            "进程退出前的最后错误不能被 closed 状态抢先丢弃: {:?}",
+            screen.lines
+        );
+        assert_eq!(
+            pm.list_sessions()
+                .into_iter()
+                .find(|session| session.session_id == id)
+                .and_then(|session| session.exit_code),
+            Some(255)
+        );
         pm.close_session(&id).unwrap();
     }
 

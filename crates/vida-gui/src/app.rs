@@ -358,6 +358,35 @@ fn active_terminal_mut(app: &mut VidaApp) -> Option<&mut s_terminal::TerminalSes
     app.terminal_sessions.get_mut(&app.active_tab_id)
 }
 
+fn classify_ssh_failure(i18n: &I18n, output: &str) -> String {
+    let output = output.to_ascii_lowercase();
+    let key = if output.contains("permission denied")
+        || output.contains("authentication failed")
+        || output.contains("too many authentication failures")
+    {
+        "terminal_ssh_auth_failed"
+    } else if output.contains("connection refused") {
+        "terminal_ssh_connection_refused"
+    } else if output.contains("operation timed out")
+        || output.contains("connection timed out")
+        || output.contains("no route to host")
+        || output.contains("network is unreachable")
+    {
+        "terminal_ssh_unreachable"
+    } else if output.contains("could not resolve hostname")
+        || output.contains("name or service not known")
+    {
+        "terminal_ssh_dns_failed"
+    } else if output.contains("host key verification failed")
+        || output.contains("remote host identification has changed")
+    {
+        "terminal_ssh_host_key_failed"
+    } else {
+        "terminal_ssh_failed_generic"
+    };
+    i18n.tr(key).to_string()
+}
+
 /// Close the daemon session owned by a terminal tab. Human input is already
 /// serialized through the client's ordered queue; closing uses the same queue
 /// so no late keystroke can overtake CloseSession.
@@ -2390,6 +2419,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             };
             session.closed = true;
             session.exit_code = exit_code;
+            if session.remote_host_id.is_some() && exit_code.is_some_and(|code| code != 0) {
+                session.notice = Some(classify_ssh_failure(&app.i18n, &session.grid.plain_text()));
+            }
             match exit_code {
                 Some(code) => tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code),
                 None => tracing::info!("终端会话 {} 结束, 退出码未知", session_id),
@@ -2637,7 +2669,9 @@ fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppMessage, Screen, Tab, VidaApp, parse_backup_bytes, update};
+    use super::{
+        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, parse_backup_bytes, update,
+    };
     use crate::screens::{s_terminal, s3_main};
     use crate::term::primitive::TerminalAppearance;
     use crate::ws_client::PushMsg;
@@ -2687,6 +2721,20 @@ mod tests {
             parse_backup_bytes(&serde_json::json!({"data": [256]})),
             Err(())
         );
+    }
+
+    #[test]
+    fn ssh_failure_classifier_turns_exit_255_output_into_actionable_copy() {
+        let i18n = vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn);
+        assert!(
+            classify_ssh_failure(&i18n, "Permission denied (publickey,password)")
+                .contains("认证失败")
+        );
+        assert!(
+            classify_ssh_failure(&i18n, "ssh: connect to host x port 22: Connection refused")
+                .contains("服务器拒绝")
+        );
+        assert!(classify_ssh_failure(&i18n, "").contains("常见原因"));
     }
 
     #[test]

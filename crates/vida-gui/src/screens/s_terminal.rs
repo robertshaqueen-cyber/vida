@@ -70,9 +70,13 @@ impl TerminalSession {
     /// 渲染终端画面 + 会话状态栏。
     pub fn view<'a>(&'a self, i18n: &'a I18n) -> Element<'a, AppMessage> {
         let status = if self.closed {
-            let code_text = match self.exit_code {
-                Some(code) => i18n.trf("terminal_closed_code", &[&code.to_string()]),
-                None => i18n.tr("terminal_closed_unknown").to_string(),
+            let code_text = if self.remote_host_id.is_some() {
+                i18n.tr("terminal_ssh_ended").to_string()
+            } else {
+                match self.exit_code {
+                    Some(code) => i18n.trf("terminal_closed_code", &[&code.to_string()]),
+                    None => i18n.tr("terminal_closed_unknown").to_string(),
+                }
             };
             text(code_text).size(11).color(ui::DANGER)
         } else {
@@ -116,11 +120,26 @@ impl TerminalSession {
             ..Default::default()
         });
         let notice_el: Element<'_, AppMessage> = match &self.notice {
-            Some(n) => container(text(n).size(12))
-                .padding([7, 12])
-                .width(Length::Fill)
-                .style(ui::surface)
-                .into(),
+            Some(n) => {
+                let mut notice = row![text(n).size(12).width(Length::Fill)]
+                    .spacing(10)
+                    .align_y(Alignment::Center);
+                if self.closed
+                    && let Some(host_id) = &self.remote_host_id
+                {
+                    notice = notice.push(
+                        iced::widget::button(i18n.tr("terminal_edit_host"))
+                            .on_press(AppMessage::EditHost(host_id.clone()))
+                            .style(ui::secondary_button)
+                            .padding([7, 10]),
+                    );
+                }
+                container(notice)
+                    .padding([7, 12])
+                    .width(Length::Fill)
+                    .style(ui::surface)
+                    .into()
+            }
             None => container(Space::new()).height(0).into(),
         };
         let content = column![toolbar, notice_el, canvas]

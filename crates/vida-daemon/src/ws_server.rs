@@ -194,6 +194,16 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         }
                     }
                     PushKind::SessionClosed { exit_code } => {
+                        if !payload.bytes.is_empty()
+                            && let Err(e) = write
+                                .send(Message::Binary(
+                                    tokio_tungstenite::tungstenite::Bytes::from(payload.bytes),
+                                ))
+                                .await
+                        {
+                            error!("Failed to push final binary frame to {}: {}", addr, e);
+                            break;
+                        }
                         // 规格 5.3：shell 退出时推送事件
                         let event = serde_json::json!({
                             "type": "Event",
