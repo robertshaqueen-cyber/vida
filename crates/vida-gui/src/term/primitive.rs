@@ -57,11 +57,13 @@ struct FontMetrics {
     font_size: f32,
 }
 
-/// 终端默认配色（主题色）。
-// 避免低 DPI 下纯白前景产生类似位图字体的强烈反差；接近 iced 原生界面文字。
-const DEFAULT_FG: (u8, u8, u8) = (220, 222, 225);
+/// 终端默认配色（与 Ghostty 默认主题一致）。
+const DEFAULT_FG: (u8, u8, u8) = (255, 255, 255);
 const DEFAULT_BG: (u8, u8, u8) = (40, 44, 52);
 const DEFAULT_FONT_SIZE: f32 = 13.0;
+pub(crate) const DEFAULT_TERMINAL_FONT_FAMILY: &str = "JetBrains Mono";
+const BUNDLED_REGULAR: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+const BUNDLED_BOLD: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf");
 /// macOS 的 pt 是逻辑像素；光栅化时只乘显示器 scale，不能再乘 96/72。
 /// Ghostty 风格的默认行高：13pt 在 scale=1 时对应约 18px 行高。
 const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
@@ -150,7 +152,7 @@ pub struct TerminalAppearance {
 impl Default for TerminalAppearance {
     fn default() -> Self {
         Self {
-            font_family: "Menlo".to_string(),
+            font_family: DEFAULT_TERMINAL_FONT_FAMILY.to_string(),
             font_size: DEFAULT_FONT_SIZE,
             cursor_blink: true,
         }
@@ -162,7 +164,7 @@ impl TerminalAppearance {
         let font_family = self.font_family.trim();
         Self {
             font_family: if font_family.is_empty() {
-                "Menlo".to_string()
+                DEFAULT_TERMINAL_FONT_FAMILY.to_string()
             } else {
                 font_family.to_string()
             },
@@ -301,7 +303,7 @@ impl IcedPrimitive for TermPrimitive {
             };
             if family != appearance.font_family {
                 tracing::warn!(
-                    "字体 {} 不可用，回落为 {}（候选: Menlo → SF Mono → Monaco → 默认）",
+                    "字体 {} 不可用，回落为 {}（候选: JetBrains Mono → Menlo → SF Mono → Monaco → 默认）",
                     appearance.font_family,
                     family
                 );
@@ -1036,6 +1038,13 @@ fn load_native_face(source: &SystemSource, family: &str, bold: bool) -> Option<N
 }
 
 fn load_native_font_set(family: &str) -> Option<NativeFontSet> {
+    if family.eq_ignore_ascii_case(DEFAULT_TERMINAL_FONT_FAMILY) {
+        let regular = NativeFont::from_bytes(Arc::new(BUNDLED_REGULAR.to_vec()), 0).ok()?;
+        let bold = NativeFont::from_bytes(Arc::new(BUNDLED_BOLD.to_vec()), 0)
+            .unwrap_or_else(|_| regular.clone());
+        tracing::info!("终端原生栅格器: 使用内置 JetBrains Mono Regular/Bold");
+        return Some(NativeFontSet { regular, bold });
+    }
     let source = SystemSource::new();
     let regular = load_native_face(&source, family, false)?;
     let bold = load_native_face(&source, family, true).unwrap_or_else(|| regular.clone());
@@ -1060,6 +1069,7 @@ fn build_pipeline(
     // 字体系统：移除系统位图 CJK 字体（无 glyf/cff 轮廓，swash 无法光栅化）
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
+    load_bundled_terminal_fonts(&mut db);
     let bitmap_ids: Vec<_> = db
         .faces()
         .filter(|f| f.post_script_name.contains("Bitmap"))
@@ -1069,9 +1079,11 @@ fn build_pipeline(
         db.remove_face(id);
     }
     // 字体族显式指定（产品决策，不依赖 fallback 顺序）：
-    // VIDA_FONT_FAMILY 覆盖，默认 Menlo；缺失时按候选回落并 warn。
+    // VIDA_FONT_FAMILY 覆盖，默认使用与 Ghostty 相同的内置 JetBrains Mono；
+    // 缺失时按候选回落并 warn。
     // 必须在 db move 进 FontSystem 之前解析。
-    let requested = std::env::var("VIDA_FONT_FAMILY").unwrap_or_else(|_| "Menlo".to_string());
+    let requested = std::env::var("VIDA_FONT_FAMILY")
+        .unwrap_or_else(|_| DEFAULT_TERMINAL_FONT_FAMILY.to_string());
     let family = resolve_font_family(&db, &requested);
     let mut font_system = FontSystem::new_with_locale_and_db("zh-Hans".into(), db);
     // 初始 scale=1.0；首次 prepare 时用真实 viewport scale 重新测量
@@ -1089,7 +1101,7 @@ fn build_pipeline(
     .normalized();
     if family != requested {
         tracing::warn!(
-            "字体 {} 不可用，回落为 {}（候选: Menlo → SF Mono → Monaco → 默认）",
+            "字体 {} 不可用，回落为 {}（候选: JetBrains Mono → Menlo → SF Mono → Monaco → 默认）",
             requested,
             family
         );
@@ -1307,10 +1319,22 @@ fn build_pipeline(
     }
 }
 
+/// 把随应用分发的默认等宽字体加入字体数据库。
+pub(crate) fn load_bundled_terminal_fonts(db: &mut fontdb::Database) {
+    db.load_font_data(BUNDLED_REGULAR.to_vec());
+    db.load_font_data(BUNDLED_BOLD.to_vec());
+}
+
 /// 解析实际字体族：请求的字体不可用时按候选回落。
-/// 候选顺序：请求值 → Menlo → SF Mono → Monaco → 默认 monospace。
+/// 候选顺序：请求值 → JetBrains Mono → Menlo → SF Mono → Monaco → 默认 monospace。
 fn resolve_font_family(db: &fontdb::Database, requested: &str) -> String {
-    let candidates = [requested, "Menlo", "SF Mono", "Monaco"];
+    let candidates = [
+        requested,
+        DEFAULT_TERMINAL_FONT_FAMILY,
+        "Menlo",
+        "SF Mono",
+        "Monaco",
+    ];
     for name in candidates {
         let query = fontdb::Query {
             families: &[fontdb::Family::Name(name)],
@@ -1678,8 +1702,8 @@ mod tests {
         );
     }
 
-    /// 字号对照实验：16/18/20/22 下 cell 尺寸与 'A' 实际字体名。
-    /// 判定：若字号增大观感改善 → 非渲染 bug，是 16px 的固有效果；
+    /// 字号对照实验：13/16/18/20/22 下 cell 尺寸与 'A' 实际字体名。
+    /// 判定：若字号增大观感改善 → 非渲染 bug，是小字号的固有效果；
     /// 若各字号同样发虚 → 渲染问题。
     #[test]
     fn diagnostic_font_sizes_and_face() {

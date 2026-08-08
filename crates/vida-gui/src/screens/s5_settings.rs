@@ -5,15 +5,18 @@ use vida_core::vault::Settings;
 
 use crate::app::AppMessage;
 use crate::screens::s3_main::HostItem;
-use crate::term::primitive::TerminalAppearance;
+use crate::term::primitive::{
+    DEFAULT_TERMINAL_FONT_FAMILY, TerminalAppearance, load_bundled_terminal_fonts,
+};
 
 const TERMINAL_FONT_SIZES: &[u16] = &[10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32];
 
-/// 只展示系统实际安装的等宽字体。比例字体会破坏终端固定 cell 布局，
-/// 因此即使已安装也不进入这个选择器。
+/// 展示内置默认字体和系统安装的等宽字体。比例字体会破坏
+/// 终端固定 cell 布局，因此即使已安装也不进入这个选择器。
 fn installed_terminal_fonts() -> Vec<String> {
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
+    load_bundled_terminal_fonts(&mut database);
 
     let mut families: Vec<String> = database
         .faces()
@@ -29,10 +32,15 @@ fn selected_terminal_font(configured: &str, installed: &[String]) -> String {
     installed
         .iter()
         .find(|name| name.eq_ignore_ascii_case(configured))
+        .or_else(|| {
+            installed
+                .iter()
+                .find(|name| name.as_str() == DEFAULT_TERMINAL_FONT_FAMILY)
+        })
         .or_else(|| installed.iter().find(|name| name.as_str() == "Menlo"))
         .or_else(|| installed.first())
         .cloned()
-        .unwrap_or_else(|| "Menlo".to_string())
+        .unwrap_or_else(|| DEFAULT_TERMINAL_FONT_FAMILY.to_string())
 }
 
 fn selected_terminal_font_size(configured: f32) -> u16 {
@@ -650,9 +658,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_font_selection_falls_back_to_installed_menlo() {
+    fn terminal_font_selection_falls_back_to_bundled_default() {
         let installed = vec!["JetBrains Mono".to_string(), "Menlo".to_string()];
-        assert_eq!(selected_terminal_font("not installed", &installed), "Menlo");
+        assert_eq!(
+            selected_terminal_font("not installed", &installed),
+            "JetBrains Mono"
+        );
         assert_eq!(
             selected_terminal_font("jetbrains mono", &installed),
             "JetBrains Mono"

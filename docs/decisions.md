@@ -867,8 +867,14 @@ Physical footprint 从约 248MB 激增到 552MB，因此原生后端只加载用
 字体；CJK 固定由已有 Swash 数据库回退，不复制大型字体集合。普通宽字符保持
 Regular，alpha 原样上传；Menlo 13pt 在 scale=1 下为 cell 8×18、ascent 14，CoreText
 `A` 位图 8×10、Swash 中文位图 13×13。最终隔离 release 实测 scale=1 Physical
-footprint 257.3MB（峰值 257.8MB），相对旧版 247.9MB 增加约 9.4MB。默认前景由
-纯白降为 `#dcdee1`。
+footprint 257.3MB（峰值 257.8MB），相对旧版 247.9MB 增加约 9.4MB。
+
+第四轮与同机 Ghostty 截图逐像素对照后确认：Ghostty 零配置并不使用
+Menlo，而是内置 JetBrains Mono 13pt、纯白前景和原生 alpha 混合。Vida 因此
+内置 JetBrains Mono 2.304 Regular/Bold（OFL-1.1），同时保留系统等宽字体选择。
+拉丁字形由平台原生后端直接从内置字体光栅化，CJK 仍走 Swash 系统回退；
+默认前景恢复 `#ffffff`。金库 v5 升至 v6，仅将与旧默认完全一致的
+Menlo/13pt/闪烁设置迁移为 JetBrains Mono，保留其他用户选择。
 测试同时断言原生遮罩包含非零实心像素和 0—255 之间的抗锯齿覆盖率，且普通、粗体、
 CJK 位图上下界都位于 cell 内。
 图集增量上传测试会把跨行探针写入 GPU 纹理，再复制回 MAP_READ buffer 与 CPU 图集

@@ -1060,7 +1060,7 @@ async fn get_settings_returns_vault_settings() {
         result["sync_local_path"].is_null(),
         "default sync_local_path is null"
     );
-    assert_eq!(result["terminal_font_family"], "Menlo");
+    assert_eq!(result["terminal_font_family"], "JetBrains Mono");
     assert_eq!(result["terminal_font_size"], 13.0);
     assert_eq!(result["terminal_cursor_blink"], true);
 }

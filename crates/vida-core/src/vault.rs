@@ -13,7 +13,7 @@ pub const PRODUCTION_LOG_N: u8 = 18;
 
 /// Current vault format version. Bump when the struct layout changes.
 /// When bumping, MUST also add migration function and test (see AGENTS.md).
-pub const CURRENT_VAULT_VERSION: u32 = 5;
+pub const CURRENT_VAULT_VERSION: u32 = 6;
 
 /// A string wrapper that zeroizes its contents on drop.
 /// Used for sensitive data (private keys, passphrases, secrets)
@@ -117,7 +117,7 @@ pub struct Settings {
     /// 回滚行数。默认 3000：3000×200列×24字节(Cell) ≈ 14.4MB。
     /// 用户可调高，每 1000 行约 5MB 内存。
     pub scrollback_lines: usize,
-    /// 终端主字体族。不存在时 GUI 会按 Menlo → SF Mono → Monaco 回落。
+    /// 终端主字体族。默认使用内置 JetBrains Mono。
     pub terminal_font_family: String,
     /// 终端逻辑字号，GUI 接受范围 8–48。
     pub terminal_font_size: f32,
@@ -134,7 +134,7 @@ impl Default for Settings {
             s3_secret_key: None,
             sync_local_path: None,
             scrollback_lines: 3000,
-            terminal_font_family: "Menlo".to_string(),
+            terminal_font_family: "JetBrains Mono".to_string(),
             terminal_font_size: 13.0,
             terminal_cursor_blink: true,
         }
@@ -264,6 +264,9 @@ fn migrate_json(plaintext: &[u8], from_version: u32) -> Result<Vec<u8>> {
     if from_version < 5 {
         migrate_json_v4_to_v5(&mut root)?;
     }
+    if from_version < 6 {
+        migrate_json_v5_to_v6(&mut root)?;
+    }
 
     serde_json::to_vec_pretty(&root).context("Failed to serialize migrated vault")
 }
@@ -309,6 +312,9 @@ pub fn migrate_vault_json(plaintext: &[u8], backup_path: &Path) -> Result<Vec<u8
     }
     if version < 5 {
         migrate_json_v4_to_v5(&mut root)?;
+    }
+    if version < 6 {
+        migrate_json_v5_to_v6(&mut root)?;
     }
 
     let migrated =
@@ -399,6 +405,26 @@ fn migrate_json_v4_to_v5(root: &mut serde_json::Value) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// v5 → v6: 终端默认字体改为内置 JetBrains Mono。
+/// 只迁移与旧默认完全一致的设置，保留用户自定义字体。
+fn migrate_json_v5_to_v6(root: &mut serde_json::Value) -> Result<()> {
+    root["version"] = serde_json::json!(6);
+    if let Some(settings) = root.get_mut("settings")
+        && settings
+            .get("terminal_font_family")
+            .and_then(|v| v.as_str())
+            == Some("Menlo")
+        && settings.get("terminal_font_size").and_then(|v| v.as_f64()) == Some(13.0)
+        && settings
+            .get("terminal_cursor_blink")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    {
+        settings["terminal_font_family"] = serde_json::json!("JetBrains Mono");
+    }
     Ok(())
 }
 
@@ -794,7 +820,7 @@ mod tests {
             "sync_local_path defaults to null"
         );
         assert_eq!(vault.settings.scrollback_lines, 5000);
-        assert_eq!(vault.settings.terminal_font_family, "Menlo");
+        assert_eq!(vault.settings.terminal_font_family, "JetBrains Mono");
         assert_eq!(vault.settings.terminal_font_size, 13.0);
         assert!(vault.settings.terminal_cursor_blink);
 
@@ -809,7 +835,7 @@ mod tests {
         );
     }
 
-    /// v4 的真实 JSON 必须完整迁移到 v5，保留原字段并补齐终端外观。
+    /// v4 的真实 JSON 必须完整迁移到当前版本，保留原字段并补齐终端外观。
     #[test]
     fn migrate_v4_to_v5_adds_terminal_appearance() {
         let v4_json = r##"{
@@ -833,17 +859,55 @@ mod tests {
         let migrated = migrate_vault_json(v4_json.as_bytes(), &backup_path).unwrap();
         let vault: Vault = serde_json::from_slice(&migrated).unwrap();
 
-        assert_eq!(vault.version, 5);
+        assert_eq!(vault.version, CURRENT_VAULT_VERSION);
         assert_eq!(vault.revision, 9);
         assert_eq!(vault.device_id, "v4-device");
         assert_eq!(vault.settings.scrollback_lines, 4321);
-        assert_eq!(vault.settings.terminal_font_family, "Menlo");
+        assert_eq!(vault.settings.terminal_font_family, "JetBrains Mono");
         assert_eq!(vault.settings.terminal_font_size, 13.0);
         assert!(vault.settings.terminal_cursor_blink);
         assert!(
             std::fs::read_to_string(backup_path)
                 .unwrap()
                 .contains("\"version\": 4")
+        );
+    }
+
+    /// v5 的真实 JSON 会把未修改的旧默认外观迁移为 Ghostty 同款默认字体。
+    #[test]
+    fn migrate_v5_to_v6_updates_untouched_terminal_default() {
+        let v5_json = r##"{
+  "version": 5,
+  "revision": 2,
+  "device_id": "v5-device",
+  "modified_at": 1700000000,
+  "hosts": [],
+  "settings": {
+    "s3_endpoint": null,
+    "s3_bucket": null,
+    "s3_access_key": null,
+    "s3_secret_key": null,
+    "sync_local_path": null,
+    "scrollback_lines": 3000,
+    "terminal_font_family": "Menlo",
+    "terminal_font_size": 13.0,
+    "terminal_cursor_blink": true
+  }
+}"##;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join("backup-v5.json");
+        let migrated = migrate_vault_json(v5_json.as_bytes(), &backup_path).unwrap();
+        let vault: Vault = serde_json::from_slice(&migrated).unwrap();
+
+        assert_eq!(vault.version, CURRENT_VAULT_VERSION);
+        assert_eq!(vault.settings.terminal_font_family, "JetBrains Mono");
+        assert_eq!(vault.settings.terminal_font_size, 13.0);
+        assert!(vault.settings.terminal_cursor_blink);
+        assert!(
+            std::fs::read_to_string(backup_path)
+                .unwrap()
+                .contains("\"version\": 5")
         );
     }
 
@@ -887,7 +951,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&vault).unwrap();
 
         // Verify key structural markers
-        assert!(json.contains("\"version\": 5"), "version must be 5");
+        assert!(json.contains("\"version\": 6"), "version must be 6");
         assert!(json.contains("\"revision\""), "must have revision field");
         assert!(json.contains("\"device_id\""), "must have device_id field");
         assert!(
