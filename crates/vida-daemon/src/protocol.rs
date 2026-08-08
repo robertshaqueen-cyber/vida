@@ -98,6 +98,8 @@ pub enum PtyRequest {
         cols: u16,
         rows: u16,
     },
+    /// Scroll the terminal's real daemon-owned history. Positive lines move up.
+    ScrollSession { session_id: String, lines: i32 },
     /// Close a session (kill child + wait).
     CloseSession { session_id: String },
     /// List all sessions.
@@ -262,6 +264,16 @@ mod tests {
                 assert_eq!(data, b"a\nb");
             }
             other => panic!("expected Pty(PasteSession), got {:?}", other),
+        }
+
+        let json = r#"{"method":"ScrollSession","params":{"session_id":"abc","lines":-12}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Pty(PtyRequest::ScrollSession { session_id, lines }) => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(lines, -12);
+            }
+            other => panic!("expected Pty(ScrollSession), got {:?}", other),
         }
 
         // 非 PTY 请求不受影响

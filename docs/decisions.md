@@ -991,3 +991,31 @@ GUI 实测发现：把多行剪贴板直接走 `SessionInput` 会让 shell 逐�
 GUI 收到新尺寸时先重建 `ClientGrid`，daemon 随后在同一个请求中同时执行
 `Term::resize` 与 PTY ioctl。scale 变化时先用同公式的保守值，渲染器给出真实度量后
 下一帧自动校正，避免 Retina/跨显示器时逻辑像素与物理像素混用。
+
+## M2b-3 终端标签状态归属（2026-08-08）
+
+终端标签与 PTY 是一对一关系，状态存放在 `VidaApp.terminal_sessions`，key 使用稳定的
+tab id。`TabKind::Terminal` 保存当前 session id；daemon 重启后替代会话可以更新
+session id，而标签身份和用户所在位置不变。`Screen` 只保留连接、解锁、冲突等顶层
+流程，不再用 `Screen::Terminal` 覆盖整个主界面。
+
+推送订阅按所有打开的终端会话建立，帧和 `session_closed` 事件按 session id 查找目标
+状态；人的输入、粘贴和 resize 则只取当前活动 tab。两条路由必须分开：若把推送也只
+交给当前 tab，后台命令输出会丢失；若把输入按最后收到帧的 session 路由，人在快速
+切换标签时可能把命令写进错误主机。
+
+关闭标签通过现有有序发送队列提交 `CloseSession`，保证此前的人类按键先到达 daemon；
+锁库先关闭所有终端标签再发送 `Lock`。M3 接入 SSH 时应复用这套标签/订阅/关闭模型，
+只替换 daemon 的会话打开方式，不另建第二套远程终端 UI 状态。
+
+### 鼠标选择、回滚与右键菜单
+
+回滚历史继续只由 daemon 的 alacritty `Term` 持有。GUI 滚轮发送 `ScrollSession`，daemon
+改变真实 `display_offset` 后通过现有推送通道发送当前 viewport 全量帧；因此 GUI 仍只
+保存可见网格，多个标签不会各自复制设置中的全部回滚行。人在历史中阅读时新输出沿用
+alacritty 的锚定语义，键盘输入或粘贴前由同一有序队列先回到底部。
+
+选择状态只属于终端 widget，不进入 daemon，也不进入日志。跨行复制跳过宽字符 spacer
+并清除行尾未选中的填充空格。右键菜单由 iced canvas 使用 Vida 的深色表面绘制，复制
+直接写系统剪贴板，粘贴仍发布 `TerminalPaste` 并由 daemon 查询真实 bracketed-paste
+模式；右键菜单不能绕过人的输入路径或把剪贴板内容交给 AI。

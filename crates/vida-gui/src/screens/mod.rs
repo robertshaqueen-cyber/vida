@@ -23,6 +23,7 @@ use crate::app::AppMessage;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TabKind {
     Host { host_id: String },
+    Terminal { session_id: String, number: u32 },
     AddHost,
     EditHost { host_id: String },
     Settings,
@@ -67,6 +68,14 @@ impl Tab {
             kind: TabKind::Settings,
         }
     }
+
+    pub fn terminal(session_id: String, number: u32, name: String) -> Self {
+        Self {
+            id: format!("terminal:{session_id}"),
+            name,
+            kind: TabKind::Terminal { session_id, number },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -82,8 +91,6 @@ pub enum Screen {
     Conflict(s6_conflict::State),
     ConflictFile(s7_conflict_file::State),
     RemoteMissing(s8_remote_missing::State),
-    /// 可交互调试终端（M2b-2，M2b-3 起并入标签页体系）。
-    Terminal(s_terminal::TerminalSession),
 }
 
 impl Screen {
@@ -96,9 +103,6 @@ impl Screen {
             Screen::Conflict(s) => s.view(i18n),
             Screen::ConflictFile(s) => s.view(i18n),
             Screen::RemoteMissing(s) => s.view(i18n),
-            // Terminal 屏不走统一 view（需要 app 级的 ws_client/订阅），
-            // 在 app::view 里单独渲染。
-            Screen::Terminal(s) => s.view(),
         }
     }
 }

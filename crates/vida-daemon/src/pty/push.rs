@@ -187,9 +187,10 @@ fn encode_color(buf: &mut Vec<u8>, color: &ColorSpec) {
 
 pub fn build_full_frame(term: &Term<alacritty_terminal::event::VoidListener>, seq: u64) -> Frame {
     let rows: usize = term.grid().screen_lines();
+    let display_offset = term.grid().display_offset() as i32;
     let mut lines: Vec<DirtyLine> = Vec::new();
     for row in 0..rows {
-        if let Some(line) = build_dirty_line_full(term, row as u16) {
+        if let Some(line) = build_dirty_line_full(term, row as u16, row as i32 - display_offset) {
             lines.push(line);
         }
     }
@@ -198,7 +199,7 @@ pub fn build_full_frame(term: &Term<alacritty_terminal::event::VoidListener>, se
         seq,
         cursor_row: cursor.line.0 as u16,
         cursor_col: cursor.column.0 as u16,
-        cursor_visible: true,
+        cursor_visible: display_offset == 0,
         lines,
     }
 }
@@ -235,15 +236,26 @@ pub fn build_partial_frame(
 
 fn build_dirty_line_full(
     term: &Term<alacritty_terminal::event::VoidListener>,
-    row: u16,
+    viewport_row: u16,
+    grid_line: i32,
 ) -> Option<DirtyLine> {
     let cols: usize = term.grid().columns();
-    build_dirty_line_range(term, row, 0, cols as u16 - 1)
+    build_dirty_line_range_at(term, viewport_row, grid_line, 0, cols as u16 - 1)
 }
 
 fn build_dirty_line_range(
     term: &Term<alacritty_terminal::event::VoidListener>,
     row: u16,
+    start_col: u16,
+    end_col: u16,
+) -> Option<DirtyLine> {
+    build_dirty_line_range_at(term, row, row as i32, start_col, end_col)
+}
+
+fn build_dirty_line_range_at(
+    term: &Term<alacritty_terminal::event::VoidListener>,
+    viewport_row: u16,
+    grid_line: i32,
     start_col: u16,
     end_col: u16,
 ) -> Option<DirtyLine> {
@@ -253,7 +265,7 @@ fn build_dirty_line_range(
     let mut last_col: u16 = start_col;
     let mut col: u16 = start_col;
     while col <= end_col {
-        let point: Point = Point::new(Line(row as i32), Column(col as usize));
+        let point: Point = Point::new(Line(grid_line), Column(col as usize));
         let cell = &term.grid()[point];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             col += 1;
@@ -301,7 +313,7 @@ fn build_dirty_line_range(
         return None;
     }
     Some(DirtyLine {
-        row,
+        row: viewport_row,
         start_col: first_col.unwrap_or(start_col),
         end_col: last_col,
         runs,
@@ -471,6 +483,38 @@ pub struct PushPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::{Dimensions, Scroll};
+    use alacritty_terminal::term::Config;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    struct TestSize {
+        cols: usize,
+        rows: usize,
+    }
+
+    impl Dimensions for TestSize {
+        fn total_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
+    fn frame_text(frame: &Frame) -> String {
+        frame
+            .lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .flat_map(|run| std::iter::repeat_n(run.char, run.len as usize))
+            .collect()
+    }
 
     #[test]
     fn bounded_sender_drop_oldest() {
@@ -533,6 +577,32 @@ mod tests {
         assert_eq!(
             encode_color_spec(&Color::Named(NamedColor::Foreground)),
             ColorSpec::Default
+        );
+    }
+
+    #[test]
+    fn full_frame_uses_scrollback_viewport_and_hides_cursor() {
+        let config = Config {
+            scrolling_history: 100,
+            ..Config::default()
+        };
+        let mut term: Term<VoidListener> =
+            Term::new(config, &TestSize { cols: 12, rows: 3 }, VoidListener);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        processor.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+        let bottom = build_full_frame(&term, 1);
+        assert!(bottom.cursor_visible);
+        assert!(frame_text(&bottom).contains("five"));
+
+        term.scroll_display(Scroll::Delta(1));
+        let scrolled = build_full_frame(&term, 2);
+        let text = frame_text(&scrolled);
+        assert!(!scrolled.cursor_visible);
+        assert!(text.contains("four"), "回滚视图应包含较早输出: {text:?}");
+        assert!(
+            !text.contains("five"),
+            "回滚一行后不应仍显示底部行: {text:?}"
         );
     }
 
