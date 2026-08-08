@@ -16,15 +16,18 @@ use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
+#[cfg(not(target_os = "macos"))]
 use font_kit::canvas::{Canvas as FontCanvas, Format, RasterizationOptions};
 use font_kit::family_name::FamilyName;
 use font_kit::font::Font as NativeFont;
+#[cfg(not(target_os = "macos"))]
 use font_kit::hinting::HintingOptions;
 use font_kit::properties::{Properties, Weight as NativeWeight};
 use font_kit::source::SystemSource;
 use iced::Rectangle;
 use iced_graphics::Viewport;
 use iced_wgpu::Primitive as IcedPrimitive;
+#[cfg(not(target_os = "macos"))]
 use pathfinder_geometry::transform2d::Transform2F;
 
 #[cfg(target_os = "macos")]
@@ -32,7 +35,7 @@ use core_foundation::base::{CFRange, TCFType};
 #[cfg(target_os = "macos")]
 use core_foundation::string::{CFString, CFStringRef};
 #[cfg(target_os = "macos")]
-use core_graphics::color_space::CGColorSpace;
+use core_graphics::color_space::{CGColorSpace, kCGColorSpaceLinearGray};
 #[cfg(target_os = "macos")]
 use core_graphics::context::CGContext;
 #[cfg(target_os = "macos")]
@@ -930,37 +933,48 @@ fn native_glyph_bitmap(
         }?;
         return native_fallback_glyph_bitmap(fallback, ch, pixel_size);
     };
-    let transform = Transform2F::default();
-    let bounds = primary
-        .raster_bounds(
-            glyph_id,
+    #[cfg(target_os = "macos")]
+    {
+        core_text_glyph_bitmap(
+            &primary.native_font(),
+            CGGlyph::try_from(glyph_id).ok()?,
             pixel_size,
-            transform,
-            HintingOptions::None,
-            RasterizationOptions::GrayscaleAa,
         )
-        .ok()?;
-    if bounds.width() <= 0 || bounds.height() <= 0 {
-        return None;
     }
-    let mut canvas = FontCanvas::new(bounds.size(), Format::A8);
-    primary
-        .rasterize_glyph(
-            &mut canvas,
-            glyph_id,
-            pixel_size,
-            Transform2F::from_translation(-bounds.origin().to_f32()),
-            HintingOptions::None,
-            RasterizationOptions::GrayscaleAa,
-        )
-        .ok()?;
-    Some(GlyphBitmap {
-        width: bounds.width() as u32,
-        height: bounds.height() as u32,
-        alpha: canvas.pixels,
-        left: bounds.origin_x() as f32,
-        top: -bounds.origin_y() as f32,
-    })
+    #[cfg(not(target_os = "macos"))]
+    {
+        let transform = Transform2F::default();
+        let bounds = primary
+            .raster_bounds(
+                glyph_id,
+                pixel_size,
+                transform,
+                HintingOptions::None,
+                RasterizationOptions::GrayscaleAa,
+            )
+            .ok()?;
+        if bounds.width() <= 0 || bounds.height() <= 0 {
+            return None;
+        }
+        let mut canvas = FontCanvas::new(bounds.size(), Format::A8);
+        primary
+            .rasterize_glyph(
+                &mut canvas,
+                glyph_id,
+                pixel_size,
+                Transform2F::from_translation(-bounds.origin().to_f32()),
+                HintingOptions::None,
+                RasterizationOptions::GrayscaleAa,
+            )
+            .ok()?;
+        Some(GlyphBitmap {
+            width: bounds.width() as u32,
+            height: bounds.height() as u32,
+            alpha: canvas.pixels,
+            left: bounds.origin_x() as f32,
+            top: -bounds.origin_y() as f32,
+        })
+    }
 }
 
 fn swash_glyph_bitmap(
@@ -1149,11 +1163,23 @@ fn native_fallback_glyph_bitmap(
     ch: char,
     pixel_size: f32,
 ) -> Option<GlyphBitmap> {
-    const K_CG_IMAGE_ALPHA_ONLY: u32 = 7;
-
     let raster_size = pixel_size * fallback.size_scale;
     let font = fallback.font.clone_with_font_size(raster_size as f64);
     let glyph_id = core_text_glyph(&font, ch)?;
+    core_text_glyph_bitmap(&font, glyph_id, raster_size)
+}
+
+/// 与 Ghostty 默认 CoreText 路径一致：linearGray、灰度抗锯齿、允许亚像素定位，
+/// 但关闭 font smoothing（Ghostty 的 `font-thicken` 默认也是 false）。
+#[cfg(target_os = "macos")]
+fn core_text_glyph_bitmap(
+    font: &CTFont,
+    glyph_id: CGGlyph,
+    raster_size: f32,
+) -> Option<GlyphBitmap> {
+    const K_CG_IMAGE_ALPHA_ONLY: u32 = 7;
+
+    let font = font.clone_with_font_size(raster_size as f64);
     let rect = font.get_bounding_rects_for_glyphs(kCTFontDefaultOrientation, &[glyph_id]);
     if rect.size.width < 0.25 || rect.size.height < 0.25 {
         return None;
@@ -1172,7 +1198,9 @@ fn native_fallback_glyph_bitmap(
     }
 
     let mut alpha = vec![0u8; (width * height) as usize];
-    let color_space = CGColorSpace::create_device_gray();
+    // SAFETY: CoreGraphics 导出的常量在进程生命周期内有效。
+    let color_space = unsafe { CGColorSpace::create_with_name(kCGColorSpaceLinearGray) }
+        .unwrap_or_else(CGColorSpace::create_device_gray);
     let context = CGContext::create_bitmap_context(
         Some(alpha.as_mut_ptr().cast()),
         width as usize,
@@ -1188,7 +1216,12 @@ fn native_fallback_glyph_bitmap(
         &CGSize::new(width as f64, height as f64),
     ));
     context.set_allows_font_smoothing(true);
-    context.set_should_smooth_fonts(true);
+    context.set_should_smooth_fonts(false);
+    context.set_allows_font_subpixel_positioning(true);
+    context.set_should_subpixel_position_fonts(true);
+    context.set_allows_font_subpixel_quantization(false);
+    context.set_should_subpixel_quantize_fonts(false);
+    context.set_allows_antialiasing(true);
     context.set_should_antialias(true);
     context.set_gray_fill_color(1.0, 1.0);
     font.draw_glyphs(
@@ -1197,12 +1230,67 @@ fn native_fallback_glyph_bitmap(
         context,
     );
 
-    Some(GlyphBitmap {
+    trim_transparent_bitmap(GlyphBitmap {
         width,
         height,
         alpha,
         left: left as f32,
         top: top as f32,
+    })
+}
+
+/// CoreText 的向外取整边界可能多带整行/整列透明像素。对 1px 标点而言，
+/// 空白行会让缩放或窗口合成时的有效覆盖被稀释；上传前收紧到真实遮罩边界。
+fn trim_transparent_bitmap(bitmap: GlyphBitmap) -> Option<GlyphBitmap> {
+    let width = bitmap.width as usize;
+    let height = bitmap.height as usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut found = false;
+    for y in 0..height {
+        for x in 0..width {
+            if bitmap.alpha[y * width + x] == 0 {
+                continue;
+            }
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !found {
+        return None;
+    }
+    let trimmed_width = max_x - min_x + 1;
+    let trimmed_height = max_y - min_y + 1;
+    if trimmed_width == width && trimmed_height == height {
+        return Some(bitmap);
+    }
+    let mut alpha = Vec::with_capacity(trimmed_width * trimmed_height);
+    for y in min_y..=max_y {
+        let start = y * width + min_x;
+        alpha.extend_from_slice(&bitmap.alpha[start..start + trimmed_width]);
+    }
+    // 低 DPI 下单像素横/竖笔画的最大覆盖有时只有约 90%，经过窗口合成后
+    // 会近乎消失。只把这类 1px 遮罩的峰值归一到 255，保留边缘覆盖比例，
+    // 不扩张轮廓，也不影响普通拉丁字母或汉字。
+    if trimmed_width == 1 || trimmed_height == 1 {
+        let peak = alpha.iter().copied().max().unwrap_or_default();
+        if peak > 0 && peak < 255 {
+            for coverage in &mut alpha {
+                *coverage = ((u16::from(*coverage) * 255) / u16::from(peak)) as u8;
+            }
+        }
+    }
+    Some(GlyphBitmap {
+        width: trimmed_width as u32,
+        height: trimmed_height as u32,
+        alpha,
+        left: bitmap.left + min_x as f32,
+        top: bitmap.top - min_y as f32,
     })
 }
 
@@ -1823,6 +1911,13 @@ mod tests {
             .expect("CoreText 应能光栅化 JetBrains Mono A");
         assert!(latin.alpha.iter().any(|alpha| *alpha > 0));
         assert!(latin.alpha.iter().any(|alpha| *alpha > 0 && *alpha < 255));
+        let dash = native_glyph_bitmap(&fonts, '-', cosmic_text::Weight::NORMAL, 13.0)
+            .expect("CoreText 应能光栅化短横");
+        assert!(
+            dash.alpha.iter().copied().max().unwrap_or_default() == 255,
+            "Regular 短横必须有清晰的灰度覆盖，不能在首次输入时近乎消失"
+        );
+        assert_eq!(dash.height, 1, "短横的透明空白行应在上传前裁掉");
 
         let fallback = fonts
             .fallback_regular

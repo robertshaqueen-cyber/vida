@@ -499,8 +499,8 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
   8×10、苹方常规 13×14、中粗 14×14。普通中英文均不人工加深覆盖率；前景
   `#ffffff`、终端背景 `#282c34`。JetBrains Mono 2.304 Regular/Bold 以 OFL-1.1
   随应用分发；字体下拉同时保留系统等宽字体。隔离 release 窗口在 scale=1、输出中英文和 `ls`
-  后，`vmmap --summary` Physical footprint **252.0MB**（峰值 252.8MB）；同机旧版本
-  约 247.9MB，原生中英文栅格化增量约 4.1MB。
+  后，`vmmap --summary` Physical footprint **251.5MB**（峰值 252.2MB）；同机旧版本
+  约 247.9MB，原生中英文栅格化增量约 3.6MB。
 - 增加 500ms 闪烁的实心方块光标；timer 仅在终端屏且用户启用闪烁时存在。
 - WIDE 字符仍推进两个 cell，但按原始字形宽高比绘制，不再横向拉伸中文；
   灰度覆盖率由平台原生光栅器直接产生，不做人工加深。
@@ -509,6 +509,10 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
 - 普通中文由 `PingFangSC-Regular` 绘制，bold 中文由 `PingFangSC-Semibold`
   绘制；CGBitmapContext 的行序直接上传图集，不做二次翻转；字形按原始宽高比绘制，
   不做单轴拉伸。
+- macOS 的中英文 CTFont 均使用 linearGray、灰度抗锯齿与亚像素定位，默认关闭
+  CoreText font smoothing，与 Ghostty `font-thicken=false` 对齐；ANSI 0—15 色使用
+  Ghostty 默认调色板，NamedColor 在 daemon 推帧时保留对应索引。原生遮罩上传前
+  裁掉透明边界，单像素笔画归一化峰值但不扩张轮廓。
 - M2b-2 调试终端仍是临时 Screen；点击真实标签或设置时会先关闭调试会话并恢复
   Main，再执行标签切换，避免 active tab 已变化但终端仍覆盖内容。
 - 自动 GUI 首轮已看到提示符处方块光标；最终字体视觉观感仍以所有者截图验收为准。

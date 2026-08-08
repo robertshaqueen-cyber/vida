@@ -892,6 +892,16 @@ CJK 位图上下界都位于 cell 内。
 图集增量上传测试会把跨行探针写入 GPU 纹理，再复制回 MAP_READ buffer 与 CPU 图集
 逐字节比较；因此本次缺笔已确认不是 atlas 行距、上传范围或 GPU 数据损坏。
 
+第六轮所有者截图指出：输入态 `ls --color` 的 `--` 过暗，且中英文都像粗体、
+缺少平滑抗锯齿。对照本机 Ghostty 1.3.1 的有效配置与 CoreText 源码后确认，
+Ghostty 默认 `font-thicken=false`，使用 `linearGray`、亚像素定位且关闭亚像素量化；
+Vida 此前经 font-kit/自有 CJK 路径把 font smoothing 打开，实际产生了额外加粗。
+macOS 的拉丁与 CJK 现统一走 CTFont 句柄，使用 linearGray 灰度遮罩并关闭 smoothing；
+ANSI 0—15 色同步为 Ghostty 默认调色板，daemon 也不再把 NamedColor 丢成默认白色。
+CoreText 位图上传前裁掉全透明边界；低 DPI 的单像素横/竖笔画只归一化峰值覆盖，
+不扩张轮廓，避免 `-` 首次出现时被窗口合成稀释到近乎不可见。scale=1 发布版
+输出中英文与 `ls --color` 后 Physical footprint 为 251.5MB（峰值 252.2MB）。
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；
