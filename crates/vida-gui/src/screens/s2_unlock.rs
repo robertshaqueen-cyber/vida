@@ -4,16 +4,16 @@ use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
 use crate::secure_text_input::SecureTextInput;
+use crate::ui::{self, icons};
 
 /// ID for the unlock password input, used to focus/select-all after error.
 pub const UNLOCK_PASSPHRASE_ID: &str = "unlock_passphrase";
 
 /// Custom text input style with red border for error state.
 fn error_text_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    // Use default styling but with red border color
-    let mut style = text_input::default(theme, status);
-    style.border.color = iced::Color::from_rgb(0.9, 0.2, 0.2);
-    style.border.width = 2.0;
+    let mut style = ui::input(theme, status);
+    style.border.color = ui::DANGER.scale_alpha(0.72);
+    style.border.width = 1.0;
     style
 }
 
@@ -41,8 +41,15 @@ impl State {
     }
 
     pub fn view(&self, i18n: &I18n) -> Element<'_, AppMessage> {
-        let title = text("vida").size(32);
-        let subtitle = text(i18n.tr("unlock_title")).size(18);
+        let mark = container(icons::icon(icons::LOCK, 23).color(ui::ACCENT))
+            .center_x(52)
+            .center_y(52)
+            .style(ui::accent_badge);
+        let title = text("vida").size(28);
+        let subtitle = ui::muted(i18n.tr("unlock_title")).size(14);
+        let header = row![mark, column![title, subtitle].spacing(3)]
+            .spacing(16)
+            .align_y(iced::Alignment::Center);
 
         // Error styling: red border for input when error exists
         let can_unlock = !self.passphrase.is_empty() && !self.unlocking;
@@ -64,6 +71,7 @@ impl State {
                 SecureTextInput::new(i18n.tr("unlock_passphrase_placeholder"), &self.passphrase)
                     .on_input(AppMessage::UnlockPassphraseChanged)
                     .secure(true)
+                    .style(ui::input)
                     .id(UNLOCK_PASSPHRASE_ID);
             if can_unlock {
                 input.on_submit(AppMessage::UnlockVault)
@@ -83,9 +91,11 @@ impl State {
         };
 
         let unlock_btn = if can_unlock {
-            unlock_btn.on_press(AppMessage::UnlockVault)
+            unlock_btn
+                .on_press(AppMessage::UnlockVault)
+                .style(ui::primary_button)
         } else {
-            unlock_btn.style(button::secondary)
+            unlock_btn.style(ui::primary_button)
         };
 
         // Inline unlock button with input row
@@ -113,23 +123,18 @@ impl State {
         // placing the error text in a row with a trailing spacer whose width
         // mirrors the unlock button — same structure as input_row, so the
         // text portion naturally aligns with the input.
-        let error_text = text(error_msg).size(12);
+        let error_content = row![
+            icons::icon(icons::CIRCLE_ALERT, 14).color(ui::DANGER_TEXT),
+            text(error_msg).size(12),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
         let error_slot: Element<'_, AppMessage> = if self.toast_visible {
             row![
-                container(error_text)
+                container(error_content)
                     .width(Length::Fill)
-                    .padding(iced::Padding::from([8, 10]))
-                    .style(|_theme: &Theme| container::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgba(
-                            0.15, 0.08, 0.08, 1.0,
-                        ))),
-                        border: iced::Border {
-                            color: iced::Color::from_rgb(0.9, 0.2, 0.2),
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    }),
+                    .padding(iced::Padding::from([9, 11]))
+                    .style(ui::error_notice),
                 // Spacer matching unlock button width + spacing, so the
                 // error container stops at the input's right edge.
                 text("").width(Length::Fixed(80.0)),
@@ -146,16 +151,21 @@ impl State {
         };
 
         // Main centered content — error_slot sits between input and checkbox
-        let main_content = column![title, subtitle, input_row, error_slot, remember_check,]
-            .spacing(10)
-            .padding(40)
-            .max_width(400);
+        let main_content = container(
+            column![header, input_row, error_slot, remember_check,]
+                .spacing(12)
+                .width(Length::Fill),
+        )
+        .padding(26)
+        .width(520)
+        .style(ui::elevated);
 
         container(main_content)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(ui::app_background)
             .into()
     }
 }

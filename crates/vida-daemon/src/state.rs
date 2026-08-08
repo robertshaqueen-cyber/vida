@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use secrecy::SecretString;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 use vida_core::config;
 use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
 use vida_core::vault::{AuthMethod, Settings, Vault};
@@ -103,6 +104,69 @@ impl DaemonState {
             None => self.ensure_passphrase()?.to_string(),
         };
         vida_core::vault::encrypt(vault, &p)
+    }
+
+    /// Decrypt a backup for confirmation without mutating current state.
+    pub fn preview_backup(
+        &self,
+        data: &[u8],
+        passphrase: &str,
+    ) -> Result<(usize, i64, Vec<String>)> {
+        let vault = vida_core::vault::decrypt(data, passphrase)
+            .context("无法打开备份：口令错误或文件已损坏")?;
+        let host_names = vault.hosts.iter().map(|host| host.name.clone()).collect();
+        Ok((vault.hosts.len(), vault.modified_at, host_names))
+    }
+
+    /// Restore a backup using its own passphrase as the new vault passphrase.
+    /// Validation completes before any on-disk state is changed. `save_vault`
+    /// rotates the current vault and then performs an atomic replacement.
+    pub fn restore_backup(
+        &mut self,
+        data: &[u8],
+        passphrase: &str,
+    ) -> Result<(Vec<HostSummary>, Option<String>)> {
+        let restored = vida_core::vault::decrypt(data, passphrase)
+            .context("无法恢复备份：口令错误或文件已损坏")?;
+
+        let secret = SecretString::from(passphrase.to_string());
+        vida_core::persist::save_vault(&restored, &secret, &self.vault_path)
+            .context("无法写入恢复后的金库，当前金库仍保留在轮转备份中")?;
+
+        let hosts = restored.hosts.iter().map(host_to_summary).collect();
+        self.vault = Some(restored);
+        self.passphrase = Some(passphrase.to_string());
+
+        // A sync baseline belongs to the previous vault. Clear it only after
+        // the atomic replacement succeeds. If cleanup fails, keep sync off so
+        // stale state can never be applied to the restored vault.
+        let sync_state_path = vida_core::config::config_dir()?.join("sync_state.json");
+        let sync_state_cleared = !sync_state_path.exists()
+            || match std::fs::remove_file(&sync_state_path) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        "Vault restored but old sync state cleanup failed: {}",
+                        error
+                    );
+                    false
+                }
+            };
+        let sync_warning = if !sync_state_cleared {
+            self.sync = None;
+            Some(
+                "金库已恢复，但旧同步状态未能清除；同步已停用，请在设置中重新选择同步目录。"
+                    .to_string(),
+            )
+        } else if let Err(error) = self.init_sync() {
+            self.sync = None;
+            warn!("Vault restored but sync initialization failed: {}", error);
+            Some("金库已恢复，但同步未能初始化；请在设置中重新检查同步目录。".to_string())
+        } else {
+            None
+        };
+        info!("Vault restored from encrypted backup");
+        Ok((hosts, sync_warning))
     }
 
     fn init_sync(&mut self) -> Result<()> {

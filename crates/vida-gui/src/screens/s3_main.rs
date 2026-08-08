@@ -1,9 +1,10 @@
-use iced::widget::{button, column, container, row, rule, text, tooltip};
-use iced::{Element, Length};
+use iced::widget::{Space, button, column, container, row, rule, scrollable, text, tooltip};
+use iced::{Alignment, Element, Length};
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
-use crate::screens::Tab;
+use crate::screens::{Tab, TabKind};
+use crate::ui::{self, icons};
 
 #[derive(Debug, Clone)]
 pub struct HostItem {
@@ -39,120 +40,156 @@ impl State {
         sync_symbol: &'static str,
         sync_label: String,
     ) -> Element<'a, AppMessage> {
-        // Tab buttons: text-only, active tab has bottom indicator, with X close button
+        // Compact chips follow the Oryxis-style 40 px chrome rhythm while
+        // keeping Vida's existing independent close action.
         let tab_buttons: Vec<Element<'a, AppMessage>> = tabs
             .iter()
             .map(|tab| {
-                let label = text(&tab.name).size(13);
+                let glyph = match tab.kind {
+                    TabKind::Host { .. } => icons::SERVER,
+                    TabKind::AddHost => icons::CIRCLE_PLUS,
+                    TabKind::EditHost { .. } => icons::PENCIL,
+                    TabKind::Settings => icons::SETTINGS,
+                };
+                let is_active = tab.id == active_tab_id;
+                let label = row![
+                    icons::icon(glyph, 14).color(if is_active {
+                        ui::ACCENT
+                    } else {
+                        ui::TEXT_MUTED
+                    }),
+                    text(&tab.name).size(13),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center);
+                let switch_btn = button(label)
+                    .on_press(AppMessage::SwitchTab(tab.id.clone()))
+                    .style(ui::tab(is_active))
+                    .padding([7, 9]);
                 let close_btn = tooltip(
-                    button(text("×").size(14))
+                    button(icons::icon(icons::X, 12))
                         .on_press(AppMessage::CloseTab(tab.id.clone()))
-                        .style(button::text),
+                        .style(ui::icon_button(false))
+                        .padding(7),
                     i18n.tr("main_tab_close"),
                     tooltip::Position::Bottom,
                 );
-                let tab_content = row![label, close_btn]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center);
-                let is_active = tab.id == active_tab_id;
-                let btn = button(tab_content)
-                    .on_press(AppMessage::SwitchTab(tab.id.clone()))
-                    .style(button::text)
-                    .width(Length::Shrink);
-                if is_active {
-                    container(column![btn, rule::horizontal(2),])
-                        .width(Length::Shrink)
-                        .into()
-                } else {
-                    btn.into()
-                }
+                container(
+                    row![switch_btn, close_btn]
+                        .spacing(0)
+                        .align_y(Alignment::Center),
+                )
+                .style(ui::tab_surface(is_active))
+                .height(36)
+                .into()
             })
             .collect();
 
-        let tabs_row = row(tab_buttons).spacing(0).align_y(iced::Alignment::Center);
+        let home_badge = container(icons::icon(icons::HOUSE, 16).color(ui::ACCENT))
+            .center_x(34)
+            .center_y(34)
+            .style(ui::accent_badge);
+
+        let tabs_row = row(tab_buttons).spacing(2).align_y(Alignment::Center);
+        let tabs_scroll = scrollable(tabs_row)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            ))
+            .width(Length::Fill)
+            .height(36);
 
         let add_btn = tooltip(
-            button(text("+").size(16))
+            button(icons::icon(icons::PLUS, 16))
                 .on_press(AppMessage::OpenAddHostTab)
-                .style(button::text),
+                .style(ui::icon_button(false))
+                .padding(9),
             i18n.tr("main_tab_add"),
             tooltip::Position::Bottom,
         );
 
         // Stacked/expand button for quick connect panel
         let connect_panel_btn = tooltip(
-            button(text("⊞").size(14))
+            button(icons::icon(icons::PANEL_LEFT, 16))
                 .on_press(AppMessage::ToggleConnectPanel)
-                .style(if show_connect_panel {
-                    button::secondary
-                } else {
-                    button::text
-                }),
+                .style(ui::icon_button(show_connect_panel))
+                .padding(9),
             i18n.tr("main_tab_connect"),
             tooltip::Position::Bottom,
         );
 
         // 调试终端入口（M2b-2 可交互终端）
         let debug_term_btn = tooltip(
-            button(text("▮_").size(14))
+            button(icons::icon(icons::TERMINAL, 16))
                 .on_press(AppMessage::OpenDebugTerminal)
-                .style(button::text),
+                .style(ui::icon_button(false))
+                .padding(9),
             "调试终端 (M2b-2)",
             tooltip::Position::Bottom,
         );
 
-        // Left side: tabs + add button + connect panel button + debug terminal
-        let left_side = row![tabs_row, add_btn, connect_panel_btn, debug_term_btn]
-            .spacing(4)
-            .align_y(iced::Alignment::Center);
-
         // Right side: settings gear + lock
         let settings_btn = tooltip(
-            button(text("⚙").size(16))
+            button(icons::icon(icons::SETTINGS, 16))
                 .on_press(AppMessage::OpenSettingsTab)
-                .style(button::text),
+                .style(ui::icon_button(false))
+                .padding(9),
             i18n.tr("main_tab_settings"),
             tooltip::Position::Bottom,
         );
         let lock_btn = tooltip(
-            button(text("🔒").size(14))
+            button(icons::icon(icons::LOCK, 16))
                 .on_press(AppMessage::LockVault)
-                .style(button::text),
+                .style(ui::icon_button(false))
+                .padding(9),
             i18n.tr("main_tab_lock"),
             tooltip::Position::Bottom,
         );
         // Sync indicator: always sends SyncTriggered on click.
         // Daemon returns real state (including sync_not_configured).
+        let sync_glyph = match sync_symbol {
+            "✓" => icons::CIRCLE_CHECK,
+            "▲" | "✗" => icons::CIRCLE_ALERT,
+            _ => icons::REFRESH,
+        };
+        let sync_active = sync_symbol == "⟳" || sync_symbol == "▲";
         let sync_btn = tooltip(
-            button(text(sync_symbol).size(14))
+            button(icons::icon(sync_glyph, 16))
                 .on_press(AppMessage::SyncTriggered)
-                .style(if sync_symbol == "⟳" || sync_symbol == "▲" {
-                    button::secondary
-                } else {
-                    button::text
-                }),
+                .style(ui::icon_button(sync_active))
+                .padding(9),
             text(sync_label),
             tooltip::Position::Bottom,
         );
 
         let right_buttons = row![sync_btn, settings_btn, lock_btn]
-            .spacing(4)
-            .align_y(iced::Alignment::Center);
+            .spacing(2)
+            .align_y(Alignment::Center);
 
         // Full tab bar: left | spacer | right
         let tab_bar = row![
-            left_side,
-            container(text("")).width(Length::Fill),
+            home_badge,
+            tabs_scroll,
+            add_btn,
+            connect_panel_btn,
+            debug_term_btn,
             right_buttons,
         ]
-        .spacing(0)
+        .spacing(4)
         .align_y(iced::Alignment::Center)
         .width(Length::Fill);
 
-        container(tab_bar)
-            .padding(iced::padding::Padding::new(8.0).horizontal(12.0))
-            .width(Length::Fill)
-            .into()
+        column![
+            container(tab_bar)
+                .padding(iced::padding::Padding::new(5.0).horizontal(8.0))
+                .height(46)
+                .width(Length::Fill)
+                .style(ui::chrome),
+            container(Space::new())
+                .height(1)
+                .width(Length::Fill)
+                .style(|_| { container::Style::default().background(ui::ACCENT) }),
+        ]
+        .into()
     }
 
     pub fn view_connect_panel<'a>(
@@ -166,6 +203,8 @@ impl State {
         let search_input = text_input(i18n.tr("main_connect_search"), search)
             .on_input(AppMessage::ConnectPanelSearch)
             .id("connect_panel_search")
+            .style(ui::input)
+            .padding(11)
             .width(Length::Fill);
 
         let mut items: Vec<Element<'a, AppMessage>> = Vec::new();
@@ -176,10 +215,20 @@ impl State {
         let mut recent_items: Vec<Element<'a, AppMessage>> = Vec::new();
         for host_id in recent_ids.iter() {
             if let Some(host) = hosts.iter().find(|h| &h.id == host_id) {
-                let label = text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(13);
+                let label = row![
+                    icons::icon(icons::HISTORY, 14).color(ui::TEXT_MUTED),
+                    column![
+                        text(&host.name).size(13),
+                        ui::muted(format!("{}@{}", host.user, host.host)).size(11),
+                    ]
+                    .spacing(2)
+                ]
+                .spacing(9)
+                .align_y(Alignment::Center);
                 let item = button(label)
                     .on_press(AppMessage::QuickConnectHost(host.id.clone()))
-                    .style(button::text)
+                    .style(ui::nav_item(false))
+                    .padding(8)
                     .width(Length::Fill);
                 recent_items.push(item.into());
             }
@@ -207,11 +256,20 @@ impl State {
             let host_items: Vec<Element<'a, AppMessage>> = filtered
                 .iter()
                 .map(|host| {
-                    let label =
-                        text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(13);
+                    let label = row![
+                        icons::icon(icons::SERVER, 14).color(ui::TEXT_MUTED),
+                        column![
+                            text(&host.name).size(13),
+                            ui::muted(format!("{}@{}", host.user, host.host)).size(11),
+                        ]
+                        .spacing(2)
+                    ]
+                    .spacing(9)
+                    .align_y(Alignment::Center);
                     button(label)
                         .on_press(AppMessage::QuickConnectHost(host.id.clone()))
-                        .style(button::text)
+                        .style(ui::nav_item(false))
+                        .padding(8)
                         .width(Length::Fill)
                         .into()
                 })
@@ -222,16 +280,26 @@ impl State {
         // Add host button
         items.push(rule::horizontal(1).into());
         items.push(
-            button(text(i18n.tr("main_connect_add")).size(13))
-                .on_press(AppMessage::QuickAddHost)
-                .style(button::text)
-                .width(Length::Fill)
-                .into(),
+            button(
+                row![
+                    icons::icon(icons::PLUS, 14),
+                    text(i18n.tr("main_connect_add")).size(13),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .on_press(AppMessage::QuickAddHost)
+            .style(ui::primary_button)
+            .padding([9, 12])
+            .width(Length::Fill)
+            .into(),
         );
 
-        let panel = column(items).spacing(4).padding(8).width(Length::Fill);
-
-        container(panel).padding(4).into()
+        column(items)
+            .spacing(6)
+            .padding(10)
+            .width(Length::Fill)
+            .into()
     }
 
     pub fn view_host_detail<'a>(
@@ -241,24 +309,85 @@ impl State {
         i18n: &'a I18n,
     ) -> Element<'a, AppMessage> {
         if let Some(host) = hosts.iter().find(|h| h.id == host_id) {
-            let name = text(&host.name).size(24);
-            let conn = text(format!("{}@{}:{}", host.user, host.host, host.port)).size(14);
-            let auth = text(i18n.trf("main_auth_kind", &[&host.auth_kind])).size(14);
+            let identity = row![
+                container(icons::icon(icons::SERVER, 22).color(ui::ACCENT))
+                    .center_x(48)
+                    .center_y(48)
+                    .style(ui::accent_badge),
+                column![
+                    text(&host.name).size(24),
+                    ui::muted(format!("{}@{}:{}", host.user, host.host, host.port)).size(13),
+                ]
+                .spacing(4),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center);
 
-            let edit_btn =
-                button(i18n.tr("main_edit")).on_press(AppMessage::EditHost(host.id.clone()));
-            let reveal_btn = button(i18n.tr("main_reveal_credential"))
-                .on_press(AppMessage::RevealCredential(host.id.clone()));
-            let delete_btn = button(i18n.tr("main_delete"))
-                .on_press(AppMessage::DeleteHostConfirm(host.id.clone()));
+            let edit_btn = button(
+                row![
+                    icons::icon(icons::PENCIL, 14),
+                    text(i18n.tr("main_edit")).size(13),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .on_press(AppMessage::EditHost(host.id.clone()))
+            .style(ui::primary_button)
+            .padding([9, 12]);
+            let reveal_btn = button(
+                row![
+                    icons::icon(icons::EYE, 14),
+                    text(i18n.tr("main_reveal_credential")).size(13),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .on_press(AppMessage::RevealCredential(host.id.clone()))
+            .style(ui::secondary_button)
+            .padding([9, 12]);
+            let delete_btn = button(
+                row![
+                    icons::icon(icons::TRASH, 14),
+                    text(i18n.tr("main_delete")).size(13),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .on_press(AppMessage::DeleteHostConfirm(host.id.clone()))
+            .style(ui::danger_button)
+            .padding([9, 12]);
 
-            let notes = match &host.notes {
-                Some(n) if !n.is_empty() => text(n).size(13),
-                _ => text("").size(13),
+            let header = container(
+                row![
+                    identity,
+                    Space::new().width(Length::Fill),
+                    row![edit_btn, reveal_btn, delete_btn].spacing(8),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .padding(18)
+            .width(Length::Fill)
+            .style(ui::surface);
+
+            let group = host
+                .group
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .unwrap_or("—");
+            let tags = if host.tags.is_empty() {
+                "—".to_string()
+            } else {
+                host.tags.join(" · ")
             };
+            let info = row![
+                info_card(icons::KEY, i18n.trf("main_auth_kind", &[&host.auth_kind])),
+                info_card(icons::FOLDER, group.to_string()),
+                info_card(icons::DATABASE, tags),
+            ]
+            .spacing(12)
+            .width(Length::Fill);
 
-            let mut detail_items: Vec<Element<'_, AppMessage>> =
-                vec![name.into(), conn.into(), auth.into()];
+            let mut detail_items: Vec<Element<'_, AppMessage>> = vec![header.into(), info.into()];
 
             // Revealed credential block: plaintext + copy button, auto-hides in 15s.
             // Only shown when the revealed credential belongs to THIS host, so
@@ -269,33 +398,81 @@ impl State {
                 .filter(|(revealed_host_id, _)| revealed_host_id == host_id)
                 .map(|(_, cred)| cred);
             if let Some(cred) = revealed_for_this_host {
-                let cred_label = text(i18n.tr("main_credential_revealed")).size(12);
+                let cred_label = ui::muted(i18n.tr("main_credential_revealed")).size(12);
                 let cred_value = text(cred.as_str()).size(14);
-                let copy_btn = button(i18n.tr("main_credential_copy"))
-                    .on_press(AppMessage::CopyCredential(cred.clone()))
-                    .width(Length::Shrink);
+                let copy_btn = button(
+                    row![
+                        icons::icon(icons::COPY, 13),
+                        text(i18n.tr("main_credential_copy")).size(12),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(AppMessage::CopyCredential(cred.clone()))
+                .style(ui::secondary_button)
+                .padding([7, 10])
+                .width(Length::Shrink);
                 let mut cred_row = row![cred_value, copy_btn]
                     .spacing(12)
                     .align_y(iced::Alignment::Center);
                 if self.credential_copied {
                     cred_row = cred_row.push(text(i18n.tr("main_credential_copied")).size(12));
                 }
-                detail_items.push(cred_label.into());
-                detail_items.push(cred_row.into());
-                detail_items.push(text(i18n.tr("main_credential_auto_hide")).size(11).into());
+                let credential_card = container(
+                    column![
+                        cred_label,
+                        cred_row,
+                        ui::muted(i18n.tr("main_credential_auto_hide")).size(11),
+                    ]
+                    .spacing(8),
+                )
+                .padding(16)
+                .width(Length::Fill)
+                .style(ui::surface);
+                detail_items.push(credential_card.into());
             }
 
-            detail_items.push(column![row![edit_btn, reveal_btn, delete_btn].spacing(12)].into());
-            detail_items.push(notes.into());
+            if let Some(notes) = host.notes.as_deref().filter(|value| !value.is_empty()) {
+                detail_items.push(
+                    container(
+                        column![
+                            ui::muted(i18n.tr("editor_notes")).size(12),
+                            text(notes).size(13),
+                        ]
+                        .spacing(8),
+                    )
+                    .padding(16)
+                    .width(Length::Fill)
+                    .style(ui::surface)
+                    .into(),
+                );
+            }
 
-            let detail = column(detail_items).spacing(12).padding(20);
+            let detail = column(detail_items).spacing(14).padding(24).max_width(1060);
 
             container(detail)
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .center_x(Length::Fill)
+                .style(ui::app_background)
                 .into()
         } else {
             text(i18n.tr("main_host_not_found")).into()
         }
     }
+}
+
+fn info_card<'a>(glyph: &'static str, value: String) -> Element<'a, AppMessage> {
+    container(
+        row![
+            icons::icon(glyph, 16).color(ui::ACCENT),
+            text(value).size(13),
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+    )
+    .padding(14)
+    .width(Length::FillPortion(1))
+    .style(ui::surface)
+    .into()
 }
