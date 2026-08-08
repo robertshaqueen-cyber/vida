@@ -1,12 +1,10 @@
-//! 调试终端屏（M2b-2）：显示并操作一个本地会话。
-//!
-//! 本轮不接标签页/连接面板/启动流程（M2b-3 才做）——
-//! 通过 VidaApp 的 debug 入口进入；点击真实标签时退出此临时屏。
+//! 正式终端标签内容（M2b-3）：显示并操作一个本地会话。
 
 use std::sync::Arc;
 
-use iced::widget::{Space, button, column, container, row, text};
+use iced::widget::{Space, column, container, row, text};
 use iced::{Alignment, Background, Color, Element, Length};
+use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
 use crate::term::client_grid::ClientGrid;
@@ -14,7 +12,7 @@ use crate::term::primitive::{TerminalAppearance, ViewportMetrics};
 use crate::term::widget;
 use crate::ui::{self, icons};
 
-/// 终端会话状态（调试屏持有）。
+/// 一个正式终端标签持有的会话状态。
 #[derive(Debug, Clone)]
 pub struct TerminalSession {
     pub session_id: String,
@@ -57,27 +55,22 @@ impl TerminalSession {
 
 impl TerminalSession {
     /// 渲染终端画面 + 会话状态栏。
-    pub fn view(&self) -> Element<'_, AppMessage> {
+    pub fn view<'a>(&'a self, i18n: &'a I18n) -> Element<'a, AppMessage> {
         let status = if self.closed {
             let code_text = match self.exit_code {
-                Some(code) => format!("会话已结束（shell 退出，exit_code={}）", code),
-                None => "会话已结束（shell 退出，退出码未知）".to_string(),
+                Some(code) => i18n.trf("terminal_closed_code", &[&code.to_string()]),
+                None => i18n.tr("terminal_closed_unknown").to_string(),
             };
             text(code_text).size(11).color(ui::DANGER)
         } else {
-            ui::muted(format!("会话 {}", self.session_id)).size(11)
+            ui::muted(i18n.trf("terminal_session_status", &[&self.session_id])).size(11)
         };
-        let back = button(icons::icon(icons::X, 14))
-            .on_press(AppMessage::CloseDebugTerminal)
-            .style(ui::icon_button(false))
-            .padding(8);
         let toolbar = container(
             row![
                 icons::icon(icons::TERMINAL, 15).color(ui::ACCENT),
-                text("本地终端").size(13),
+                text(i18n.tr("terminal_local_title")).size(13),
                 Space::new().width(Length::Fill),
                 status,
-                back,
             ]
             .spacing(9)
             .align_y(Alignment::Center),

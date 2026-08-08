@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use iced::{Element, Task};
 use vida_core::i18n::{self, I18n};
 
@@ -59,13 +61,14 @@ pub struct VidaApp {
     /// the clipboard if the current content still matches what we wrote.
     clipboard_guard: Option<(u64, String)>,
     clipboard_token: u64,
-    /// 调试终端的会话 id（M2b-1）。有值时 subscription() 挂起推送接收
-    /// stream；空闲时 recv().await 挂起 → CPU ≈ 0%。
-    debug_terminal_sid: Option<String>,
+    /// 正式终端标签的 UI 状态。key 是稳定 tab id；会话重连后 session_id
+    /// 可以变化，但 tab id 不变。
+    terminal_sessions: HashMap<String, s_terminal::TerminalSession>,
+    terminal_opening: bool,
+    terminal_error: Option<String>,
+    next_terminal_number: u32,
     /// 终端重连冷却（10 秒内最多重连一次，防止 daemon 未恢复时空转）。
     terminal_reconnect_cooldown: Option<std::time::Instant>,
-    /// 进入终端屏时备份的 Main 屏状态（返回时恢复，不丢失主界面状态）。
-    main_state_backup: Option<s3_main::State>,
     /// 当前持久化的终端外观；业务设置不放在 Screen 内。
     terminal_appearance: crate::term::primitive::TerminalAppearance,
 }
@@ -116,26 +119,22 @@ impl SyncState {
 
 #[derive(Debug, Clone)]
 pub enum AppMessage {
-    // Interactive debug terminal (M2b-2)
-    OpenDebugTerminal,
-    CloseDebugTerminal,
+    // Formal local terminal tabs (M2b-3)
+    OpenLocalTerminal,
     TerminalPush(PushMsg),
     /// 订阅建立完成。
     TerminalOpened {
         session_id: String,
     },
     /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
-    TerminalDisconnected,
-    /// 自动重连完成：新连接 + 会话已就绪。notice 为可选提示（如
-    /// 「原会话已结束，已为你打开新终端」）。
+    TerminalDisconnected {
+        session_id: String,
+    },
+    /// 自动重连完成。每个 tuple 是 (旧 session_id, 新 session_id,
+    /// 是否因 daemon 丢失旧会话而创建了替代会话)。
     TerminalReconnected {
         client: WsClient,
-        session_id: String,
-        notice: Option<String>,
-    },
-    /// 原会话已不存在：需要提示用户并新开会话。
-    TerminalSessionLost {
-        client: WsClient,
+        mappings: Vec<(String, String, bool)>,
     },
     /// 自动重连失败（等待冷却后由用户手动重试）。
     TerminalReconnectFailed(String),
@@ -287,9 +286,11 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         cred_hide_token: 0,
         clipboard_guard: None,
         clipboard_token: 0,
-        debug_terminal_sid: None,
+        terminal_sessions: HashMap::new(),
+        terminal_opening: false,
+        terminal_error: None,
+        next_terminal_number: 1,
         terminal_reconnect_cooldown: None,
-        main_state_backup: None,
         terminal_appearance: crate::term::primitive::TerminalAppearance::default(),
     };
 
@@ -339,73 +340,87 @@ impl VidaApp {
     }
 }
 
-/// 退出 M2b-2 的临时调试终端并恢复主界面。
-/// M2b-3 把终端并入正式标签页后删除这条兼容路径。
-fn leave_debug_terminal(app: &mut VidaApp) {
-    if !matches!(app.screen, Screen::Terminal(_)) {
-        return;
-    }
-
-    if let Some(session_id) = app.debug_terminal_sid.take()
-        && let Some(client) = app.ws_client.as_ref()
-    {
-        client.unsubscribe(&session_id);
-        if let Err(error) = client.send_queued(
-            "CloseSession",
-            serde_json::json!({"session_id": session_id}),
-        ) {
-            tracing::warn!("退出调试终端时未能关闭会话：{}", error.message);
-        }
-    }
-    app.terminal_reconnect_cooldown = None;
-    let main_state = app.main_state_backup.take().unwrap_or(s3_main::State {
-        revealed_credential: None,
-        credential_copied: false,
-    });
-    app.screen = Screen::Main(main_state);
+fn active_terminal(app: &VidaApp) -> Option<&s_terminal::TerminalSession> {
+    app.terminal_sessions.get(&app.active_tab_id)
 }
 
-/// 订阅：调试终端活跃时挂起推送接收 stream；启用光标闪烁时另加 500ms tick。
-/// 帧到达 → TerminalPush；推送本身在无数据时 recv().await 挂起。
-/// 连接断开（sender drop）→ recv 返回 None → TerminalDisconnected。
+fn active_terminal_mut(app: &mut VidaApp) -> Option<&mut s_terminal::TerminalSession> {
+    app.terminal_sessions.get_mut(&app.active_tab_id)
+}
+
+/// Close the daemon session owned by a terminal tab. Human input is already
+/// serialized through the client's ordered queue; closing uses the same queue
+/// so no late keystroke can overtake CloseSession.
+fn close_terminal_session(app: &mut VidaApp, tab_id: &str) {
+    let Some(session) = app.terminal_sessions.remove(tab_id) else {
+        return;
+    };
+    if let Some(client) = app.ws_client.as_ref() {
+        client.unsubscribe(&session.session_id);
+        if let Err(error) = client.send_queued(
+            "CloseSession",
+            serde_json::json!({"session_id": session.session_id}),
+        ) {
+            tracing::warn!("关闭终端标签时未能关闭会话：{}", error.message);
+        }
+    }
+}
+
+fn close_all_terminal_sessions(app: &mut VidaApp) {
+    let tab_ids: Vec<String> = app.terminal_sessions.keys().cloned().collect();
+    for tab_id in tab_ids {
+        close_terminal_session(app, &tab_id);
+    }
+    app.tabs
+        .retain(|tab| !matches!(tab.kind, crate::screens::TabKind::Terminal { .. }));
+    app.terminal_reconnect_cooldown = None;
+}
+
+/// Every open terminal tab gets its own push stream. Inactive tabs keep their
+/// grids current without repaint polling; each receiver sleeps in recv().await
+/// when no frame is available. A single 500 ms timer is added only when the
+/// active terminal requests cursor blinking.
 fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     let mut subscriptions = Vec::new();
-    let (Some(ws), Some(sid)) = (app.ws_client.as_ref(), app.debug_terminal_sid.as_ref()) else {
+    let Some(ws) = app.ws_client.as_ref() else {
         return iced::Subscription::none();
     };
-    // data 的 identity = (sid, WsClient 的 Arc 指针)：
-    // 重连（新连接）自动换 identity → iced 重启订阅 stream → 重新 SubscribeSession 拿全量帧。
-    let data = (sid.clone(), ws.clone());
-    subscriptions.push(iced::Subscription::run_with(data, |d| {
-        let sid = d.0.clone();
-        let ws = d.1.clone();
-        // unfold 状态 = (ws, sid, rx)：全部随状态传递，闭包零捕获。
-        // 首次迭代 rx=None → 注册订阅；无推送时 rx.recv().await 挂起 → CPU ≈ 0%。
-        futures_util::stream::unfold(
-            Some((
-                ws,
-                sid,
-                None::<tokio::sync::mpsc::UnboundedReceiver<PushMsg>>,
-            )),
-            |state| async move {
-                let (ws, sid, rx_opt) = state?;
-                let mut rx = match rx_opt {
-                    Some(rx) => rx,
-                    None => ws.subscribe(&sid),
-                };
-                let msg = match rx.recv().await {
-                    Some(msg) => msg,
-                    None => {
-                        // 后台任务断开：通知上层
-                        return Some((AppMessage::TerminalDisconnected, None));
-                    }
-                };
-                Some((AppMessage::TerminalPush(msg), Some((ws, sid, Some(rx)))))
-            },
-        )
-    }));
 
-    if matches!(&app.screen, Screen::Terminal(s) if s.appearance.cursor_blink) {
+    for (tab_id, session) in &app.terminal_sessions {
+        // identity includes stable tab id, current session id, and WsClient's
+        // Arc identity. Reconnect or replacement restarts only the right stream.
+        let data = (tab_id.clone(), session.session_id.clone(), ws.clone());
+        subscriptions.push(iced::Subscription::run_with(data, |d| {
+            let sid = d.1.clone();
+            let ws = d.2.clone();
+            futures_util::stream::unfold(
+                Some((
+                    ws,
+                    sid,
+                    None::<tokio::sync::mpsc::UnboundedReceiver<PushMsg>>,
+                )),
+                |state| async move {
+                    let (ws, sid, rx_opt) = state?;
+                    let mut rx = match rx_opt {
+                        Some(rx) => rx,
+                        None => ws.subscribe(&sid),
+                    };
+                    let msg = match rx.recv().await {
+                        Some(msg) => msg,
+                        None => {
+                            return Some((
+                                AppMessage::TerminalDisconnected { session_id: sid },
+                                None,
+                            ));
+                        }
+                    };
+                    Some((AppMessage::TerminalPush(msg), Some((ws, sid, Some(rx)))))
+                },
+            )
+        }));
+    }
+
+    if active_terminal(app).is_some_and(|session| session.appearance.cursor_blink) {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(500))
                 .map(|_| AppMessage::TerminalCursorBlink),
@@ -413,21 +428,6 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     }
 
     iced::Subscription::batch(subscriptions)
-}
-
-/// 重连成功后恢复会话尺寸（从断线前的 grid 快照）。
-fn old_rows_or_default(app: &VidaApp) -> u16 {
-    match &app.screen {
-        Screen::Terminal(s) => s.grid.rows,
-        _ => 40,
-    }
-}
-
-fn old_cols_or_default(app: &VidaApp) -> u16 {
-    match &app.screen {
-        Screen::Terminal(s) => s.grid.cols,
-        _ => 100,
-    }
 }
 
 /// 打开本地会话并订阅推送，返回 session_id。
@@ -654,9 +654,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- Tab management ----
         AppMessage::SwitchTab(tab_id) => {
-            // 调试终端还不是正式 tab；点击任一真实 tab 时先退出临时屏，
-            // 否则 active_tab_id 虽变化，最上层仍会继续渲染终端。
-            leave_debug_terminal(app);
             app.active_tab_id = tab_id;
             // Invalidate any pending credential-hide timer and clear the
             // revealed credential: it belongs to the previous host.
@@ -665,7 +662,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 s.revealed_credential = None;
                 s.credential_copied = false;
             }
-            Task::none()
+            if active_terminal(app).is_some() {
+                iced::widget::operation::focus::<AppMessage>(crate::term::widget::id())
+            } else {
+                Task::none()
+            }
         }
         AppMessage::OpenAddHostTab => {
             // Add a new "新增主机" tab if not already present
@@ -679,7 +680,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::OpenSettingsTab => {
-            leave_debug_terminal(app);
             // Add settings tab if not already present, or switch to it
             let existing = app.tabs.iter().find(|t| t.id == "settings");
             if existing.is_none() {
@@ -704,9 +704,18 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
         }
         AppMessage::CloseTab(tab_id) => {
+            let closed_position = app.tabs.iter().position(|tab| tab.id == tab_id);
+            close_terminal_session(app, &tab_id);
             app.tabs.retain(|t| t.id != tab_id);
             if app.active_tab_id == tab_id {
-                app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
+                app.active_tab_id = closed_position
+                    .and_then(|position| {
+                        let next = position.min(app.tabs.len().saturating_sub(1));
+                        app.tabs.get(next)
+                    })
+                    .or_else(|| app.tabs.first())
+                    .map(|tab| tab.id.clone())
+                    .unwrap_or_default();
             }
             Task::none()
         }
@@ -1220,6 +1229,14 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         AppMessage::LockVault => {
             let client = app.ws_client.as_ref().unwrap().clone();
+            close_all_terminal_sessions(app);
+            if !app.tabs.iter().any(|tab| tab.id == app.active_tab_id) {
+                app.active_tab_id = app
+                    .tabs
+                    .first()
+                    .map(|tab| tab.id.clone())
+                    .unwrap_or_default();
+            }
             Task::perform(
                 async move {
                     match client.lock().await {
@@ -1231,7 +1248,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::VaultLocked => {
-            // Just switch to unlock screen, preserve all tabs and their state
+            app.terminal_opening = false;
+            app.terminal_error = None;
             app.screen = Screen::Unlock(s2_unlock::State::new());
             Task::none()
         }
@@ -1265,6 +1283,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     }
                     crate::screens::TabKind::AddHost => {
                         tab.name = app.i18n.tr("main_add_host_tab").to_string();
+                    }
+                    crate::screens::TabKind::Terminal { number, .. } => {
+                        tab.name = app
+                            .i18n
+                            .trf("terminal_local_numbered", &[&number.to_string()]);
                     }
                     _ => {}
                 }
@@ -1867,12 +1890,17 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
-        // ---- Interactive debug terminal (M2b-2) ----
-        AppMessage::OpenDebugTerminal => {
+        // ---- Formal local terminal tabs (M2b-3) ----
+        AppMessage::OpenLocalTerminal => {
+            if app.terminal_opening || !matches!(app.screen, Screen::Main(_)) {
+                return Task::none();
+            }
             let client = match app.ws_client.as_ref() {
                 Some(c) => c.clone(),
                 None => return Task::none(),
             };
+            app.terminal_opening = true;
+            app.terminal_error = None;
             Task::perform(
                 async move {
                     match open_and_subscribe(&client).await {
@@ -1884,173 +1912,194 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::TerminalOpened { session_id } => {
-            app.debug_terminal_sid = Some(session_id.clone());
-            // 备份当前 Main 屏状态（hosts/tabs 等在 VidaApp 上，但 Main 的
-            // UI 状态如已揭示凭据需保留），返回时恢复。
-            if let Screen::Main(s) = &app.screen {
-                app.main_state_backup = Some(s.clone());
-            }
-            app.screen = Screen::Terminal(s_terminal::TerminalSession::new(
-                session_id,
-                40,
-                100,
-                app.terminal_appearance.clone(),
-            ));
-            iced::widget::operation::focus::<AppMessage>(crate::term::widget::id())
-        }
-        AppMessage::TerminalDisconnected => {
-            // 主动取消（点返回 → unsubscribe → rx 关闭）也会走到这里：
-            // 此时已不在终端屏，不重连（否则用户返回后被拉回终端）。
-            if !matches!(app.screen, Screen::Terminal(_)) {
+            app.terminal_opening = false;
+            if !matches!(app.screen, Screen::Main(_)) {
+                if let Some(client) = app.ws_client.as_ref() {
+                    client.unsubscribe(&session_id);
+                    let _ = client.send_queued(
+                        "CloseSession",
+                        serde_json::json!({"session_id": session_id}),
+                    );
+                }
                 return Task::none();
             }
-            if let Screen::Terminal(s) = &mut app.screen {
-                s.closed = true;
+            let number = app.next_terminal_number;
+            app.next_terminal_number = app.next_terminal_number.saturating_add(1);
+            let name = app
+                .i18n
+                .trf("terminal_local_numbered", &[&number.to_string()]);
+            let tab = Tab::terminal(session_id.clone(), number, name);
+            let tab_id = tab.id.clone();
+            app.terminal_sessions.insert(
+                tab_id.clone(),
+                s_terminal::TerminalSession::new(
+                    session_id,
+                    40,
+                    100,
+                    app.terminal_appearance.clone(),
+                ),
+            );
+            app.tabs.push(tab);
+            app.active_tab_id = tab_id;
+            app.show_connect_panel = false;
+            iced::widget::operation::focus::<AppMessage>(crate::term::widget::id())
+        }
+        AppMessage::TerminalDisconnected { session_id } => {
+            if !app
+                .terminal_sessions
+                .values()
+                .any(|session| session.session_id == session_id && !session.closed)
+            {
+                return Task::none();
             }
-            tracing::warn!("终端推送连接断开，尝试自动重连");
-            // 冷却：10 秒内最多触发一次重连，防止 daemon 未恢复时空转
+
+            let snapshots: Vec<(String, u16, u16)> = app
+                .terminal_sessions
+                .values()
+                .filter(|session| !session.closed)
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        session.grid.rows,
+                        session.grid.cols,
+                    )
+                })
+                .collect();
+            for session in app
+                .terminal_sessions
+                .values_mut()
+                .filter(|session| !session.closed)
+            {
+                session.closed = true;
+                session.notice = Some(app.i18n.tr("terminal_reconnecting").to_string());
+            }
+
             let now = std::time::Instant::now();
-            if app.terminal_reconnect_cooldown.is_some_and(|t| now < t) {
+            if app
+                .terminal_reconnect_cooldown
+                .is_some_and(|until| now < until)
+            {
                 return Task::none();
             }
             app.terminal_reconnect_cooldown = Some(now + std::time::Duration::from_secs(10));
-            // 断线前的会话 id 与尺寸（重连后复用原会话）
-            let old_sid = app.debug_terminal_sid.clone();
-            let (old_rows, old_cols) = match &app.screen {
-                Screen::Terminal(s) => (s.grid.rows, s.grid.cols),
-                _ => (40, 100),
-            };
+
             Task::perform(
                 async move {
-                    // 先等 5 秒让 daemon 有时间恢复
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    match WsClient::connect().await {
-                        Ok(client) => {
-                            // 优先复用原会话：会话属于 daemon 不属于连接，
-                            // 断开后旧会话仍在运行（编译/命令历史/vim 未保存
-                            // 内容都在），重连只需重新订阅拿全量帧恢复画面。
-                            match old_sid.as_ref() {
-                                Some(sid) => {
-                                    match client
-                                        .send(
-                                            "SubscribeSession",
-                                            serde_json::json!({"session_id": sid}),
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            // 尺寸同步：断线期间窗口可能变化过
-                                            // （M2b-2 起真实发生），订阅成功后主动
-                                            // 发一次 ResizeSession。
-                                            let _ = client
-                                                .send(
-                                                    "ResizeSession",
-                                                    serde_json::json!({
-                                                        "session_id": sid,
-                                                        "cols": old_cols,
-                                                        "rows": old_rows,
-                                                    }),
-                                                )
-                                                .await;
-                                            AppMessage::TerminalReconnected {
-                                                client,
-                                                session_id: sid.clone(),
-                                                notice: None,
-                                            }
-                                        }
-                                        Err(e) if e.message.contains("会话不存在") => {
-                                            // 原会话已结束（daemon 重启等）：
-                                            // 提示用户后新开，不静默替换
-                                            AppMessage::TerminalSessionLost { client }
-                                        }
-                                        Err(e) => AppMessage::TerminalReconnectFailed(e.message),
+                    let client = match WsClient::connect().await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            return AppMessage::TerminalReconnectFailed(error.to_string());
+                        }
+                    };
+                    let mut mappings = Vec::with_capacity(snapshots.len());
+                    for (old_session_id, rows, cols) in snapshots {
+                        match client
+                            .send(
+                                "SubscribeSession",
+                                serde_json::json!({"session_id": old_session_id}),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                let _ = client
+                                    .send(
+                                        "ResizeSession",
+                                        serde_json::json!({
+                                            "session_id": old_session_id,
+                                            "cols": cols,
+                                            "rows": rows,
+                                        }),
+                                    )
+                                    .await;
+                                mappings.push((old_session_id.clone(), old_session_id, false));
+                            }
+                            Err(error) if error.message.contains("会话不存在") => {
+                                match open_and_subscribe(&client).await {
+                                    Ok(new_session_id) => {
+                                        let _ = client
+                                            .send(
+                                                "ResizeSession",
+                                                serde_json::json!({
+                                                    "session_id": new_session_id,
+                                                    "cols": cols,
+                                                    "rows": rows,
+                                                }),
+                                            )
+                                            .await;
+                                        mappings.push((old_session_id, new_session_id, true));
                                     }
-                                }
-                                None => {
-                                    // 无旧会话（理论不可达：断线必有会话），安全兜底
-                                    match open_and_subscribe(&client).await {
-                                        Ok(sid) => AppMessage::TerminalReconnected {
-                                            client,
-                                            session_id: sid,
-                                            notice: None,
-                                        },
-                                        Err(e) => AppMessage::TerminalReconnectFailed(e),
+                                    Err(error) => {
+                                        return AppMessage::TerminalReconnectFailed(error);
                                     }
                                 }
                             }
+                            Err(error) => {
+                                return AppMessage::TerminalReconnectFailed(error.message);
+                            }
                         }
-                        Err(e) => AppMessage::TerminalReconnectFailed(e.to_string()),
                     }
+                    AppMessage::TerminalReconnected { client, mappings }
                 },
-                |msg| msg,
+                |message| message,
             )
         }
-        AppMessage::TerminalReconnected {
-            client,
-            session_id,
-            notice,
-        } => {
-            // 重连任务飞行期间用户可能已返回主界面：不再重新打开终端屏。
-            if !matches!(app.screen, Screen::Terminal(_)) {
-                app.ws_client = Some(client);
-                return Task::none();
-            }
-            // 新 WsClient（新 Arc 指针）→ subscription identity 变化 → iced
-            // 重启推送 stream → 首次迭代订阅 → 收到全量帧。
+        AppMessage::TerminalReconnected { client, mappings } => {
             app.ws_client = Some(client);
-            app.debug_terminal_sid = Some(session_id.clone());
-            let mut session = s_terminal::TerminalSession::new(
-                session_id,
-                old_rows_or_default(app),
-                old_cols_or_default(app),
-                app.terminal_appearance.clone(),
-            );
-            if let Some(n) = notice {
-                session.notice = Some(n);
-            }
-            app.screen = Screen::Terminal(session);
-            Task::none()
-        }
-        AppMessage::TerminalSessionLost { client } => {
-            tracing::info!("原终端会话已结束，为调试终端打开新会话");
-            Task::perform(
-                async move {
-                    match open_and_subscribe(&client).await {
-                        Ok(sid) => AppMessage::TerminalReconnected {
-                            client,
-                            session_id: sid,
-                            notice: Some("原会话已结束，已为你打开新终端".to_string()),
-                        },
-                        Err(e) => AppMessage::TerminalReconnectFailed(e),
+            app.terminal_reconnect_cooldown = None;
+            app.terminal_error = None;
+
+            for (old_session_id, new_session_id, replaced) in mappings {
+                if let Some(session) = app
+                    .terminal_sessions
+                    .values_mut()
+                    .find(|session| session.session_id == old_session_id)
+                {
+                    session.session_id = new_session_id.clone();
+                    session.closed = false;
+                    session.exit_code = None;
+                    session.notice =
+                        replaced.then(|| app.i18n.tr("terminal_session_replaced").to_string());
+                    let (rows, cols) = (session.grid.rows, session.grid.cols);
+                    session.grid.reset(rows, cols);
+                    session.cursor_on = true;
+                }
+                for tab in &mut app.tabs {
+                    if let crate::screens::TabKind::Terminal { session_id, .. } = &mut tab.kind
+                        && *session_id == old_session_id
+                    {
+                        *session_id = new_session_id.clone();
                     }
-                },
-                |msg| msg,
-            )
-        }
-        AppMessage::TerminalReconnectFailed(msg) => {
-            tracing::error!("终端自动重连失败: {}（可返回后重新打开调试终端）", msg);
+                }
+            }
             Task::none()
         }
-        AppMessage::TerminalSetupError(msg) => {
-            tracing::error!("终端调试屏打开失败: {}", msg);
+        AppMessage::TerminalReconnectFailed(message) => {
+            app.terminal_opening = false;
+            app.terminal_error = Some(app.i18n.trf("terminal_reconnect_failed", &[&message]));
+            Task::none()
+        }
+        AppMessage::TerminalSetupError(message) => {
+            app.terminal_opening = false;
+            app.terminal_error = Some(app.i18n.trf("terminal_open_failed", &[&message]));
             Task::none()
         }
         AppMessage::TerminalInput(data) => {
             if data.is_empty() {
                 return Task::none();
             }
-            let Some(client) = app.ws_client.as_ref() else {
+            let Some(client) = app.ws_client.as_ref().cloned() else {
                 return Task::none();
             };
-            let Screen::Terminal(session) = &mut app.screen else {
+            let closed_notice = app.i18n.tr("terminal_closed_input").to_string();
+            let Some(session) = active_terminal_mut(app) else {
                 return Task::none();
             };
             if session.closed {
-                session.notice = Some("会话已结束，无法继续输入。请返回后重新打开终端。".into());
+                session.notice = Some(closed_notice);
                 return Task::none();
             }
             session.cursor_on = true;
-            // 同步入队保证逐键顺序；绝不记录 data（其中可能包含口令）。
             if let Err(error) = client.send_queued(
                 "SessionInput",
                 serde_json::json!({
@@ -2066,19 +2115,18 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             if data.is_empty() {
                 return Task::none();
             }
-            let Some(client) = app.ws_client.as_ref() else {
+            let Some(client) = app.ws_client.as_ref().cloned() else {
                 return Task::none();
             };
-            let Screen::Terminal(session) = &mut app.screen else {
+            let closed_notice = app.i18n.tr("terminal_closed_paste").to_string();
+            let Some(session) = active_terminal_mut(app) else {
                 return Task::none();
             };
             if session.closed {
-                session.notice = Some("会话已结束，无法粘贴。请返回后重新打开终端。".into());
+                session.notice = Some(closed_notice);
                 return Task::none();
             }
             session.cursor_on = true;
-            // 与普通输入分流：daemon 依据真实 TermMode 决定 bracketed paste。
-            // 绝不记录 data（剪贴板可能包含口令或私钥）。
             if let Err(error) = client.send_queued(
                 "PasteSession",
                 serde_json::json!({
@@ -2091,17 +2139,16 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::TerminalResize { cols, rows } => {
-            let Some(client) = app.ws_client.as_ref() else {
+            let Some(client) = app.ws_client.as_ref().cloned() else {
                 return Task::none();
             };
-            let Screen::Terminal(session) = &mut app.screen else {
+            let Some(session) = active_terminal_mut(app) else {
                 return Task::none();
             };
             if session.closed || (session.grid.cols == cols && session.grid.rows == rows) {
                 return Task::none();
             }
 
-            // 先让 GUI grid 与新尺寸一致；daemon 随后的 Full damage 会填满它。
             session.grid.reset(rows, cols);
             if let Err(error) = client.send_queued(
                 "ResizeSession",
@@ -2116,34 +2163,29 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::TerminalPush(PushMsg::Frame { session_id, bytes }) => {
-            let Screen::Terminal(session) = &mut app.screen else {
+            let Some(session) = app
+                .terminal_sessions
+                .values_mut()
+                .find(|session| session.session_id == session_id)
+            else {
                 return Task::none();
             };
-
-            if session.session_id != session_id {
-                return Task::none();
-            }
-            // 订阅后第一帧是全量帧 → 重置 grid；后续增量帧按区间更新。
-            // 帧协议不含 rows/cols 字段：grid 尺寸在 OpenLocalSession 时
-            // 已由客户端指定（TerminalSession::new），全量帧只重置内容。
             let first = session.grid.last_seq.is_none();
             match frame::decode_frame(&bytes) {
-                Some(f) => {
+                Some(frame) => {
                     if first {
                         let (rows, cols) = (session.grid.rows, session.grid.cols);
                         session.grid.reset(rows, cols);
                     }
-                    session.apply_frame(&f);
+                    session.apply_frame(&frame);
                     session.cursor_on = true;
                 }
-                None => {
-                    tracing::warn!("终端帧解码失败（丢弃）");
-                }
+                None => tracing::warn!("终端帧解码失败（丢弃）"),
             }
             Task::none()
         }
         AppMessage::TerminalCursorBlink => {
-            let Screen::Terminal(session) = &mut app.screen else {
+            let Some(session) = active_terminal_mut(app) else {
                 return Task::none();
             };
             if session.appearance.cursor_blink && session.grid.cursor_visible && !session.closed {
@@ -2157,23 +2199,19 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             session_id,
             exit_code,
         }) => {
-            let Screen::Terminal(session) = &mut app.screen else {
+            let Some(session) = app
+                .terminal_sessions
+                .values_mut()
+                .find(|session| session.session_id == session_id)
+            else {
                 return Task::none();
             };
-            if session.session_id == session_id {
-                session.closed = true;
-                session.exit_code = exit_code;
-                match exit_code {
-                    Some(code) => {
-                        tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code)
-                    }
-                    None => tracing::info!("终端会话 {} 结束, 退出码未知", session_id),
-                }
+            session.closed = true;
+            session.exit_code = exit_code;
+            match exit_code {
+                Some(code) => tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code),
+                None => tracing::info!("终端会话 {} 结束, 退出码未知", session_id),
             }
-            Task::none()
-        }
-        AppMessage::CloseDebugTerminal => {
-            leave_debug_terminal(app);
             Task::none()
         }
     }
@@ -2182,7 +2220,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 fn view(app: &VidaApp) -> Element<'_, AppMessage> {
     use crate::screens::TabKind;
     use iced::Length;
-    use iced::widget::{column, container, text};
+    use iced::widget::{Space, column, container, row, text};
 
     match &app.screen {
         // Pre-main screens: full screen, no tab bar
@@ -2206,6 +2244,11 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
             {
                 match &active_tab.kind {
                     TabKind::Host { host_id } => s.view_host_detail(&app.hosts, host_id, &app.i18n),
+                    TabKind::Terminal { .. } => app
+                        .terminal_sessions
+                        .get(&active_tab.id)
+                        .map(|session| session.view(&app.i18n))
+                        .unwrap_or_else(|| text(app.i18n.tr("terminal_state_missing")).into()),
                     TabKind::AddHost | TabKind::EditHost { .. } => {
                         if let Some(editor) = &app.editor_state {
                             editor.view(&app.i18n)
@@ -2246,7 +2289,28 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     .into()
             };
 
-            let base = column![tab_bar, content]
+            let terminal_error: Element<'_, AppMessage> = match &app.terminal_error {
+                Some(message) => container(
+                    row![
+                        crate::ui::icons::icon(crate::ui::icons::CIRCLE_ALERT, 15)
+                            .color(crate::ui::DANGER_TEXT),
+                        text(message)
+                            .size(12)
+                            .color(crate::ui::DANGER_TEXT)
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([8, 12])
+                .width(Length::Fill)
+                .style(crate::ui::error_notice)
+                .into(),
+                None => container(Space::new()).height(0).into(),
+            };
+
+            let base = column![tab_bar, terminal_error, content]
                 .width(Length::Fill)
                 .height(Length::Fill);
 
@@ -2391,7 +2455,37 @@ fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_backup_bytes;
+    use super::{AppMessage, Screen, Tab, VidaApp, parse_backup_bytes, update};
+    use crate::screens::{s_terminal, s3_main};
+    use crate::term::primitive::TerminalAppearance;
+    use crate::ws_client::PushMsg;
+
+    fn app_with_two_terminal_tabs() -> VidaApp {
+        let (mut app, _) = super::new();
+        app.screen = Screen::Main(s3_main::State {
+            revealed_credential: None,
+            credential_copied: false,
+        });
+        for (session_id, number) in [("session-a", 1), ("session-b", 2)] {
+            let tab = Tab::terminal(
+                session_id.to_string(),
+                number,
+                format!("Local terminal {number}"),
+            );
+            app.terminal_sessions.insert(
+                tab.id.clone(),
+                s_terminal::TerminalSession::new(
+                    session_id.to_string(),
+                    40,
+                    100,
+                    TerminalAppearance::default(),
+                ),
+            );
+            app.tabs.push(tab);
+        }
+        app.active_tab_id = "terminal:session-a".to_string();
+        app
+    }
 
     #[test]
     fn backup_bytes_accept_full_byte_range() {
@@ -2409,5 +2503,37 @@ mod tests {
             parse_backup_bytes(&serde_json::json!({"data": [256]})),
             Err(())
         );
+    }
+
+    #[test]
+    fn terminal_closed_event_updates_only_matching_tab_session() {
+        let mut app = app_with_two_terminal_tabs();
+        let _ = update(
+            &mut app,
+            AppMessage::TerminalPush(PushMsg::SessionClosed {
+                session_id: "session-b".to_string(),
+                exit_code: Some(7),
+            }),
+        );
+
+        assert!(!app.terminal_sessions["terminal:session-a"].closed);
+        assert!(app.terminal_sessions["terminal:session-b"].closed);
+        assert_eq!(
+            app.terminal_sessions["terminal:session-b"].exit_code,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn closing_terminal_tab_removes_only_its_session_and_selects_neighbor() {
+        let mut app = app_with_two_terminal_tabs();
+        let _ = update(
+            &mut app,
+            AppMessage::CloseTab("terminal:session-a".to_string()),
+        );
+
+        assert!(!app.terminal_sessions.contains_key("terminal:session-a"));
+        assert!(app.terminal_sessions.contains_key("terminal:session-b"));
+        assert_eq!(app.active_tab_id, "terminal:session-b");
     }
 }

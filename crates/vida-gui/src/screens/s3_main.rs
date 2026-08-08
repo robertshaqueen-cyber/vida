@@ -47,6 +47,7 @@ impl State {
             .map(|tab| {
                 let glyph = match tab.kind {
                     TabKind::Host { .. } => icons::SERVER,
+                    TabKind::Terminal { .. } => icons::TERMINAL,
                     TabKind::AddHost => icons::CIRCLE_PLUS,
                     TabKind::EditHost { .. } => icons::PENCIL,
                     TabKind::Settings => icons::SETTINGS,
@@ -117,13 +118,12 @@ impl State {
             tooltip::Position::Bottom,
         );
 
-        // 调试终端入口（M2b-2 可交互终端）
-        let debug_term_btn = tooltip(
+        let local_term_btn = tooltip(
             button(icons::icon(icons::TERMINAL, 16))
-                .on_press(AppMessage::OpenDebugTerminal)
+                .on_press(AppMessage::OpenLocalTerminal)
                 .style(ui::icon_button(false))
                 .padding(9),
-            "调试终端 (M2b-2)",
+            i18n.tr("terminal_open_local"),
             tooltip::Position::Bottom,
         );
 
@@ -171,7 +171,7 @@ impl State {
             tabs_scroll,
             add_btn,
             connect_panel_btn,
-            debug_term_btn,
+            local_term_btn,
             right_buttons,
         ]
         .spacing(4)
