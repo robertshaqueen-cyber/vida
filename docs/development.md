@@ -490,29 +490,21 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
 
 ### 所有者视觉验收修正
 
-- 默认字体与密度改为 Ghostty 零配置默认值：内置 JetBrains Mono 13pt。macOS 的点数就是逻辑
-  像素，光栅化时只乘显示器 scale，不再额外乘 `96/72`；scale=1 实测 cell
-  **8×18**、ascent **14**。所选等宽字体由 `font-kit` 调用平台原生栅格器（macOS
-  CoreText、Windows DirectWrite、Linux FreeType）。macOS 中文使用与 Ghostty 相同的
-  `CTFontCreateForString` 按系统语言发现苹方，只保留 CTFont 句柄，不复制大型
-  PingFang TTC；回退字号按 `ic_width` 与主字体调和。实测 CoreText `A` 位图
-  8×10、苹方常规 13×14、中粗 14×14。普通中英文均不人工加深覆盖率；前景
-  `#ffffff`、终端背景 `#282c34`。JetBrains Mono 2.304 Regular/Bold 以 OFL-1.1
-  随应用分发；字体下拉同时保留系统等宽字体。隔离 release 窗口在 scale=1、输出中英文和 `ls`
-  后，`vmmap --summary` Physical footprint **251.5MB**（峰值 252.2MB）；同机旧版本
-  约 247.9MB，原生中英文栅格化增量约 3.6MB。
+- 默认字体为内置 JetBrains Mono 13pt，JetBrains Mono 2.304 Regular/Bold 以 OFL-1.1
+  随应用分发；字体下拉同时保留系统等宽字体。根据 Oryxis 的成熟做法，文字不再经过
+  Vida 自建的 CoreText 位图、字形图集与采样器，而是由 iced canvas/cosmic-text 直接
+  渲染。ASCII 合并为不超过 32 字符的 run，CJK 由系统字体自然回退并保持逐 cell 定位；
+  cell advance 用 iced Paragraph 实测，行高为字号的 1.15 倍。前景 `#ffffff`、终端背景
+  `#282c34`。隔离 release 窗口在 scale=1、输出中英文并输入未执行的 `ls --color` 后，
+  `vmmap --summary` Physical footprint **264.8MB**（峰值 265.2MB）。
 - 增加 500ms 闪烁的实心方块光标；timer 仅在终端屏且用户启用闪烁时存在。
-- WIDE 字符仍推进两个 cell，但按原始字形宽高比绘制，不再横向拉伸中文；
-  灰度覆盖率由平台原生光栅器直接产生，不做人工加深。
+- WIDE 字符仍推进两个 cell，中文交给 iced/cosmic-text 的系统字体回退，不做单轴拉伸
+  或人工覆盖率处理。
 - 「设置 → 终端」从内置 JetBrains Mono 与系统等宽字体中选择字体，并从固定列表选择字号；
   可持久化字体、字号与光标闪烁，保存后新开的终端生效。
-- 普通中文由 `PingFangSC-Regular` 绘制，bold 中文由 `PingFangSC-Semibold`
-  绘制；CGBitmapContext 的行序直接上传图集，不做二次翻转；字形按原始宽高比绘制，
-  不做单轴拉伸。
-- macOS 的中英文 CTFont 均使用 linearGray、灰度抗锯齿与亚像素定位，默认关闭
-  CoreText font smoothing，与 Ghostty `font-thicken=false` 对齐；ANSI 0—15 色使用
-  Ghostty 默认调色板，NamedColor 在 daemon 推帧时保留对应索引。原生遮罩上传前
-  裁掉透明边界，单像素笔画归一化峰值但不扩张轮廓。
+- ANSI 0—15 色使用 Ghostty 默认调色板，NamedColor 在 daemon 推帧时保留对应索引。
+  `-` 不再作为 1px 位图单独上传，而是与相邻 ASCII 一起交给 iced 文本管线塑形，
+  输入态和执行后的渲染路径完全相同。
 - M2b-2 调试终端仍是临时 Screen；点击真实标签或设置时会先关闭调试会话并恢复
   Main，再执行标签切换，避免 active tab 已变化但终端仍覆盖内容。
 - 自动 GUI 首轮已看到提示符处方块光标；最终字体视觉观感仍以所有者截图验收为准。

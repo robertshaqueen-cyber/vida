@@ -20,6 +20,8 @@ pub fn run() -> Result<(), iced::Error> {
         .init();
 
     iced::application(new, update, view)
+        .font(crate::term::primitive::BUNDLED_REGULAR)
+        .font(crate::term::primitive::BUNDLED_BOLD)
         .subscription(subscription)
         .title(|_: &VidaApp| "vida".to_string())
         .theme(|_: &VidaApp| Theme::Dark)

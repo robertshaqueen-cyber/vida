@@ -6,19 +6,30 @@
 //! - resize 使用渲染管线实测的物理像素 cell 尺寸，逻辑像素只用于 iced 布局；
 //! - widget 自身不设置定时器；光标闪烁由终端屏存活期间的 app subscription 驱动。
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use iced::advanced::Renderer as _;
+use iced::advanced::graphics::geometry::Renderer as GeometryRenderer;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse;
 use iced::advanced::renderer;
+use iced::advanced::text::Paragraph as _;
 use iced::advanced::widget::operation::Focusable;
 use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, clipboard, input_method};
 use iced::keyboard::{self, Key, Modifiers, key};
-use iced::{Element, Event, Length, Rectangle, Size, window};
+use iced::widget::canvas::{self, Frame, Text as CanvasText};
+use iced::{
+    Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size, Vector, alignment, font,
+    window,
+};
 
 use super::client_grid::ClientGrid;
-use super::primitive::{TermPrimitive, TerminalAppearance, ViewportMetrics};
+use super::primitive::{
+    DEFAULT_BG, TerminalAppearance, ViewportMetrics, resolve_bg, resolve_text_fg,
+};
 
 const TERMINAL_WIDGET_ID: &str = "vida-terminal-canvas";
 
@@ -27,13 +38,22 @@ pub fn id() -> iced::widget::Id {
     iced::widget::Id::new(TERMINAL_WIDGET_ID)
 }
 
-#[derive(Debug)]
 struct State {
     focused: bool,
     window_focused: bool,
     scale_factor: f32,
     preedit: Option<input_method::Preedit>,
     last_grid_size: Option<(u16, u16)>,
+    geometry_cache: canvas::Cache,
+    last_render_key: Cell<Option<RenderKey>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    version: u64,
+    font: Font,
+    font_size_bits: u32,
+    cursor_on: bool,
 }
 
 impl Default for State {
@@ -44,6 +64,8 @@ impl Default for State {
             scale_factor: 1.0,
             preedit: None,
             last_grid_size: None,
+            geometry_cache: canvas::Cache::new(),
+            last_render_key: Cell::new(None),
         }
     }
 }
@@ -100,10 +122,7 @@ impl<Message> TermCanvas<Message> {
     }
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for TermCanvas<Message>
-where
-    Renderer: iced::advanced::Renderer + iced_wgpu::primitive::Renderer,
-{
+impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
     }
@@ -122,7 +141,7 @@ where
     fn layout(
         &mut self,
         _tree: &mut Tree,
-        _renderer: &Renderer,
+        _renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         layout::Node::new(limits.max())
@@ -132,7 +151,7 @@ where
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
-        _renderer: &Renderer,
+        _renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
         let state = tree.state.downcast_mut::<State>();
@@ -146,7 +165,7 @@ where
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _renderer: &Renderer,
+        _renderer: &iced::Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
@@ -252,8 +271,8 @@ where
 
     fn draw(
         &self,
-        _tree: &Tree,
-        renderer: &mut Renderer,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
         _theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
@@ -264,14 +283,41 @@ where
         if self.snapshot.rows == 0 || self.snapshot.cols == 0 {
             return;
         }
-        let primitive = TermPrimitive::with_appearance(
-            self.snapshot.clone(),
-            bounds,
-            self.viewport_metrics.clone(),
-            self.appearance.clone(),
-            self.cursor_on,
+        let state = tree.state.downcast_ref::<State>();
+        let appearance = self.appearance.normalized();
+        let base_font = terminal_font(&appearance.font_family, false, false);
+        let cell_width = cell_advance(base_font, appearance.font_size);
+        let cell_height = appearance.font_size * 1.15;
+        self.viewport_metrics.store(
+            cell_width * state.scale_factor,
+            cell_height * state.scale_factor,
+            state.scale_factor,
         );
-        renderer.draw_primitive(bounds, primitive);
+
+        let key = RenderKey {
+            version: self.snapshot.version,
+            font: base_font,
+            font_size_bits: appearance.font_size.to_bits(),
+            cursor_on: self.cursor_on,
+        };
+        if state.last_render_key.get() != Some(key) {
+            state.last_render_key.set(Some(key));
+            state.geometry_cache.clear();
+        }
+        let geometry = state.geometry_cache.draw(renderer, bounds.size(), |frame| {
+            draw_grid(
+                frame,
+                &self.snapshot,
+                base_font,
+                appearance.font_size,
+                cell_width,
+                cell_height,
+                self.cursor_on,
+            );
+        });
+        renderer.with_translation(Vector::new(bounds.x, bounds.y), |renderer| {
+            renderer.draw_geometry(geometry);
+        });
     }
 
     fn mouse_interaction(
@@ -280,12 +326,269 @@ where
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
-        _renderer: &Renderer,
+        _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None
+        }
+    }
+}
+
+/// Oryxis 的终端没有自建字形位图和纹理采样器，而是把文字交回 iced/cosmic-text。
+/// 这里沿用同一做法，并通过 iced 自己的 Paragraph 测量真实等宽 advance，确保
+/// 绘制、光标、PTY resize 三者使用同一套度量。
+fn cell_advance(font: Font, font_size: f32) -> f32 {
+    static ADVANCES: OnceLock<Mutex<HashMap<(Font, u32), f32>>> = OnceLock::new();
+    let key = (font, font_size.to_bits());
+    let mut advances = ADVANCES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(advance) = advances.get(&key) {
+        return *advance;
+    }
+    const SAMPLES: usize = 40;
+    let sample = "0".repeat(SAMPLES);
+    let text = iced::advanced::text::Text {
+        content: sample.as_str(),
+        bounds: Size::INFINITE,
+        size: Pixels(font_size),
+        line_height: iced::advanced::text::LineHeight::default(),
+        font,
+        align_x: iced::advanced::text::Alignment::Default,
+        align_y: alignment::Vertical::Top,
+        shaping: iced::advanced::text::Shaping::Basic,
+        wrapping: iced::advanced::text::Wrapping::None,
+    };
+    let width = iced::advanced::graphics::text::Paragraph::with_text(text)
+        .min_bounds()
+        .width;
+    let advance = if width > 0.0 {
+        width / SAMPLES as f32
+    } else {
+        font_size * 0.6
+    };
+    advances.insert(key, advance);
+    advance
+}
+
+fn intern_font_family(name: &str) -> &'static str {
+    static FAMILIES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let mut families = FAMILIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(name) = families.get(name) {
+        return name;
+    }
+    let owned = name.to_string();
+    let interned = Box::leak(owned.clone().into_boxed_str());
+    families.insert(owned, interned);
+    interned
+}
+
+fn terminal_font(family: &str, bold: bool, italic: bool) -> Font {
+    Font {
+        family: font::Family::Name(intern_font_family(family)),
+        weight: if bold {
+            font::Weight::Bold
+        } else {
+            font::Weight::Normal
+        },
+        style: if italic {
+            font::Style::Italic
+        } else {
+            font::Style::Normal
+        },
+        ..Font::DEFAULT
+    }
+}
+
+fn color(rgb: (u8, u8, u8)) -> Color {
+    Color::from_rgb8(rgb.0, rgb.1, rgb.2)
+}
+
+fn draw_text(
+    frame: &mut Frame<iced::Renderer>,
+    content: String,
+    position: Point,
+    foreground: Color,
+    size: f32,
+    font: Font,
+) {
+    frame.fill_text(CanvasText {
+        content,
+        position,
+        color: foreground,
+        size: Pixels(size),
+        font,
+        align_x: alignment::Horizontal::Left.into(),
+        align_y: alignment::Vertical::Top,
+        ..CanvasText::default()
+    });
+}
+
+fn draw_grid(
+    canvas: &mut Frame<iced::Renderer>,
+    grid: &ClientGrid,
+    base_font: Font,
+    font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+    cursor_on: bool,
+) {
+    canvas.fill_rectangle(Point::ORIGIN, canvas.size(), color(DEFAULT_BG));
+
+    // Canvas 的文字层始终在形状层之上，所以先画背景、光标和装饰线。
+    for row in 0..grid.rows {
+        for col in 0..grid.cols {
+            let Some(cell) = grid.cell(row, col) else {
+                continue;
+            };
+            if cell.flags & super::client_grid::cell_flags::WIDE_SPACER != 0 {
+                continue;
+            }
+            let x = col as f32 * cell_width;
+            let y = row as f32 * cell_height;
+            let width = if cell.flags & super::frame::flag::WIDE != 0 {
+                cell_width * 2.0
+            } else {
+                cell_width
+            };
+            let is_cursor = cursor_on
+                && grid.cursor_visible
+                && row == grid.cursor_row
+                && col == grid.cursor_col;
+            if is_cursor {
+                canvas.fill_rectangle(
+                    Point::new(x, y),
+                    Size::new(width, cell_height),
+                    color(resolve_text_fg(cell)),
+                );
+            } else if cell.bg != super::client_grid::ColorSpec::Default
+                || cell.flags & super::frame::flag::REVERSE != 0
+            {
+                canvas.fill_rectangle(
+                    Point::new(x, y),
+                    Size::new(width, cell_height),
+                    color(resolve_bg(cell)),
+                );
+            }
+            let decoration = if is_cursor {
+                color(resolve_bg(cell))
+            } else {
+                color(resolve_text_fg(cell))
+            };
+            if cell.flags & super::frame::flag::UNDERLINE != 0 {
+                canvas.fill_rectangle(
+                    Point::new(x, y + cell_height - 2.0),
+                    Size::new(width, 1.0),
+                    decoration,
+                );
+            }
+            if cell.flags & super::frame::flag::STRIKEOUT != 0 {
+                canvas.fill_rectangle(
+                    Point::new(x, y + (cell_height * 0.52).round()),
+                    Size::new(width, 1.0),
+                    decoration,
+                );
+            }
+        }
+    }
+
+    struct Run {
+        row: u16,
+        start_col: u16,
+        next_col: u16,
+        foreground: Color,
+        font: Font,
+        content: String,
+    }
+    let flush = |canvas: &mut Frame<iced::Renderer>, run: Run| {
+        draw_text(
+            canvas,
+            run.content,
+            Point::new(
+                run.start_col as f32 * cell_width,
+                run.row as f32 * cell_height,
+            ),
+            run.foreground,
+            font_size,
+            run.font,
+        );
+    };
+    let mut run: Option<Run> = None;
+    for row in 0..grid.rows {
+        for col in 0..grid.cols {
+            let Some(cell) = grid.cell(row, col) else {
+                continue;
+            };
+            let is_spacer = cell.flags & super::client_grid::cell_flags::WIDE_SPACER != 0;
+            let hidden = cell.flags & super::frame::flag::HIDDEN != 0;
+            let is_cursor = cursor_on
+                && grid.cursor_visible
+                && row == grid.cursor_row
+                && col == grid.cursor_col;
+            let foreground = if is_cursor {
+                color(resolve_bg(cell))
+            } else {
+                color(resolve_text_fg(cell))
+            };
+            let cell_font = terminal_font(
+                match base_font.family {
+                    font::Family::Name(name) => name,
+                    _ => super::primitive::DEFAULT_TERMINAL_FONT_FAMILY,
+                },
+                cell.flags & super::frame::flag::BOLD != 0,
+                cell.flags & super::frame::flag::ITALIC != 0,
+            );
+            let batchable = !is_spacer
+                && !hidden
+                && !is_cursor
+                && cell.ch.is_ascii_graphic()
+                && cell.flags & super::frame::flag::WIDE == 0;
+            let fits = batchable
+                && run.as_ref().is_some_and(|run| {
+                    run.row == row
+                        && run.next_col == col
+                        && run.foreground == foreground
+                        && run.font == cell_font
+                        && run.content.len() < 32
+                });
+            if fits {
+                if let Some(run) = run.as_mut() {
+                    run.content.push(cell.ch);
+                    run.next_col += 1;
+                }
+                continue;
+            }
+            if let Some(run) = run.take() {
+                flush(canvas, run);
+            }
+            if batchable {
+                run = Some(Run {
+                    row,
+                    start_col: col,
+                    next_col: col + 1,
+                    foreground,
+                    font: cell_font,
+                    content: cell.ch.to_string(),
+                });
+            } else if !is_spacer && !hidden && cell.ch != ' ' && cell.ch != '\0' {
+                draw_text(
+                    canvas,
+                    cell.ch.to_string(),
+                    Point::new(col as f32 * cell_width, row as f32 * cell_height),
+                    foreground,
+                    font_size,
+                    cell_font,
+                );
+            }
+        }
+        if let Some(run) = run.take() {
+            flush(canvas, run);
         }
     }
 }

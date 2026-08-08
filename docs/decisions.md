@@ -902,6 +902,19 @@ CoreText 位图上传前裁掉全透明边界；低 DPI 的单像素横/竖笔�
 不扩张轮廓，避免 `-` 首次出现时被窗口合成稀释到近乎不可见。scale=1 发布版
 输出中英文与 `ls --color` 后 Physical footprint 为 251.5MB（峰值 252.2MB）。
 
+第七轮所有者截图证明上述自建位图修正仍不可靠：输入态 `ls --color` 的两枚
+短横线仍会被采样到几乎不可见，CJK 视觉高度也再次偏小。对照 Oryxis 当前源码后，
+关键差异不是某个 CoreText 开关，而是架构：Oryxis 不维护独立字形位图、基线换算
+和纹理采样器，而是使用 iced canvas 的 `fill_text`，让 iced/cosmic-text 负责字体
+回退与 GPU 文本缓存；ASCII 合并为短 run，宽字符保持逐 cell 定位。Vida 因此删除
+自建 wgpu 字形图集，按同一原则独立实现文字层：cell advance 由 iced Paragraph 对
+40 个 `0` 的真实宽度测量并缓存，ASCII 最多 32 字符一批，CJK 按协议 WIDE 起始列
+单独绘制，行高为字号的 1.15 倍。背景、反色、光标和装饰线仍按 cell 绘制，PTY、
+网格协议与人的输入路径均未改变。启用 iced `canvas` feature 会引入其官方 lyon
+几何依赖，这是使用 iced 原生文字路径所必需，不是新增终端栈。scale=1 隔离发布版
+实测：首次输入但未执行的 `ls --color` 两枚短横线清晰可见，`echo 中文测试` 未压扁；
+Physical footprint 为 264.8MB（峰值 265.2MB）。
+
 **对齐自查方法**（评审建议）：rows() 最上面加一行尺子——
 每列一个 `|`，共 80 列。像素级验证（surface readback dump PNG）：
 80 个 `|` 全部落在 `col * cell_width` 列边界（偏差 <1px）；
