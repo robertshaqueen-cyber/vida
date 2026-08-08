@@ -564,6 +564,46 @@ fn export_backup_produces_valid_ciphertext() {
 }
 
 #[test]
+fn restore_backup_validates_before_replacing_and_rotates_current_vault() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let (mut state, dir) = test_state("tok");
+    unsafe { std::env::set_var("VIDA_CONFIG_DIR", dir.path()) };
+
+    state.create_vault("current-pass").unwrap();
+    add_test_host(&mut state, "from-backup");
+    let backup = state.export_backup(Some("backup-pass")).unwrap();
+    add_test_host(&mut state, "current-only");
+
+    assert!(state.preview_backup(&backup, "wrong-pass").is_err());
+    assert_eq!(state.list_hosts().unwrap().len(), 2);
+
+    let (host_count, _, host_names) = state.preview_backup(&backup, "backup-pass").unwrap();
+    assert_eq!(host_count, 1);
+    assert_eq!(host_names, vec!["from-backup"]);
+
+    let (restored_hosts, warning) = state.restore_backup(&backup, "backup-pass").unwrap();
+    assert_eq!(restored_hosts.len(), 1);
+    assert_eq!(restored_hosts[0].name, "from-backup");
+    assert!(warning.is_none());
+
+    state.lock();
+    state.unlock("backup-pass", false).unwrap();
+    assert_eq!(state.list_hosts().unwrap().len(), 1);
+
+    let rotated = std::fs::read(dir.path().join("vault.1.age")).unwrap();
+    let previous = vida_core::vault::decrypt(&rotated, "current-pass").unwrap();
+    assert_eq!(previous.hosts.len(), 2);
+    assert!(
+        previous
+            .hosts
+            .iter()
+            .any(|host| host.name == "current-only")
+    );
+
+    unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
+}
+
+#[test]
 fn list_hosts_no_plaintext_credentials() {
     let (mut state, _dir) = test_state("tok");
     state.create_vault("pass").unwrap();

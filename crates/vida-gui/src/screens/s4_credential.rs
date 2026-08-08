@@ -1,9 +1,10 @@
 use iced::widget::{button, column, container, row, text, text_input};
-use iced::{Element, Length};
+use iced::{Alignment, Element, Length};
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
 use crate::secure_text_input::SecureTextInput;
+use crate::ui::{self, icons};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorMode {
@@ -82,26 +83,58 @@ impl State {
 
     pub fn view(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let is_edit = matches!(self.mode, EditorMode::Edit { .. });
-        let title = if is_edit {
-            text(i18n.tr("editor_title_edit")).size(24)
+        let title_copy = if is_edit {
+            i18n.tr("editor_title_edit")
         } else {
-            text(i18n.tr("editor_title_add")).size(24)
+            i18n.tr("editor_title_add")
         };
+        let title = text(title_copy).size(24);
+        let header_icon = if is_edit {
+            icons::PENCIL
+        } else {
+            icons::SERVER
+        };
+        let header = row![
+            container(icons::icon(header_icon, 20).color(ui::ACCENT))
+                .center_x(46)
+                .center_y(46)
+                .style(ui::accent_badge),
+            column![
+                title,
+                ui::muted(if is_edit {
+                    i18n.tr("editor_hint_keep_password")
+                } else {
+                    i18n.tr("editor_hint_need_password")
+                })
+                .size(12),
+            ]
+            .spacing(4),
+        ]
+        .spacing(13)
+        .align_y(Alignment::Center);
 
         let name_input = text_input(i18n.tr("editor_name"), &self.name)
             .on_input(AppMessage::EditorNameChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let host_input = text_input(i18n.tr("editor_host"), &self.host)
             .on_input(AppMessage::EditorHostChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let user_input = text_input(i18n.tr("editor_user"), &self.user)
             .on_input(AppMessage::EditorUserChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let port_input = text_input(i18n.tr("editor_port"), &self.port)
             .on_input(AppMessage::EditorPortChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let password_label = if is_edit {
@@ -112,18 +145,26 @@ impl State {
         let password_input = SecureTextInput::new(i18n.tr("editor_password"), &self.password)
             .on_input(AppMessage::EditorPasswordChanged)
             .secure(true)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let tags_input = text_input(i18n.tr("editor_tags"), &self.tags)
             .on_input(AppMessage::EditorTagsChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let group_input = text_input(i18n.tr("editor_group"), &self.group)
             .on_input(AppMessage::EditorGroupChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let notes_input = text_input(i18n.tr("editor_notes"), &self.notes)
             .on_input(AppMessage::EditorNotesChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
 
         let can_save = !self.saving
@@ -136,57 +177,76 @@ impl State {
         let save_btn = if self.saving {
             button(i18n.tr("common_saving"))
                 .width(Length::Shrink)
-                .style(button::primary)
+                .style(ui::primary_button)
+                .padding([9, 14])
         } else {
             button(i18n.tr("common_save"))
                 .width(Length::Shrink)
-                .style(button::primary)
+                .style(ui::primary_button)
+                .padding([9, 14])
         };
 
         let save_btn = if can_save {
             save_btn.on_press(AppMessage::EditorSave)
         } else {
-            save_btn.style(button::secondary)
+            save_btn
         };
 
         let cancel_btn = button(i18n.tr("common_cancel"))
             .on_press(AppMessage::EditorCancel)
-            .style(button::text);
-
-        let error_text = match &self.error {
-            Some(e) => text(e).size(12),
-            None => text(""),
-        };
+            .style(ui::secondary_button)
+            .padding([9, 14]);
 
         let hint = if is_edit {
-            text(i18n.tr("editor_hint_keep_password")).size(11)
+            ui::muted(i18n.tr("editor_hint_keep_password")).size(11)
         } else {
-            text(i18n.tr("editor_hint_need_password")).size(11)
+            ui::muted(i18n.tr("editor_hint_need_password")).size(11)
         };
 
-        let content = column![
-            title,
+        let fields = column![
             name_input,
             host_input,
             row![user_input, port_input].spacing(12),
-            password_label,
+            password_label.color(ui::TEXT_SECONDARY),
             password_input,
             hint,
             tags_input,
             group_input,
             notes_input,
-            row![save_btn, cancel_btn].spacing(12),
-            error_text,
         ]
-        .spacing(10)
-        .padding(40)
-        .max_width(500);
+        .spacing(11)
+        .width(Length::Fill);
+
+        let mut card = column![header, fields, row![save_btn, cancel_btn].spacing(10)]
+            .spacing(18)
+            .width(Length::Fill);
+
+        if let Some(error) = &self.error {
+            card = card.push(
+                container(
+                    row![
+                        icons::icon(icons::CIRCLE_ALERT, 15).color(ui::DANGER_TEXT),
+                        text(error).size(12).color(ui::DANGER_TEXT),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding([8, 10])
+                .width(Length::Fill)
+                .style(ui::error_notice),
+            );
+        }
+
+        let content = container(card)
+            .padding(22)
+            .width(Length::Fixed(620.0))
+            .style(ui::surface);
 
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
-            .center_y(Length::Fill)
+            .padding(iced::padding::Padding::new(0.0).top(62))
             .into()
     }
 }

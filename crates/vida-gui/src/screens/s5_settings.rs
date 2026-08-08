@@ -1,13 +1,17 @@
-use iced::widget::{button, column, container, pick_list, row, rule, text, text_input};
-use iced::{Element, Length};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, rule, scrollable, text, text_input,
+};
+use iced::{Alignment, Element, Length};
 use vida_core::i18n::I18n;
 use vida_core::vault::Settings;
 
 use crate::app::AppMessage;
 use crate::screens::s3_main::HostItem;
+use crate::screens::s9_backup;
 use crate::term::primitive::{
     DEFAULT_TERMINAL_FONT_FAMILY, TerminalAppearance, load_bundled_terminal_fonts,
 };
+use crate::ui::{self, icons};
 
 const TERMINAL_FONT_SIZES: &[u16] = &[10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32];
 
@@ -215,6 +219,8 @@ pub struct State {
     pub terminal_font_family: String,
     pub terminal_font_size: u16,
     pub terminal_cursor_blink: bool,
+    /// Backup form is UI state owned by the Settings screen.
+    pub backup: s9_backup::State,
     /// 保存时以 daemon 返回的完整 Settings 为底，避免覆盖未在当前页面展示的字段。
     pub vault_settings: Settings,
     // Save state
@@ -255,6 +261,7 @@ impl State {
             terminal_font_family,
             terminal_font_size,
             terminal_cursor_blink: vault_settings.terminal_cursor_blink,
+            backup: s9_backup::State::new(),
             vault_settings,
             saving: false,
             saved: false,
@@ -283,29 +290,47 @@ impl State {
     }
 
     fn view_sidebar(&self, i18n: &I18n) -> Element<'_, AppMessage> {
-        let title = text(i18n.tr("main_tab_settings")).size(20);
+        let title = row![
+            icons::icon(icons::SETTINGS, 18).color(ui::ACCENT),
+            text(i18n.tr("main_tab_settings")).size(18),
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center);
 
         let nav_items: Vec<Element<'_, AppMessage>> = SettingsSection::all()
             .iter()
             .map(|section| {
-                let label = text(section.label(i18n)).size(14);
+                let glyph = match section {
+                    SettingsSection::Application => icons::LANGUAGES,
+                    SettingsSection::Connections => icons::SERVER,
+                    SettingsSection::Sync => icons::CLOUD,
+                    SettingsSection::Terminal => icons::TERMINAL,
+                    SettingsSection::Backup => icons::SHIELD,
+                };
+                let label = row![icons::icon(glyph, 15), text(section.label(i18n)).size(13),]
+                    .spacing(10)
+                    .align_y(Alignment::Center);
                 let is_active = self.active_section == *section;
-                let btn = button(label)
+                button(label)
                     .on_press(AppMessage::SettingsSectionChanged(*section))
-                    .width(Length::Fill);
-                if is_active {
-                    btn.style(button::secondary).into()
-                } else {
-                    btn.style(button::text).into()
-                }
+                    .style(ui::nav_item(is_active))
+                    .padding([10, 12])
+                    .width(Length::Fill)
+                    .into()
             })
             .collect();
 
         let nav_list = column(nav_items).spacing(2);
 
-        let sidebar_content = column![title, nav_list].spacing(16).padding(16).width(200);
+        let sidebar_content = column![title, nav_list, Space::new().height(Length::Fill)]
+            .spacing(18)
+            .padding(14)
+            .width(204);
 
-        container(sidebar_content).height(Length::Fill).into()
+        container(sidebar_content)
+            .height(Length::Fill)
+            .style(ui::sidebar)
+            .into()
     }
 
     fn view_content(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
@@ -317,15 +342,27 @@ impl State {
             SettingsSection::Backup => self.view_backup(i18n),
         };
 
-        let wrapper = column![content].spacing(16).padding(24).width(Length::Fill);
+        let wrapper = scrollable(
+            container(content)
+                .padding(24)
+                .width(Length::Fill)
+                .max_width(980)
+                .center_x(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill);
 
-        container(wrapper).height(Length::Fill).into()
+        container(wrapper)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .style(ui::app_background)
+            .into()
     }
 
     fn view_application(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("settings_application")).size(20);
 
-        let lang_label = text(i18n.tr("settings_language")).size(14);
+        let lang_label = text(i18n.tr("settings_language")).size(13);
         let lang_options: Vec<LangChoice> =
             vec![LangChoice::System, LangChoice::ZhCn, LangChoice::En];
         let lang_pick = pick_list(
@@ -333,13 +370,21 @@ impl State {
             Some(self.language.clone()),
             AppMessage::SettingsLanguageChanged,
         )
+        .style(ui::picker)
+        .padding(10)
         .width(Length::Fill);
 
         let can_save = !self.saving;
         let save_btn = if self.saving {
-            button(i18n.tr("common_saving")).width(Length::Shrink)
+            button(i18n.tr("common_saving"))
+                .width(Length::Shrink)
+                .style(ui::primary_button)
+                .padding([9, 14])
         } else {
-            button(i18n.tr("common_save")).width(Length::Shrink)
+            button(i18n.tr("common_save"))
+                .width(Length::Shrink)
+                .style(ui::primary_button)
+                .padding([9, 14])
         };
 
         let save_btn = if can_save {
@@ -359,17 +404,17 @@ impl State {
             None => text(""),
         };
 
-        column![
+        settings_section(
             title,
-            rule::horizontal(1),
-            lang_label,
-            lang_pick,
-            save_btn,
-            status_text,
-            error_text,
-        ]
-        .spacing(12)
-        .into()
+            column![
+                lang_label,
+                lang_pick,
+                row![save_btn, status_text].spacing(10),
+                error_text
+            ]
+            .spacing(10)
+            .into(),
+        )
     }
 
     fn view_connections(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
@@ -399,8 +444,28 @@ impl State {
                     .into(),
             );
             for host in &ungrouped {
-                let label = text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(14);
-                items.push(button(label).style(button::text).width(Length::Fill).into());
+                let label = row![
+                    container(icons::icon(icons::SERVER, 15).color(ui::ACCENT))
+                        .center_x(34)
+                        .center_y(34)
+                        .style(ui::accent_badge),
+                    column![
+                        text(host.name.clone()).size(14),
+                        ui::muted(format!("{}@{}", host.user, host.host)).size(12),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .width(Length::Fill);
+                items.push(
+                    button(label)
+                        .style(ui::nav_item(false))
+                        .padding([8, 10])
+                        .width(Length::Fill)
+                        .into(),
+                );
             }
         }
 
@@ -412,9 +477,28 @@ impl State {
                 items.push(rule::horizontal(1).into());
                 items.push(text(group_name.clone()).size(13).into());
                 for host in hosts {
-                    let label =
-                        text(format!("  {}  {}@{}", host.name, host.user, host.host)).size(14);
-                    items.push(button(label).style(button::text).width(Length::Fill).into());
+                    let label = row![
+                        container(icons::icon(icons::SERVER, 15).color(ui::ACCENT))
+                            .center_x(34)
+                            .center_y(34)
+                            .style(ui::accent_badge),
+                        column![
+                            text(host.name.clone()).size(14),
+                            ui::muted(format!("{}@{}", host.user, host.host)).size(12),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill);
+                    items.push(
+                        button(label)
+                            .style(ui::nav_item(false))
+                            .padding([8, 10])
+                            .width(Length::Fill)
+                            .into(),
+                    );
                 }
             }
         }
@@ -423,15 +507,30 @@ impl State {
             items.push(text(i18n.tr("settings_connections_empty")).size(14).into());
         }
 
-        let add_btn = button(i18n.tr("main_connect_add"))
-            .on_press(AppMessage::OpenAddHostTab)
-            .width(Length::Shrink);
+        let add_btn = button(
+            row![
+                icons::icon(icons::PLUS, 14),
+                text(i18n.tr("main_connect_add")).size(13),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        )
+        .on_press(AppMessage::OpenAddHostTab)
+        .style(ui::primary_button)
+        .padding([9, 12])
+        .width(Length::Shrink);
 
-        let items_col = iced::widget::Column::from_vec(items).spacing(4);
+        let items_col = iced::widget::Column::from_vec(items)
+            .spacing(4)
+            .width(Length::Fill);
 
-        column![title, rule::horizontal(1), add_btn, items_col,]
-            .spacing(12)
-            .into()
+        settings_section(
+            title,
+            column![add_btn, items_col]
+                .spacing(12)
+                .width(Length::Fill)
+                .into(),
+        )
     }
 
     fn view_sync(&self, i18n: &I18n) -> Element<'_, AppMessage> {
@@ -453,6 +552,8 @@ impl State {
             selected_item,
             AppMessage::SettingsSyncModeChanged,
         )
+        .style(ui::picker)
+        .padding(10)
         .width(Length::Fill);
 
         // Path input + folder button (only when Local mode)
@@ -462,22 +563,32 @@ impl State {
                 let path_input =
                     text_input(i18n.tr("settings_sync_path_hint"), &self.sync_local_path)
                         .on_input(AppMessage::SettingsSyncPathChanged)
+                        .style(ui::input)
+                        .padding(10)
                         .width(Length::Fill);
-                let pick_btn = button(text(i18n.tr("settings_sync_pick_folder")).size(13))
+                // Keep this constructor identical to the Backup/Restore file
+                // chooser so both settings rows have the same label metrics,
+                // padding, and secondary-button treatment.
+                let pick_btn = button(i18n.tr("settings_sync_pick_folder"))
                     .on_press(AppMessage::SettingsSyncPickFolder)
+                    .style(ui::secondary_button)
+                    .padding([9, 12])
                     .width(Length::Shrink);
-                let path_row = row![path_input, pick_btn].spacing(8).width(Length::Fill);
+                let path_row = row![path_input, pick_btn]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill);
 
                 // Quick location shortcuts
                 let icloud_label = text("iCloud Drive").size(12);
                 let icloud_btn = button(icloud_label)
                     .on_press(AppMessage::SettingsSyncQuickLocation(QuickLocation::ICloud))
-                    .style(button::text)
+                    .style(ui::nav_item(false))
                     .padding([2, 6]);
                 let home_label = text("~").size(12);
                 let home_btn = button(home_label)
                     .on_press(AppMessage::SettingsSyncQuickLocation(QuickLocation::Home))
-                    .style(button::text)
+                    .style(ui::nav_item(false))
                     .padding([2, 6]);
                 let shortcuts_hint = text(i18n.tr("settings_sync_quick_locations")).size(11);
                 let shortcuts_row = row![shortcuts_hint, icloud_btn, home_btn]
@@ -494,9 +605,15 @@ impl State {
         // Save button
         let can_save = !self.saving;
         let save_btn = if self.saving {
-            button(i18n.tr("common_saving")).width(Length::Shrink)
+            button(i18n.tr("common_saving"))
+                .width(Length::Shrink)
+                .style(ui::primary_button)
+                .padding([9, 14])
         } else {
-            button(i18n.tr("common_save")).width(Length::Shrink)
+            button(i18n.tr("common_save"))
+                .width(Length::Shrink)
+                .style(ui::primary_button)
+                .padding([9, 14])
         };
         let save_btn = if can_save {
             save_btn.on_press(AppMessage::SettingsSave)
@@ -515,27 +632,30 @@ impl State {
             None => text(""),
         };
 
-        column![
+        settings_section(
             title,
-            rule::horizontal(1),
-            explain,
-            mode_label,
-            mode_pick,
-            path_section,
-            save_btn,
-            status_text,
-            error_text,
-        ]
-        .spacing(12)
-        .into()
+            column![
+                explain,
+                mode_label,
+                mode_pick,
+                path_section,
+                row![save_btn, status_text].spacing(10),
+                error_text,
+            ]
+            .spacing(12)
+            .into(),
+        )
     }
 
     fn view_terminal(&self, i18n: &I18n) -> Element<'_, AppMessage> {
         let title = text(i18n.tr("settings_terminal")).size(20);
+        let renderer_hint = ui::muted(i18n.tr("settings_terminal_renderer_hint")).size(12);
 
         let scroll_label = text(i18n.tr("settings_scrollback")).size(14);
         let scroll_input = text_input("3000", &self.scrollback_lines)
             .on_input(AppMessage::SettingsScrollbackChanged)
+            .style(ui::input)
+            .padding(10)
             .width(Length::Fill);
         let scroll_hint = text(i18n.tr("settings_scrollback_hint")).size(11);
 
@@ -545,6 +665,8 @@ impl State {
             Some(&self.terminal_font_family),
             AppMessage::SettingsTerminalFontFamilyChanged,
         )
+        .style(ui::picker)
+        .padding(10)
         .width(Length::Fill);
         let font_family_hint = text(i18n.tr("settings_terminal_font_family_hint")).size(11);
 
@@ -554,6 +676,8 @@ impl State {
             Some(self.terminal_font_size),
             AppMessage::SettingsTerminalFontSizeChanged,
         )
+        .style(ui::picker)
+        .padding(10)
         .width(Length::Fill);
         let font_size_hint = text(i18n.tr("settings_terminal_font_size_hint")).size(11);
 
@@ -563,9 +687,15 @@ impl State {
 
         let can_save = !self.saving;
         let save_btn = if self.saving {
-            button(i18n.tr("common_saving")).width(Length::Shrink)
+            button(i18n.tr("common_saving"))
+                .width(Length::Shrink)
+                .style(ui::primary_button)
+                .padding([9, 14])
         } else {
-            button(i18n.tr("common_save")).width(Length::Shrink)
+            button(i18n.tr("common_save"))
+                .width(Length::Shrink)
+                .style(ui::primary_button)
+                .padding([9, 14])
         };
 
         let save_btn = if can_save {
@@ -585,38 +715,49 @@ impl State {
             None => text(""),
         };
 
-        column![
+        settings_section(
             title,
-            rule::horizontal(1),
-            scroll_label,
-            scroll_input,
-            scroll_hint,
-            font_family_label,
-            font_family_input,
-            font_family_hint,
-            font_size_label,
-            font_size_input,
-            font_size_hint,
-            cursor_blink,
-            save_btn,
-            status_text,
-            error_text,
-        ]
-        .spacing(12)
-        .into()
+            column![
+                renderer_hint,
+                scroll_label,
+                scroll_input,
+                scroll_hint,
+                rule::horizontal(1),
+                font_family_label,
+                font_family_input,
+                font_family_hint,
+                font_size_label,
+                font_size_input,
+                font_size_hint,
+                cursor_blink,
+                row![save_btn, status_text].spacing(10),
+                error_text,
+            ]
+            .spacing(11)
+            .into(),
+        )
     }
 
     fn view_backup(&self, i18n: &I18n) -> Element<'_, AppMessage> {
-        let title = text(i18n.tr("backup_title")).size(20);
-
-        let export_btn = button(i18n.tr("backup_title"))
-            .on_press(AppMessage::OpenBackup)
-            .width(Length::Shrink);
-
-        column![title, rule::horizontal(1), export_btn,]
-            .spacing(12)
-            .into()
+        let title = text(i18n.tr("backup_page_title")).size(20);
+        settings_section(title, self.backup.view_settings_content(i18n))
     }
+}
+
+fn settings_section<'a>(
+    title: iced::widget::Text<'a>,
+    content: Element<'a, AppMessage>,
+) -> Element<'a, AppMessage> {
+    column![
+        title,
+        container(content)
+            .padding(18)
+            .width(Length::Fill)
+            .style(ui::surface),
+    ]
+    .spacing(14)
+    .width(Length::Fill)
+    .into()
 }
 
 #[cfg(test)]

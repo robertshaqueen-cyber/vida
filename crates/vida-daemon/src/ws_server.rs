@@ -486,7 +486,28 @@ async fn handle_request(
         }
         Request::ExportBackup { passphrase } => {
             let data = state.export_backup(passphrase.as_deref())?;
-            Ok(serde_json::json!({"bytes": data.len()}))
+            Ok(backup_response(data))
+        }
+        Request::PreviewBackup { data, passphrase } => {
+            let (host_count, modified_at, host_names) = state.preview_backup(&data, &passphrase)?;
+            let modified_at_display = chrono::DateTime::from_timestamp(modified_at, 0)
+                .map(|date| date.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "未知时间".to_string());
+            Ok(serde_json::json!({
+                "host_count": host_count,
+                "modified_at": modified_at_display,
+                "host_names": host_names,
+            }))
+        }
+        Request::RestoreBackup { data, passphrase } => {
+            let (hosts, warning) = state.restore_backup(&data, &passphrase)?;
+            let settings = state.get_settings()?;
+            Ok(serde_json::json!({
+                "restored": true,
+                "hosts": hosts,
+                "settings": settings,
+                "warning": warning,
+            }))
         }
 
         // Settings
@@ -575,6 +596,13 @@ async fn handle_request(
             Ok(serde_json::json!({"handled": true}))
         }
     }
+}
+
+/// Keep the encrypted backup bytes in the response. The GUI owns destination
+/// selection and persists these bytes only after the user confirms a path.
+fn backup_response(data: Vec<u8>) -> serde_json::Value {
+    let bytes = data.len();
+    serde_json::json!({"bytes": bytes, "data": data})
 }
 
 /// PTY 会话请求（M2a-2）。只锁 `state.pty`（独立 RwLock），
@@ -726,4 +754,24 @@ pub async fn start(state: Arc<Mutex<DaemonState>>) -> Result<SocketAddr> {
     });
 
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backup_response;
+
+    #[test]
+    fn backup_response_preserves_every_encrypted_byte() {
+        let ciphertext = vec![0, 1, 127, 128, 254, 255];
+        let response = backup_response(ciphertext.clone());
+        let returned: Vec<u8> = response["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u8)
+            .collect();
+
+        assert_eq!(response["bytes"], ciphertext.len());
+        assert_eq!(returned, ciphertext);
+    }
 }

@@ -5,13 +5,14 @@
 
 use std::sync::Arc;
 
-use iced::widget::{button, column, container, text};
-use iced::{Background, Color, Element, Length};
+use iced::widget::{Space, button, column, container, row, text};
+use iced::{Alignment, Background, Color, Element, Length};
 
 use crate::app::AppMessage;
 use crate::term::client_grid::ClientGrid;
 use crate::term::primitive::{TerminalAppearance, ViewportMetrics};
 use crate::term::widget;
+use crate::ui::{self, icons};
 
 /// 终端会话状态（调试屏持有）。
 #[derive(Debug, Clone)]
@@ -57,19 +58,34 @@ impl TerminalSession {
 impl TerminalSession {
     /// 渲染终端画面 + 会话状态栏。
     pub fn view(&self) -> Element<'_, AppMessage> {
-        let notice_el = match &self.notice {
-            Some(n) => text(n).size(12),
-            None => text("").size(12),
-        };
         let status = if self.closed {
             let code_text = match self.exit_code {
                 Some(code) => format!("会话已结束（shell 退出，exit_code={}）", code),
                 None => "会话已结束（shell 退出，退出码未知）".to_string(),
             };
-            text(code_text).size(12)
+            text(code_text).size(11).color(ui::DANGER)
         } else {
-            text(format!("会话 {}", self.session_id)).size(12)
+            ui::muted(format!("会话 {}", self.session_id)).size(11)
         };
+        let back = button(icons::icon(icons::X, 14))
+            .on_press(AppMessage::CloseDebugTerminal)
+            .style(ui::icon_button(false))
+            .padding(8);
+        let toolbar = container(
+            row![
+                icons::icon(icons::TERMINAL, 15).color(ui::ACCENT),
+                text("本地终端").size(13),
+                Space::new().width(Length::Fill),
+                status,
+                back,
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+        )
+        .height(40)
+        .padding([3, 10])
+        .width(Length::Fill)
+        .style(ui::chrome);
         let canvas = container(widget::canvas(
             self.snapshot(),
             self.viewport_metrics.clone(),
@@ -85,14 +101,21 @@ impl TerminalSession {
             background: Some(Background::Color(Color::from_rgb8(40, 44, 52))),
             ..Default::default()
         });
-        let back = button("返回").on_press(AppMessage::CloseDebugTerminal);
-        let content = column![notice_el, status, canvas, back]
-            .spacing(8)
-            .padding(8)
+        let notice_el: Element<'_, AppMessage> = match &self.notice {
+            Some(n) => container(text(n).size(12))
+                .padding([7, 12])
+                .width(Length::Fill)
+                .style(ui::surface)
+                .into(),
+            None => container(Space::new()).height(0).into(),
+        };
+        let content = column![toolbar, notice_el, canvas]
+            .spacing(0)
             .height(Length::Fill);
         container(content)
             .height(Length::Fill)
             .width(Length::Fill)
+            .style(ui::app_background)
             .into()
     }
 }

@@ -1,4 +1,4 @@
-use iced::{Element, Task, Theme};
+use iced::{Element, Task};
 use vida_core::i18n::{self, I18n};
 
 use crate::screens::{
@@ -22,9 +22,10 @@ pub fn run() -> Result<(), iced::Error> {
     iced::application(new, update, view)
         .font(crate::term::primitive::BUNDLED_REGULAR)
         .font(crate::term::primitive::BUNDLED_BOLD)
+        .font(crate::ui::icons::FONT_BYTES)
         .subscription(subscription)
         .title(|_: &VidaApp| "vida".to_string())
-        .theme(|_: &VidaApp| Theme::Dark)
+        .theme(|_: &VidaApp| crate::ui::theme())
         .centered()
         .window_size((1024.0, 768.0))
         .run()
@@ -200,7 +201,6 @@ pub enum AppMessage {
     SyncCompleted(serde_json::Value),
     LockVault,
     VaultLocked,
-    OpenBackup,
 
     // S4: Host editor
     EditorNameChanged(String),
@@ -249,7 +249,23 @@ pub enum AppMessage {
     BackupPassphraseChanged(String),
     BackupExport,
     BackupExported(String),
-    BackupBack,
+    BackupFailed(String),
+    BackupRestoreChooseFile,
+    BackupRestorePassphraseChanged(String),
+    BackupRestorePreview,
+    BackupRestorePreviewed {
+        data: Vec<u8>,
+        host_count: usize,
+        modified_at: String,
+        host_names: Vec<String>,
+    },
+    BackupRestoreConfirm,
+    BackupRestored {
+        hosts: Vec<s3_main::HostItem>,
+        settings: serde_json::Value,
+        warning: Option<String>,
+    },
+    BackupRestoreFailed(String),
 }
 
 fn new() -> (VidaApp, Task<AppMessage>) {
@@ -1219,11 +1235,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.screen = Screen::Unlock(s2_unlock::State::new());
             Task::none()
         }
-        AppMessage::OpenBackup => {
-            app.screen = Screen::Backup(s9_backup::State::new());
-            Task::none()
-        }
-
         // ---- S5: Settings ----
         AppMessage::SettingsLoaded(val) => {
             let settings = s5_settings::State::from_json(&val, &app.i18n);
@@ -1548,21 +1559,32 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
 
         // ---- S9: Backup ----
         AppMessage::BackupUseCurrentToggled(v) => {
-            if let Screen::Backup(s) = &mut app.screen {
-                s.use_current = v;
+            if let Some(settings) = &mut app.settings_state {
+                settings.backup.use_current = v;
             }
             Task::none()
         }
         AppMessage::BackupPassphraseChanged(p) => {
-            if let Screen::Backup(s) = &mut app.screen {
-                s.export_passphrase = p;
+            if let Some(settings) = &mut app.settings_state {
+                settings.backup.export_passphrase = p;
             }
             Task::none()
         }
         AppMessage::BackupExport => {
-            if let Screen::Backup(s) = &mut app.screen {
+            if let Some(settings) = &mut app.settings_state {
+                let Some(path) = rfd::FileDialog::new()
+                    .set_title(app.i18n.tr("backup_choose_location"))
+                    .set_file_name("vida-backup.age")
+                    .add_filter("age", &["age"])
+                    .save_file()
+                else {
+                    return Task::none();
+                };
+
+                let s = &mut settings.backup;
                 s.exporting = true;
                 s.error = None;
+                s.result = None;
                 let passphrase = if s.use_current {
                     None
                 } else {
@@ -1580,12 +1602,30 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                             .await
                         {
                             Ok(val) => {
-                                let bytes = val.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                                AppMessage::BackupExported(
-                                    i18n.trf("backup_exported", &[&bytes.to_string()]),
-                                )
+                                let data = match parse_backup_bytes(&val) {
+                                    Ok(data) => data,
+                                    Err(()) => {
+                                        return AppMessage::BackupFailed(
+                                            i18n.tr("backup_invalid_data").to_string(),
+                                        );
+                                    }
+                                };
+                                let bytes = data.len();
+                                let path_display = path.display().to_string();
+                                match tokio::fs::write(&path, data).await {
+                                    Ok(()) => {
+                                        AppMessage::BackupExported(i18n.trf(
+                                            "backup_saved",
+                                            &[&path_display, &bytes.to_string()],
+                                        ))
+                                    }
+                                    Err(error) => AppMessage::BackupFailed(i18n.trf(
+                                        "backup_write_failed",
+                                        &[&path_display, &error.to_string()],
+                                    )),
+                                }
                             }
-                            Err(e) => AppMessage::WsError(e.to_string()),
+                            Err(e) => AppMessage::BackupFailed(e.to_string()),
                         }
                     },
                     |r| r,
@@ -1595,25 +1635,238 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
         }
         AppMessage::BackupExported(msg) => {
-            if let Screen::Backup(s) = &mut app.screen {
-                s.exporting = false;
-                s.result = Some(msg);
+            if let Some(settings) = &mut app.settings_state {
+                settings.backup.exporting = false;
+                settings.backup.result = Some(msg);
             }
             Task::none()
         }
-        AppMessage::BackupBack => {
+        AppMessage::BackupFailed(message) => {
+            if let Some(settings) = &mut app.settings_state {
+                settings.backup.exporting = false;
+                settings.backup.error = Some(message);
+            }
+            Task::none()
+        }
+        AppMessage::BackupRestoreChooseFile => {
+            let title = app.i18n.tr("backup_restore_choose_file");
+            let Some(path) = rfd::FileDialog::new()
+                .set_title(title)
+                .add_filter("age", &["age"])
+                .pick_file()
+            else {
+                return Task::none();
+            };
+            if let Some(settings) = &mut app.settings_state {
+                let backup = &mut settings.backup;
+                backup.restore_path = path.display().to_string();
+                backup.restore_data.clear();
+                backup.restore_preview = None;
+                backup.restore_result = None;
+                backup.restore_error = None;
+            }
+            Task::none()
+        }
+        AppMessage::BackupRestorePassphraseChanged(passphrase) => {
+            if let Some(settings) = &mut app.settings_state {
+                let backup = &mut settings.backup;
+                backup.restore_passphrase = passphrase;
+                // The preview is bound to the exact passphrase and ciphertext
+                // that were validated. Editing either requires validation again.
+                backup.restore_data.clear();
+                backup.restore_preview = None;
+                backup.restore_result = None;
+                backup.restore_error = None;
+            }
+            Task::none()
+        }
+        AppMessage::BackupRestorePreview => {
+            let Some(settings) = &mut app.settings_state else {
+                return Task::none();
+            };
+            let backup = &mut settings.backup;
+            if backup.restore_path.is_empty() || backup.restore_passphrase.is_empty() {
+                return Task::none();
+            }
+            backup.restore_validating = true;
+            backup.restore_data.clear();
+            backup.restore_preview = None;
+            backup.restore_result = None;
+            backup.restore_error = None;
+
+            let path = std::path::PathBuf::from(&backup.restore_path);
+            let path_display = backup.restore_path.clone();
+            let passphrase = backup.restore_passphrase.clone();
             let client = app.ws_client.as_ref().unwrap().clone();
+            let i18n = app.i18n.clone();
             Task::perform(
                 async move {
-                    match client.list_hosts().await {
-                        Ok(hosts_val) => AppMessage::HostsLoaded(parse_hosts(&hosts_val)),
-                        Err(e) => AppMessage::WsError(e.to_string()),
+                    let data = match tokio::fs::read(&path).await {
+                        Ok(data) => data,
+                        Err(error) => {
+                            return AppMessage::BackupRestoreFailed(i18n.trf(
+                                "backup_restore_read_failed",
+                                &[&path_display, &error.to_string()],
+                            ));
+                        }
+                    };
+                    match client
+                        .send(
+                            "PreviewBackup",
+                            serde_json::json!({
+                                "data": data.clone(),
+                                "passphrase": passphrase,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(value) => {
+                            let Some(host_count) = value
+                                .get("host_count")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|count| usize::try_from(count).ok())
+                            else {
+                                return AppMessage::BackupRestoreFailed(
+                                    i18n.tr("backup_restore_invalid_response").to_string(),
+                                );
+                            };
+                            let Some(modified_at) = value
+                                .get("modified_at")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                            else {
+                                return AppMessage::BackupRestoreFailed(
+                                    i18n.tr("backup_restore_invalid_response").to_string(),
+                                );
+                            };
+                            let Some(host_names) = value
+                                .get("host_names")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|names| {
+                                    names
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                            else {
+                                return AppMessage::BackupRestoreFailed(
+                                    i18n.tr("backup_restore_invalid_response").to_string(),
+                                );
+                            };
+                            AppMessage::BackupRestorePreviewed {
+                                data,
+                                host_count,
+                                modified_at,
+                                host_names,
+                            }
+                        }
+                        Err(error) => AppMessage::BackupRestoreFailed(error.to_string()),
                     }
                 },
-                |r| r,
+                |message| message,
             )
         }
-
+        AppMessage::BackupRestorePreviewed {
+            data,
+            host_count,
+            modified_at,
+            host_names,
+        } => {
+            if let Some(settings) = &mut app.settings_state {
+                let backup = &mut settings.backup;
+                backup.restore_validating = false;
+                backup.restore_data = data;
+                backup.restore_preview = Some(s9_backup::RestorePreview {
+                    host_count,
+                    modified_at,
+                    host_names,
+                });
+            }
+            Task::none()
+        }
+        AppMessage::BackupRestoreConfirm => {
+            let Some(settings) = &mut app.settings_state else {
+                return Task::none();
+            };
+            let backup = &mut settings.backup;
+            if backup.restore_preview.is_none() || backup.restore_data.is_empty() {
+                return Task::none();
+            }
+            backup.restoring = true;
+            backup.restore_error = None;
+            backup.restore_result = None;
+            let data = backup.restore_data.clone();
+            let passphrase = backup.restore_passphrase.clone();
+            let client = app.ws_client.as_ref().unwrap().clone();
+            let i18n = app.i18n.clone();
+            Task::perform(
+                async move {
+                    let restored = match client
+                        .send(
+                            "RestoreBackup",
+                            serde_json::json!({
+                                "data": data,
+                                "passphrase": passphrase,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return AppMessage::BackupRestoreFailed(error.to_string());
+                        }
+                    };
+                    let Some(host_values) = restored.get("hosts") else {
+                        return AppMessage::BackupRestoreFailed(
+                            i18n.tr("backup_restore_invalid_response").to_string(),
+                        );
+                    };
+                    let Some(settings) = restored.get("settings").cloned() else {
+                        return AppMessage::BackupRestoreFailed(
+                            i18n.tr("backup_restore_invalid_response").to_string(),
+                        );
+                    };
+                    let hosts = parse_hosts(host_values);
+                    let warning = restored
+                        .get("warning")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    AppMessage::BackupRestored {
+                        hosts,
+                        settings,
+                        warning,
+                    }
+                },
+                |message| message,
+            )
+        }
+        AppMessage::BackupRestored {
+            hosts,
+            settings,
+            warning,
+        } => {
+            app.set_hosts(hosts);
+            let mut state = s5_settings::State::from_json(&settings, &app.i18n);
+            state.active_section = s5_settings::SettingsSection::Backup;
+            let mut result = app.i18n.tr("backup_restore_success").to_string();
+            if let Some(warning) = warning {
+                result.push(' ');
+                result.push_str(&warning);
+            }
+            state.backup.restore_result = Some(result);
+            app.terminal_appearance = state.terminal_appearance();
+            app.settings_state = Some(state);
+            Task::none()
+        }
+        AppMessage::BackupRestoreFailed(message) => {
+            if let Some(settings) = &mut app.settings_state {
+                settings.backup.restore_validating = false;
+                settings.backup.restoring = false;
+                settings.backup.restore_error = Some(message);
+            }
+            Task::none()
+        }
         // ---- Interactive debug terminal (M2b-2) ----
         AppMessage::OpenDebugTerminal => {
             let client = match app.ws_client.as_ref() {
@@ -1969,7 +2222,22 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     }
                 }
             } else {
-                let placeholder = text(app.i18n.tr("main_no_hosts")).size(16);
+                let placeholder = container(
+                    column![
+                        container(
+                            crate::ui::icons::icon(crate::ui::icons::SERVER, 22)
+                                .color(crate::ui::ACCENT),
+                        )
+                        .center_x(48)
+                        .center_y(48)
+                        .style(crate::ui::accent_badge),
+                        crate::ui::muted(app.i18n.tr("main_no_hosts")).size(14),
+                    ]
+                    .spacing(12)
+                    .align_x(iced::Alignment::Center),
+                )
+                .padding([22, 28])
+                .style(crate::ui::surface);
                 container(placeholder)
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -2008,12 +2276,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 let base_el: Element<'_, AppMessage> = container(base)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(|theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(
-                            theme.extended_palette().background.base.color,
-                        )),
-                        ..Default::default()
-                    })
+                    .style(crate::ui::app_background)
                     .into();
 
                 // Single dim overlay layer; clicking anywhere closes the panel.
@@ -2040,13 +2303,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 let panel_inner: Element<'_, AppMessage> = container(panel)
                     .padding(4)
                     .width(Length::Fixed(420.0))
-                    .style(|_: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(Color::from_rgba(
-                            0.12, 0.12, 0.15, 1.0,
-                        ))),
-                        border: iced::Border::default().rounded(8),
-                        ..Default::default()
-                    })
+                    .style(crate::ui::elevated)
                     .into();
 
                 let panel_el: Element<'_, AppMessage> = container(panel_inner)
@@ -2115,4 +2372,42 @@ fn parse_hosts(val: &serde_json::Value) -> Vec<s3_main::HostItem> {
             })
         })
         .collect()
+}
+
+fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
+    value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?
+        .iter()
+        .map(|byte| {
+            byte.as_u64()
+                .filter(|value| *value <= u8::MAX as u64)
+                .map(|value| value as u8)
+                .ok_or(())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_backup_bytes;
+
+    #[test]
+    fn backup_bytes_accept_full_byte_range() {
+        let value = serde_json::json!({"data": [0, 1, 127, 128, 254, 255]});
+        assert_eq!(
+            parse_backup_bytes(&value),
+            Ok(vec![0, 1, 127, 128, 254, 255])
+        );
+    }
+
+    #[test]
+    fn backup_bytes_reject_missing_or_out_of_range_values() {
+        assert_eq!(parse_backup_bytes(&serde_json::json!({})), Err(()));
+        assert_eq!(
+            parse_backup_bytes(&serde_json::json!({"data": [256]})),
+            Err(())
+        );
+    }
 }

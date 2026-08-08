@@ -27,12 +27,16 @@ pub enum Request {
     Lock,
     /// Get vault status (locked/unlocked, host count).
     VaultStatus,
-    /// Export vault backup (returns encrypted age bytes).
+    /// Export vault backup (response contains the encrypted age byte array).
     /// passphrase=None → use current unlock passphrase.
     ExportBackup {
         #[serde(default)]
         passphrase: Option<String>,
     },
+    /// Validate a backup without changing the current vault.
+    PreviewBackup { data: Vec<u8>, passphrase: String },
+    /// Replace the current vault with a validated encrypted backup.
+    RestoreBackup { data: Vec<u8>, passphrase: String },
 
     // Settings
     /// Get current vault settings.
