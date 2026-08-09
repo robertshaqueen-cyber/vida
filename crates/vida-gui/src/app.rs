@@ -73,6 +73,9 @@ pub struct VidaApp {
     terminal_appearance: crate::term::primitive::TerminalAppearance,
     /// daemon 连接中断后保留终端标签；金库重新解锁后按原类型恢复会话。
     terminal_restore_pending: bool,
+    /// 防止自动定时重连和手动“重试连接”同时建立两条连接。
+    /// 成功连回 daemon 后保持为 true，直到终端标签恢复完成。
+    terminal_reconnect_in_flight: bool,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -141,8 +144,10 @@ pub enum AppMessage {
         client: WsClient,
         mappings: Vec<(String, String, bool)>,
     },
-    /// 自动重连失败（等待冷却后由用户手动重试）。
+    /// 自动重连失败；界面显示原因，并继续定时重试。
     TerminalReconnectFailed(String),
+    /// 自动重连失败后的下一次定时尝试。
+    TerminalReconnectRetry,
     TerminalSetupError(String),
     /// 人在终端 widget 中产生的原始输入字节。
     TerminalInput(Vec<u8>),
@@ -307,6 +312,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         terminal_reconnect_cooldown: None,
         terminal_appearance: crate::term::primitive::TerminalAppearance::default(),
         terminal_restore_pending: false,
+        terminal_reconnect_in_flight: false,
     };
 
     let connect = Task::perform(
@@ -419,6 +425,7 @@ fn close_all_terminal_sessions(app: &mut VidaApp) {
         .retain(|tab| !matches!(tab.kind, crate::screens::TabKind::Terminal { .. }));
     app.terminal_reconnect_cooldown = None;
     app.terminal_restore_pending = false;
+    app.terminal_reconnect_in_flight = false;
 }
 
 fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
@@ -641,6 +648,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
     match message {
         // ---- Connection ----
         AppMessage::WsConnected(client) => {
+            if !app.terminal_restore_pending {
+                app.terminal_reconnect_in_flight = false;
+            }
             app.ws_client = Some(client);
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -664,6 +674,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::WsError(e) => {
+            app.terminal_reconnect_in_flight = false;
             // If a sync was in flight, surface the failure via the sync indicator
             if app.sync_state == SyncState::Syncing {
                 app.sync_state = SyncState::Error;
@@ -673,15 +684,25 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.screen = Screen::ConnectionFailure(s0_connection::State::new(display));
             Task::none()
         }
-        AppMessage::RetryConnection => Task::perform(
-            async {
-                match WsClient::connect().await {
-                    Ok(client) => AppMessage::WsConnected(client),
-                    Err(e) => AppMessage::WsError(e.to_string()),
-                }
-            },
-            |r| r,
-        ),
+        AppMessage::RetryConnection | AppMessage::TerminalReconnectRetry => {
+            if app.terminal_reconnect_in_flight {
+                return Task::none();
+            }
+            app.terminal_reconnect_in_flight = true;
+            let restoring_terminals = app.terminal_restore_pending;
+            Task::perform(
+                async move {
+                    match WsClient::connect().await {
+                        Ok(client) => AppMessage::WsConnected(client),
+                        Err(e) if restoring_terminals => {
+                            AppMessage::TerminalReconnectFailed(e.to_string())
+                        }
+                        Err(e) => AppMessage::WsError(e.to_string()),
+                    }
+                },
+                |r| r,
+            )
+        }
         AppMessage::DaemonChecked {
             locked,
             vault_exists,
@@ -1498,6 +1519,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
 
         AppMessage::LockVault => {
+            // During daemon recovery the old client cannot perform Lock. More
+            // importantly, closing tabs here would erase the metadata needed
+            // to restore them. Preserve the tabs and make the action an
+            // immediate reconnect attempt instead.
+            if app.terminal_restore_pending {
+                return update(app, AppMessage::RetryConnection);
+            }
             let client = app.ws_client.as_ref().unwrap().clone();
             close_all_terminal_sessions(app);
             if !app.tabs.iter().any(|tab| tab.id == app.active_tab_id) {
@@ -2284,6 +2312,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             }
             app.terminal_reconnect_cooldown = Some(now + std::time::Duration::from_secs(10));
+            app.terminal_reconnect_in_flight = true;
 
             Task::perform(
                 async move {
@@ -2300,6 +2329,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.ws_client = Some(client);
             app.terminal_reconnect_cooldown = None;
             app.terminal_restore_pending = false;
+            app.terminal_reconnect_in_flight = false;
             app.terminal_error = None;
 
             for (old_session_id, new_session_id, replaced) in mappings {
@@ -2328,11 +2358,17 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::TerminalReconnectFailed(message) => {
+            app.terminal_reconnect_in_flight = false;
             app.terminal_opening = false;
             let display = app.i18n.trf("terminal_reconnect_failed", &[&message]);
             app.terminal_error = Some(display.clone());
             app.screen = Screen::ConnectionFailure(s0_connection::State::new(display));
-            Task::none()
+            Task::perform(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                },
+                |_| AppMessage::TerminalReconnectRetry,
+            )
         }
         AppMessage::TerminalSetupError(message) => {
             app.terminal_opening = false;
@@ -2346,7 +2382,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let Some(client) = app.ws_client.as_ref().cloned() else {
                 return Task::none();
             };
-            let closed_notice = app.i18n.tr("terminal_closed_input").to_string();
+            let closed_notice = if app.terminal_restore_pending {
+                app.i18n.tr("terminal_reconnecting").to_string()
+            } else {
+                app.i18n.tr("terminal_closed_input").to_string()
+            };
             let Some(session) = active_terminal_mut(app) else {
                 return Task::none();
             };
@@ -2899,6 +2939,15 @@ mod tests {
 
         assert!(app.terminal_restore_pending);
         assert!(app.terminal_sessions.values().all(|session| session.closed));
+        assert!(
+            terminal_tab_ids
+                .iter()
+                .all(|id| app.tabs.iter().any(|tab| &tab.id == id))
+        );
+
+        let _ = update(&mut app, AppMessage::LockVault);
+        assert!(app.terminal_restore_pending);
+        assert_eq!(app.terminal_sessions.len(), 2);
         assert!(
             terminal_tab_ids
                 .iter()
