@@ -155,6 +155,33 @@ macOS、1920×1080、scale factor=1。使用隔离临时配置目录启动 relea
 
 该数字是 `Physical footprint`，不是 RSS；测量用临时目录不含用户金库或会话数据，完成后删除。
 
+### M5b Agent 写入策略、审批与审计
+
+- v7 金库为每台主机保存 `agent_trust`；v6 迁移统一使用安全默认值 `ask`，并有真实 v6 JSON
+  快照测试验证凭据和其余字段不丢失。
+- daemon 维护 session→host 的设备本地映射。Agent 使用独立角色 token，只能调用
+  `AgentExec` 和必要的只读接口；人的 `SessionInput`/`PasteSession` 不经过策略层，也不能被
+  Agent token 调用。
+- 命令门提供 readonly/ask/trusted、内置危险命令表、120 秒内存审批和 0600 JSONL 审计。
+  审计不保存命令明文，只保存长度与 SHA-256 指纹；审计落盘失败时不会发送命令。
+- `vidactl session exec` 使用 Agent 角色；`host trust`、`approval`、`audit` 使用所有者角色。
+  `needs_approval`/`rejected` 的稳定退出码分别为 20/21，JSON 仍保持统一 envelope。
+
+#### M5b release 内存实测（2026-08-10）
+
+macOS、1920×1080、scale factor=1。使用隔离临时配置目录启动 release daemon；先测空闲
+控制面，再打开一个 100×40 本地会话，分别执行一条允许命令和一条进入待审批的危险命令，
+使规则正则、session 映射、审计和 pending approval 全部实际加载。
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| release daemon，空金库、无会话 | **3872K** |
+| release daemon，1 个 100×40 会话、策略已加载、1 条待审批 | **6368K** |
+
+两项均来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS。测试同时确认审计文件
+只含命令字节数和 SHA-256，不含两条测试命令明文；随后关闭会话、停止 daemon 并删除隔离
+临时目录。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |

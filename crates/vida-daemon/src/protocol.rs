@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use vida_core::agent_policy::AgentTrust;
 use vida_core::sync::ConflictFile;
 use vida_core::vault::Settings;
 
@@ -11,11 +12,15 @@ use vida_core::vault::Settings;
 pub enum Request {
     // Auth
     /// First message after WebSocket connect. Daemon rejects if token mismatches.
-    Auth { token: String },
+    Auth {
+        token: String,
+    },
 
     // Vault
     /// Create a new vault with the given passphrase.
-    CreateVault { passphrase: String },
+    CreateVault {
+        passphrase: String,
+    },
     /// Unlock an existing vault.
     /// `remember_seconds`: cache the passphrase in the OS keyring for this
     /// bounded duration. `remember=true` is retained for older clients and
@@ -38,44 +43,93 @@ pub enum Request {
         passphrase: Option<String>,
     },
     /// Validate a backup without changing the current vault.
-    PreviewBackup { data: Vec<u8>, passphrase: String },
+    PreviewBackup {
+        data: Vec<u8>,
+        passphrase: String,
+    },
     /// Replace the current vault with a validated encrypted backup.
-    RestoreBackup { data: Vec<u8>, passphrase: String },
+    RestoreBackup {
+        data: Vec<u8>,
+        passphrase: String,
+    },
 
     // Settings
     /// Get current vault settings.
     GetSettings,
     /// Update vault settings (sync path, scrollback, etc.).
-    UpdateSettings { settings: Settings },
+    UpdateSettings {
+        settings: Settings,
+    },
 
     // Hosts
     /// List all hosts (returns summary, no credentials).
     ListHosts,
     /// Reveal a host's credential (returns actual password/key).
-    RevealCredential { host_id: String },
+    RevealCredential {
+        host_id: String,
+    },
     /// Add or update a host. id=None → create, id=Some → update.
     /// password=None on update → keep existing credential.
-    UpdateHost { host: HostRequest },
+    UpdateHost {
+        host: HostRequest,
+    },
     /// Delete a host by id.
-    DeleteHost { host_id: String },
+    DeleteHost {
+        host_id: String,
+    },
+    /// Change the Agent write policy for one host. Owner clients only.
+    SetHostAgentTrust {
+        host_id: String,
+        trust: AgentTrust,
+    },
+
+    // Agent control. AgentExec is Agent-role only; approval and audit are
+    // owner-role only. Human SessionInput never enters this path.
+    AgentExec {
+        session_id: String,
+        command: String,
+    },
+    ListAgentApprovals,
+    ApproveAgentAction {
+        approval_id: String,
+    },
+    DenyAgentAction {
+        approval_id: String,
+    },
+    ReadAgentAudit {
+        #[serde(default = "default_audit_limit")]
+        limit: usize,
+        #[serde(default)]
+        host_id: Option<String>,
+    },
 
     // Sync
     /// Trigger a sync cycle.
     Sync,
     /// Resolve a conflict by choosing "local" or "remote".
-    ResolveConflict { choice: ConflictChoice },
+    ResolveConflict {
+        choice: ConflictChoice,
+    },
 
     // Conflict files (cloud-service conflicts like Dropbox)
     /// Read a conflict file and return its decrypted host summaries.
-    ReadConflictFile { path: String },
+    ReadConflictFile {
+        path: String,
+    },
     /// Adopt a conflict file: backup current vault → replace with conflict file content.
-    AdoptConflictFile { path: String },
+    AdoptConflictFile {
+        path: String,
+    },
     /// Ignore a conflict file: rename to .reviewed suffix.
-    IgnoreConflictFile { path: String },
+    IgnoreConflictFile {
+        path: String,
+    },
 
     // Remote missing
     /// Handle RemoteMissing: "reupload" or "clear_state".
-    HandleRemoteMissing { action: String },
+    HandleRemoteMissing {
+        action: String,
+    },
 
     // PTY sessions (M2a-2)
     // untagged: 尝试将 JSON 直接反序列化为 PtyRequest（内部
@@ -270,6 +324,7 @@ pub struct HostSummary {
     pub color: Option<String>,
     pub auth_kind: String,
     pub notes: Option<String>,
+    pub agent_trust: vida_core::agent_policy::AgentTrust,
 }
 
 /// Sync response — includes host list when vault may have changed.
@@ -287,6 +342,10 @@ pub struct SyncResponse {
     /// Present when ConflictFilesDetected — decoded hosts from conflict files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_hosts: Option<Vec<HostSummary>>,
+}
+
+fn default_audit_limit() -> usize {
+    50
 }
 
 #[cfg(test)]

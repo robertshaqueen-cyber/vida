@@ -1,14 +1,13 @@
 //! Human- and script-facing Vida daemon client.
 //!
-//! This first M5 checkpoint is deliberately read-only. Commands that can
-//! modify a terminal or vault arrive together with policy and audit support in
-//! the next checkpoint; exposing raw write access before that would bypass the
-//! product's safety model.
+//! Read operations use the owner's daemon role. Agent command execution uses a
+//! separate token and can only reach the daemon-owned policy/approval/audit
+//! gate; it cannot fall through to raw human terminal input.
 
 use std::process::ExitCode;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vida_client::{DaemonError, WsClient};
@@ -19,14 +18,16 @@ const EXIT_DAEMON: u8 = 11;
 const EXIT_NOT_FOUND: u8 = 12;
 const EXIT_AMBIGUOUS: u8 = 13;
 const EXIT_DATA: u8 = 14;
+const EXIT_NEEDS_APPROVAL: u8 = 20;
+const EXIT_REJECTED: u8 = 21;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "vidactl",
     version,
     about = "Vida daemon 的命令行客户端",
-    long_about = "读取 Vida daemon 的金库状态、主机和终端会话。\n\
-                  需要交互操作终端时请使用 Vida GUI；当前检查点不提供写入命令。"
+    long_about = "读取 Vida daemon 状态，并通过统一安全策略让 Agent 执行完整命令。\n\
+                  人的交互式终端输入仍请使用 Vida GUI。"
 )]
 struct Cli {
     /// 输出稳定的 JSON envelope，供脚本使用；不要用于交互阅读。
@@ -53,6 +54,18 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// 查看并处理 Agent 危险命令审批；不要用它发送普通终端输入。
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
+    /// 查看 Agent 写入审计；不要把它当作完整终端流水。
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        host_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -61,6 +74,8 @@ enum HostCommand {
     List,
     /// 按完整 ID 或唯一名称查看主机摘要；不会显示凭据。
     Show { host: String },
+    /// 设置 Agent 写入权限；人的终端输入不受影响。
+    Trust { host: String, trust: TrustArg },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +84,39 @@ enum SessionCommand {
     List,
     /// 读取当前终端屏幕快照；普通命令的完整流水应等待后续 stream 命令。
     Screen { session_id: String },
+    /// 通过 daemon 安全策略发送一条完整命令；不要用于交互按键或秘密值。
+    Exec {
+        session_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApprovalCommand {
+    /// 列出仍在 120 秒有效期内的待审批命令。
+    List,
+    /// 批准并发送一条待审批命令。
+    Approve { approval_id: String },
+    /// 拒绝一条待审批命令，保证它不会发送。
+    Deny { approval_id: String },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrustArg {
+    Readonly,
+    Ask,
+    Trusted,
+}
+
+impl TrustArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::Ask => "ask",
+            Self::Trusted => "trusted",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -92,6 +140,7 @@ struct HostSummary {
     color: Option<String>,
     auth_kind: String,
     notes: Option<String>,
+    agent_trust: String,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -171,8 +220,9 @@ async fn main() -> ExitCode {
     let i18n = I18n::new(vida_core::i18n::detect_lang());
     match execute(&cli, &i18n).await {
         Ok(output) => {
+            let exit_code = output.exit_code();
             print_success(cli.json, output, &i18n);
-            ExitCode::SUCCESS
+            ExitCode::from(exit_code)
         }
         Err(error) => {
             print_error(cli.json, &error, &i18n);
@@ -182,9 +232,18 @@ async fn main() -> ExitCode {
 }
 
 async fn execute(cli: &Cli, i18n: &I18n) -> std::result::Result<Output, CliError> {
-    let client = WsClient::connect()
-        .await
-        .map_err(|error| CliError::connection(error, i18n))?;
+    let agent_role = matches!(
+        &cli.command,
+        Command::Session {
+            command: SessionCommand::Exec { .. }
+        }
+    );
+    let client = if agent_role {
+        WsClient::connect_agent().await
+    } else {
+        WsClient::connect().await
+    }
+    .map_err(|error| CliError::connection(error, i18n))?;
 
     match &cli.command {
         Command::Doctor => {
@@ -204,6 +263,17 @@ async fn execute(cli: &Cli, i18n: &I18n) -> std::result::Result<Output, CliError
                 let selected = select_host(hosts, host, i18n)?;
                 Ok(Output::Host(selected))
             }
+            HostCommand::Trust { host, trust } => {
+                let hosts = typed_hosts(&client, i18n).await?;
+                let selected = select_host(hosts, host, i18n)?;
+                let result = client
+                    .set_host_agent_trust(&selected.id, trust.as_str())
+                    .await?;
+                Ok(Output::HostTrust {
+                    host: selected.name,
+                    result,
+                })
+            }
         },
         Command::Session { command } => match command {
             SessionCommand::List => Ok(Output::Sessions(typed_sessions(&client, i18n).await?)),
@@ -214,7 +284,28 @@ async fn execute(cli: &Cli, i18n: &I18n) -> std::result::Result<Output, CliError
                     .map_err(|error| CliError::data(error, i18n))?;
                 Ok(Output::Screen(screen))
             }
+            SessionCommand::Exec {
+                session_id,
+                command,
+            } => {
+                let command = command.join(" ");
+                Ok(Output::AgentExec(
+                    client.agent_exec(session_id, &command).await?,
+                ))
+            }
         },
+        Command::Approval { command } => match command {
+            ApprovalCommand::List => Ok(Output::Approvals(client.list_agent_approvals().await?)),
+            ApprovalCommand::Approve { approval_id } => Ok(Output::ApprovalAction(
+                client.approve_agent_action(approval_id).await?,
+            )),
+            ApprovalCommand::Deny { approval_id } => Ok(Output::ApprovalAction(
+                client.deny_agent_action(approval_id).await?,
+            )),
+        },
+        Command::Audit { limit, host_id } => Ok(Output::Audit(
+            client.read_agent_audit(*limit, host_id.as_deref()).await?,
+        )),
     }
 }
 
@@ -285,6 +376,14 @@ enum Output {
     Host(HostSummary),
     Sessions(Vec<SessionInfo>),
     Screen(ScreenData),
+    HostTrust {
+        host: String,
+        result: Value,
+    },
+    AgentExec(Value),
+    Approvals(Value),
+    ApprovalAction(Value),
+    Audit(Value),
 }
 
 impl Output {
@@ -300,6 +399,22 @@ impl Output {
             Self::Host(host) => json!(host),
             Self::Sessions(sessions) => json!(sessions),
             Self::Screen(screen) => json!(screen),
+            Self::HostTrust { result, .. }
+            | Self::AgentExec(result)
+            | Self::Approvals(result)
+            | Self::ApprovalAction(result)
+            | Self::Audit(result) => result.clone(),
+        }
+    }
+
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::AgentExec(result) => match result.get("status").and_then(Value::as_str) {
+                Some("needs_approval") => EXIT_NEEDS_APPROVAL,
+                Some("rejected") => EXIT_REJECTED,
+                _ => 0,
+            },
+            _ => 0,
         }
     }
 
@@ -360,7 +475,7 @@ impl Output {
                 }
             }
             Self::Host(host) => format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 i18n.trf("cli_host_name", &[&host.name]),
                 i18n.trf("cli_host_id", &[&host.id]),
                 i18n.trf(
@@ -378,6 +493,7 @@ impl Output {
                     }]
                 ),
                 i18n.trf("cli_host_notes", &[host.notes.as_deref().unwrap_or("—")]),
+                i18n.trf("cli_host_agent_trust", &[&host.agent_trust]),
             ),
             Self::Sessions(sessions) => {
                 if sessions.is_empty() {
@@ -405,6 +521,109 @@ impl Output {
                 }
             }
             Self::Screen(screen) => screen.lines.join("\n"),
+            Self::HostTrust { host, result } => {
+                i18n.trf(
+                    "cli_host_trust_updated",
+                    &[
+                        host,
+                        result
+                            .get("trust")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                    ],
+                ) + "\n"
+            }
+            Self::AgentExec(result) => match result.get("status").and_then(Value::as_str) {
+                Some("sent") => format!("{}\n", i18n.tr("cli_agent_sent")),
+                Some("needs_approval") => {
+                    i18n.trf(
+                        "cli_agent_needs_approval",
+                        &[
+                            result
+                                .get("approval_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—"),
+                            &result
+                                .get("reasons")
+                                .and_then(Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default(),
+                        ],
+                    ) + "\n"
+                }
+                Some("rejected") => {
+                    i18n.trf(
+                        "cli_agent_rejected",
+                        &[result.get("message").and_then(Value::as_str).unwrap_or("—")],
+                    ) + "\n"
+                }
+                _ => format!("{}\n", result),
+            },
+            Self::Approvals(result) => {
+                let Some(items) = result.as_array() else {
+                    return format!("{}\n", result);
+                };
+                if items.is_empty() {
+                    format!("{}\n", i18n.tr("cli_approvals_empty"))
+                } else {
+                    items
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}\t{}\t{}",
+                                item.get("approval_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("—"),
+                                item.get("session_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("—"),
+                                item.get("command").and_then(Value::as_str).unwrap_or("—")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n"
+                }
+            }
+            Self::ApprovalAction(result) => format!(
+                "{}\n",
+                match result.get("status").and_then(Value::as_str) {
+                    Some("approved") => i18n.tr("cli_approval_approved"),
+                    Some("denied") => i18n.tr("cli_approval_denied"),
+                    _ => i18n.tr("cli_approval_updated"),
+                }
+            ),
+            Self::Audit(result) => {
+                let Some(items) = result.as_array() else {
+                    return format!("{}\n", result);
+                };
+                if items.is_empty() {
+                    format!("{}\n", i18n.tr("cli_audit_empty"))
+                } else {
+                    items
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}\t{}\t{}\t{}",
+                                item.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
+                                item.get("outcome").and_then(Value::as_str).unwrap_or("—"),
+                                item.get("session_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("—"),
+                                item.get("input").and_then(Value::as_str).unwrap_or("—")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n"
+                }
+            }
         }
     }
 }
@@ -488,6 +707,7 @@ mod tests {
             color: None,
             auth_kind: "password".to_string(),
             notes: None,
+            agent_trust: "ask".to_string(),
         }
     }
 
@@ -567,5 +787,29 @@ mod tests {
             output.human_text(&I18n::new(Lang::En)),
             "remote 中文 output"
         );
+    }
+
+    #[test]
+    fn agent_policy_statuses_have_stable_exit_codes_and_json() {
+        let pending = Output::AgentExec(json!({
+            "status": "needs_approval",
+            "approval_id": "approval-1",
+            "reasons": ["recursive deletion"]
+        }));
+        assert_eq!(pending.exit_code(), EXIT_NEEDS_APPROVAL);
+        assert_eq!(
+            success_envelope(&pending)["data"]["approval_id"],
+            "approval-1"
+        );
+
+        let rejected = Output::AgentExec(json!({
+            "status": "rejected",
+            "reason": "readonly",
+            "message": "not sent"
+        }));
+        assert_eq!(rejected.exit_code(), EXIT_REJECTED);
+
+        let sent = Output::AgentExec(json!({"status": "sent"}));
+        assert_eq!(sent.exit_code(), 0);
     }
 }

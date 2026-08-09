@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
 use tracing::{info, warn};
+use vida_core::agent_policy::AgentTrust;
 use vida_core::config;
 use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
 use vida_core::vault::{AuthMethod, Settings, Vault};
@@ -367,6 +368,34 @@ impl DaemonState {
             .context(self.i18n.tr("daemon_host_not_found"))
     }
 
+    pub fn host_agent_trust(&self, host_id: &str) -> Result<AgentTrust> {
+        Ok(self
+            .ensure_unlocked()?
+            .hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .context(self.i18n.tr("daemon_host_not_found"))?
+            .agent_trust)
+    }
+
+    pub fn set_host_agent_trust(&mut self, host_id: &str, trust: AgentTrust) -> Result<()> {
+        let passphrase = self.ensure_passphrase()?.to_string();
+        let vault_path = self.vault_path.clone();
+        let i18n = self.i18n.clone();
+        let vault = self.ensure_unlocked_mut()?;
+        let host = vault
+            .hosts
+            .iter_mut()
+            .find(|host| host.id == host_id)
+            .context(i18n.tr("daemon_host_not_found"))?;
+        host.agent_trust = trust;
+        vault.modified_at = chrono::Utc::now().timestamp();
+        vault.revision += 1;
+        let encrypted = vida_core::vault::encrypt(vault, &passphrase)?;
+        vida_core::persist::write_atomic(&vault_path, &encrypted)?;
+        Ok(())
+    }
+
     pub fn update_host(&mut self, req: HostRequest) -> Result<HostSummary> {
         let passphrase = self.ensure_passphrase()?.to_string();
         let vault_path = self.vault_path.clone();
@@ -414,6 +443,7 @@ impl DaemonState {
                 color: req.color,
                 auth,
                 notes: req.notes,
+                agent_trust: vida_core::agent_policy::AgentTrust::Ask,
             });
         }
         vault.modified_at = now;
@@ -694,6 +724,7 @@ fn host_to_summary(h: &vida_core::vault::HostEntry) -> HostSummary {
             AuthMethod::KeyInline { .. } => "key_inline".to_string(),
         },
         notes: h.notes.clone(),
+        agent_trust: h.agent_trust,
     }
 }
 

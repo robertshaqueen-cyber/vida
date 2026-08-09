@@ -225,6 +225,7 @@ mod tests {
                     password: SecureString::new("test-pass".to_owned()),
                 },
                 notes: None,
+                agent_trust: crate::agent_policy::AgentTrust::Ask,
             }],
             ..Default::default()
         }

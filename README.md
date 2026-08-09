@@ -17,8 +17,8 @@ vida 解决两个问题：
 二进制增量推送、GPU 渲染、键盘/IME/安全粘贴、窗口 resize 和断线重连；
 **SSH 终端（M3）**已接入系统 OpenSSH，支持金库口令、私钥文件和导入私钥。
 **会话恢复（M4）**使用独立会话宿主持有 PTY/SSH，daemon 崩溃或重启不再结束 shell。
-**Agent 控制层（M5，进行中）**已提供共享 daemon 客户端与只读 `vidactl`；写入策略、
-审计和 MCP Server 仍在后续检查点中。
+**Agent 控制层（M5，进行中）**已提供共享 daemon 客户端、`vidactl`、daemon 侧主机信任
+策略、危险命令审批和不含命令明文的审计；MCP Server 仍在后续检查点中。
 
 ## 截图
 
@@ -45,8 +45,9 @@ vida 解决两个问题：
   系统 `ssh`；支持口令、私钥文件和导入私钥，凭据不进入 argv、环境变量或日志
 - ♻️ **持久会话（M4）**：本机独立会话宿主持有 PTY、SSH、回滚历史和 askpass；
   daemon 重启后复用同一个 session id、shell 进程、工作目录与运行中命令
-- 🧭 **只读命令行（M5a）**：`vidactl` 可诊断 daemon、读取金库状态、主机摘要、
-  活动会话和终端屏幕；`--json` 提供稳定 envelope 和退出码，且不会返回凭据
+- 🧭 **Agent 命令行（M5a/M5b）**：`vidactl` 可诊断 daemon、读取金库状态、主机摘要、
+  活动会话和终端屏幕；Agent 写命令经独立角色进入 daemon 的 readonly/ask/trusted
+  策略、120 秒审批与审计，不能调用人的原始输入接口
 
 规划中：
 
@@ -117,11 +118,18 @@ cargo build --release
 # 启动 daemon（第一个终端）
 cargo run --bin vida-daemon
 
-# 只读 CLI（另一个终端）
+# CLI（另一个终端）
 cargo run -p vida-mcp-cli --bin vidactl -- doctor
 cargo run -p vida-mcp-cli --bin vidactl -- host list
 cargo run -p vida-mcp-cli --bin vidactl -- session list
 cargo run -p vida-mcp-cli --bin vidactl -- session screen <session-id>
+
+# Agent 安全写入：普通命令直接发送，危险命令返回待审批 ID
+cargo run -p vida-mcp-cli --bin vidactl -- session exec <session-id> -- df -h
+cargo run -p vida-mcp-cli --bin vidactl -- session exec <session-id> -- rm -rf /tmp/example
+cargo run -p vida-mcp-cli --bin vidactl -- approval list
+cargo run -p vida-mcp-cli --bin vidactl -- approval deny <approval-id>
+cargo run -p vida-mcp-cli --bin vidactl -- audit --limit 20
 
 # 脚本使用稳定 JSON envelope
 cargo run -p vida-mcp-cli --bin vidactl -- --json status
@@ -251,6 +259,29 @@ cargo test --workspace
 5. 停止 daemon 后执行 `vidactl doctor` → 预期显示“daemon 可能尚未启动或正在重启”的
    人话提示并以退出码 10 结束；加 `--json` 时仍输出合法错误 envelope。
 6. 保持 GUI 打开并重复上述只读命令 → 预期 GUI 的连接、标签、终端内容和输入均不受影响。
+
+## M5b Agent 写入策略、审批与审计手动验收
+
+下面的 `<session-id>` 可由 `vidactl session list` 取得。请先使用临时本地终端或测试主机，
+不要拿生产主机试危险命令。
+
+1. 执行 `vidactl session exec <session-id> -- echo vida-agent-ok` → 预期退出码为 0，终端
+   出现 `vida-agent-ok`；人的键盘、IME、粘贴路径仍照常工作。
+2. 执行 `vidactl session exec <session-id> -- rm -rf /tmp/vida-never-create` → 预期命令不进入
+   终端，显示待审批 ID，并以退出码 20 结束。执行 `vidactl approval list` → 预期能看到
+   完整待审批命令和 120 秒到期时间。
+3. 对该 ID 执行 `vidactl approval deny <approval-id>` → 预期显示已拒绝，终端中没有该命令。
+   再创建一条待审批命令并执行 `approval approve` → 预期只有批准后才发送。
+4. 等待一条待审批命令超过 120 秒后再批准 → 预期返回“找不到或已过期”，命令不发送。
+5. 执行 `vidactl host trust <主机 ID 或唯一名称> readonly`，打开该 SSH 会话后执行安全的
+   Agent 命令 → 预期也被拒绝且退出码为 21；改回 `ask` 后安全命令直接发送、危险命令审批。
+   `trusted` 会跳过内置危险规则，只应用在明确可完全托管的测试主机。
+6. 执行 `vidactl audit --limit 20` → 预期看到时间、session、结果、规则与命令指纹；打开
+   Vida 配置目录中的 `audit.jsonl`，确认不含刚才命令的明文、口令或私钥内容。
+7. 尝试用 Agent 身份直接调用原始 `SessionInput`（自动集成测试已覆盖）→ 预期 daemon 返回
+   `forbidden`；持有 Agent token 也不能修改金库、显示凭据或批准自己的命令。
+8. 将现有 v6 金库交给新 daemon 解锁 → 预期自动迁移为 v7，所有主机默认 `ask`，不会因
+   升级获得 `trusted`；原主机凭据、备注和连接方式保持不变。
 
 ## UI 基础框架手动验收
 

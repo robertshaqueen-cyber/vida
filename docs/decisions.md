@@ -1086,3 +1086,20 @@ envelope、枚举值和退出码保持固定，`session screen` 返回的远端�
 第一个检查点只提供状态、主机摘要、会话清单和当前屏幕读取。即使 daemon 已经存在
 `SessionInput`，也不直接把它包装成产品命令：在策略、审批和审计落地前暴露写入会形成绕过
 安全模型的永久接口。后续 `keys_send/exec` 与 MCP 工具必须共同经过同一策略入口。
+
+### M5b Agent 身份与统一命令门
+
+Agent 不复用所有者 `daemon.token`，而使用派生并以 0600 保存的 `agent.token`。daemon 在
+认证后绑定连接角色：Agent 可读状态、主机摘要、会话和屏幕，但不能调用 `SessionInput`、
+`PasteSession`、凭据显示、金库写入或审批接口。CLI 的 `session exec` 与后续 MCP `exec`
+必须使用 Agent 身份；审批、审计和信任级别修改只能使用所有者身份。
+
+Agent 写入的原子单位是一条不含 CR/LF/NUL 的完整命令，不是按键流。daemon 依据 session
+建立时保存的真实 host id 查询 v7 金库中的信任级别：`readonly` 拒绝所有 Agent 命令，
+`ask` 只对内置危险规则要求 120 秒审批，`trusted` 直接允许；本地会话固定 `ask`。未知
+session 映射一律拒绝。v6→v7 迁移把全部现有主机设为 `ask`，绝不静默授权 trusted。
+
+危险规则只能防常见误操作，不能成为 shell 隔离边界。因此审批响应展示原命令和命中原因，
+并明确 `trusted` 的风险。完整命令只在待审批内存中存在；持久 JSONL 审计使用字节长度和
+SHA-256 指纹关联事件，避免任何未识别的口令或私钥内容落盘。策略允许/所有者批准的审计先于
+PTY 写入持久化，审计写失败时命令不得发送。

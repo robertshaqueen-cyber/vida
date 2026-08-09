@@ -13,7 +13,7 @@ pub const PRODUCTION_LOG_N: u8 = 18;
 
 /// Current vault format version. Bump when the struct layout changes.
 /// When bumping, MUST also add migration function and test (see AGENTS.md).
-pub const CURRENT_VAULT_VERSION: u32 = 6;
+pub const CURRENT_VAULT_VERSION: u32 = 7;
 
 /// A string wrapper that zeroizes its contents on drop.
 /// Used for sensitive data (private keys, passphrases, secrets)
@@ -87,6 +87,9 @@ pub struct HostEntry {
     pub color: Option<String>,
     pub auth: AuthMethod,
     pub notes: Option<String>,
+    /// Agent write policy for this host. Human input is never affected.
+    #[serde(default)]
+    pub agent_trust: crate::agent_policy::AgentTrust,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +270,9 @@ fn migrate_json(plaintext: &[u8], from_version: u32) -> Result<Vec<u8>> {
     if from_version < 6 {
         migrate_json_v5_to_v6(&mut root)?;
     }
+    if from_version < 7 {
+        migrate_json_v6_to_v7(&mut root)?;
+    }
 
     serde_json::to_vec_pretty(&root).context("Failed to serialize migrated vault")
 }
@@ -315,6 +321,9 @@ pub fn migrate_vault_json(plaintext: &[u8], backup_path: &Path) -> Result<Vec<u8
     }
     if version < 6 {
         migrate_json_v5_to_v6(&mut root)?;
+    }
+    if version < 7 {
+        migrate_json_v6_to_v7(&mut root)?;
     }
 
     let migrated =
@@ -428,6 +437,20 @@ fn migrate_json_v5_to_v6(root: &mut serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// v6 → v7: every host gets an explicit Agent trust level. Existing and new
+/// hosts default to `ask`; migration never silently grants trusted access.
+fn migrate_json_v6_to_v7(root: &mut serde_json::Value) -> Result<()> {
+    root["version"] = serde_json::json!(7);
+    if let Some(hosts) = root.get_mut("hosts").and_then(|value| value.as_array_mut()) {
+        for host in hosts {
+            if host.get("agent_trust").is_none() {
+                host["agent_trust"] = serde_json::json!("ask");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -490,6 +513,7 @@ mod tests {
                 password: SecureString::new("secret123".to_owned()),
             },
             notes: Some("Interop test host".into()),
+            agent_trust: crate::agent_policy::AgentTrust::Ask,
         });
 
         let passphrase = "age-cli-interop-test";
@@ -569,6 +593,7 @@ mod tests {
                 password: SecureString::new("hunter2".to_owned()),
             },
             notes: None,
+            agent_trust: crate::agent_policy::AgentTrust::Ask,
         };
         let debug_str = format!("{:?}", entry);
         assert!(
@@ -911,6 +936,63 @@ mod tests {
         );
     }
 
+    /// A real v6 host is migrated with the safe `ask` default while all
+    /// existing connection and credential fields remain intact.
+    #[test]
+    fn migrate_v6_to_v7_adds_agent_trust_ask() {
+        let v6_json = r##"{
+  "version": 6,
+  "revision": 10,
+  "device_id": "v6-device",
+  "modified_at": 1700000000,
+  "hosts": [{
+    "id": "host-1",
+    "name": "production",
+    "host": "192.0.2.10",
+    "user": "root",
+    "port": 22,
+    "tags": ["prod"],
+    "group": null,
+    "color": null,
+    "auth": {"Password": {"password": "kept-secret"}},
+    "notes": "keep me"
+  }],
+  "settings": {
+    "s3_endpoint": null,
+    "s3_bucket": null,
+    "s3_access_key": null,
+    "s3_secret_key": null,
+    "sync_local_path": null,
+    "scrollback_lines": 3000,
+    "terminal_font_family": "JetBrains Mono",
+    "terminal_font_size": 13.0,
+    "terminal_cursor_blink": true
+  }
+}"##;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join("backup-v6.json");
+        let migrated = migrate_vault_json(v6_json.as_bytes(), &backup_path).unwrap();
+        let vault: Vault = serde_json::from_slice(&migrated).unwrap();
+
+        assert_eq!(vault.version, 7);
+        assert_eq!(
+            vault.hosts[0].agent_trust,
+            crate::agent_policy::AgentTrust::Ask
+        );
+        assert_eq!(vault.hosts[0].name, "production");
+        assert_eq!(vault.hosts[0].notes.as_deref(), Some("keep me"));
+        match &vault.hosts[0].auth {
+            AuthMethod::Password { password } => assert_eq!(password.expose(), "kept-secret"),
+            _ => panic!("credential shape changed"),
+        }
+        assert!(
+            std::fs::read_to_string(backup_path)
+                .unwrap()
+                .contains("\"version\": 6")
+        );
+    }
+
     /// Snapshot test: lock current version ↔ structure correspondence.
     /// If this fails, someone changed the struct without bumping version
     /// and adding migration (see AGENTS.md rule).
@@ -934,6 +1016,7 @@ mod tests {
                     password: SecureString::new("snapshot-pass".into()),
                 },
                 notes: Some("Snapshot test host".into()),
+                agent_trust: crate::agent_policy::AgentTrust::Trusted,
             }],
             settings: Settings {
                 s3_endpoint: Some("https://s3.example.com".into()),
@@ -951,7 +1034,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&vault).unwrap();
 
         // Verify key structural markers
-        assert!(json.contains("\"version\": 6"), "version must be 6");
+        assert!(json.contains("\"version\": 7"), "version must be 7");
         assert!(json.contains("\"revision\""), "must have revision field");
         assert!(json.contains("\"device_id\""), "must have device_id field");
         assert!(
@@ -961,6 +1044,7 @@ mod tests {
         assert!(json.contains("\"id\""), "HostEntry must have id field");
         assert!(json.contains("\"Password\""), "auth variant name");
         assert!(json.contains("\"password\""), "password field in auth");
+        assert!(json.contains("\"agent_trust\": \"trusted\""));
         assert!(
             json.contains("\"sync_local_path\""),
             "settings must have sync_local_path"

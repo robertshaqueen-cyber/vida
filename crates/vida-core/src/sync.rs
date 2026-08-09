@@ -812,6 +812,7 @@ mod tests {
                     password: SecureString::new(format!("pass-{}", i)),
                 },
                 notes: None,
+                agent_trust: crate::agent_policy::AgentTrust::Ask,
             })
             .collect();
         Vault {

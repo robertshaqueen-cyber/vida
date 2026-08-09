@@ -129,16 +129,26 @@ impl WsClient {
     /// re-read the token file and retry once. A plain connection failure is
     /// returned as-is.
     pub async fn connect() -> Result<Self> {
-        let token = read_token()?;
-        match Self::connect_with_token(&token).await {
+        Self::connect_for_role("owner").await
+    }
+
+    /// Connect with the restricted Agent token. This role cannot call human
+    /// `SessionInput` or vault mutation methods; daemon policy is authoritative.
+    pub async fn connect_agent() -> Result<Self> {
+        Self::connect_for_role("agent").await
+    }
+
+    async fn connect_for_role(role: &str) -> Result<Self> {
+        let token = read_role_token(role)?;
+        match Self::connect_with_token_role(&token, role).await {
             Ok(client) => Ok(client),
             Err(e) => {
                 let msg = format!("{:#}", e);
                 if msg.starts_with(AUTH_FAILED_PREFIX)
-                    && let Ok(new_token) = read_token()
+                    && let Ok(new_token) = read_role_token(role)
                     && new_token != token
                 {
-                    return Self::connect_with_token(&new_token).await;
+                    return Self::connect_with_token_role(&new_token, role).await;
                 }
                 Err(e)
             }
@@ -147,9 +157,13 @@ impl WsClient {
 
     /// Connect with an explicit token (for retry after re-read).
     pub async fn connect_with_token(token: &str) -> Result<Self> {
+        Self::connect_with_token_role(token, "owner").await
+    }
+
+    async fn connect_with_token_role(token: &str, role: &str) -> Result<Self> {
         let port = read_port()?;
         let address = format!("ws://127.0.0.1:{port}");
-        Self::connect_to(&address, token).await
+        Self::connect_to_role(&address, token, role).await
     }
 
     /// Connect to an explicit daemon address with an explicit token.
@@ -158,6 +172,10 @@ impl WsClient {
     /// clients should use [`WsClient::connect`] so token rotation is handled
     /// by re-reading Vida's protected config files.
     pub async fn connect_to(address: &str, token: &str) -> Result<Self> {
+        Self::connect_to_role(address, token, "owner").await
+    }
+
+    async fn connect_to_role(address: &str, token: &str, role: &str) -> Result<Self> {
         let (ws_stream, _) = connect_async(address)
             .await
             .context("无法连接到守护进程，请确认 vida-daemon 正在运行")?;
@@ -168,7 +186,7 @@ impl WsClient {
         let auth_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let auth_req = WsRequest {
             method: "Auth".to_string(),
-            params: Some(serde_json::json!({"token": token})),
+            params: Some(serde_json::json!({"token": token, "role": role})),
             id: auth_id,
         };
         let auth_text = serde_json::to_string(&auth_req).unwrap();
@@ -418,6 +436,62 @@ impl WsClient {
             .await
     }
 
+    pub async fn agent_exec(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "AgentExec",
+            serde_json::json!({"session_id": session_id, "command": command}),
+        )
+        .await
+    }
+
+    pub async fn list_agent_approvals(&self) -> DaemonResult<serde_json::Value> {
+        self.send_no_params("ListAgentApprovals").await
+    }
+
+    pub async fn approve_agent_action(&self, approval_id: &str) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "ApproveAgentAction",
+            serde_json::json!({"approval_id": approval_id}),
+        )
+        .await
+    }
+
+    pub async fn deny_agent_action(&self, approval_id: &str) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "DenyAgentAction",
+            serde_json::json!({"approval_id": approval_id}),
+        )
+        .await
+    }
+
+    pub async fn read_agent_audit(
+        &self,
+        limit: usize,
+        host_id: Option<&str>,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "ReadAgentAudit",
+            serde_json::json!({"limit": limit, "host_id": host_id}),
+        )
+        .await
+    }
+
+    pub async fn set_host_agent_trust(
+        &self,
+        host_id: &str,
+        trust: &str,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "SetHostAgentTrust",
+            serde_json::json!({"host_id": host_id, "trust": trust}),
+        )
+        .await
+    }
+
     pub async fn get_settings(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("GetSettings").await
     }
@@ -527,8 +601,13 @@ fn forward_text_push(text: &str, registry: &PushRegistry) {
 }
 
 /// Read daemon token from config dir (e.g. ~/Library/Application Support/vida/daemon.token on macOS)
-fn read_token() -> Result<String> {
-    let path = vida_core::config::config_dir()?.join("daemon.token");
+fn read_role_token(role: &str) -> Result<String> {
+    let filename = if role == "agent" {
+        "agent.token"
+    } else {
+        "daemon.token"
+    };
+    let path = vida_core::config::config_dir()?.join(filename);
     let token = std::fs::read_to_string(&path)
         .with_context(|| format!("无法读取守护进程 token: {}", path.display()))?;
     let token = token.trim().to_string();

@@ -21,6 +21,7 @@ fn main() {
                     password: SecureString::new("vps-root-pass".to_owned()),
                 },
                 notes: None,
+                agent_trust: vida_core::agent_policy::AgentTrust::Ask,
             },
             HostEntry {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -36,6 +37,7 @@ fn main() {
                     passphrase: None,
                 },
                 notes: None,
+                agent_trust: vida_core::agent_policy::AgentTrust::Ask,
             },
         ],
         ..Default::default()
