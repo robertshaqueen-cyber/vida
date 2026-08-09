@@ -70,3 +70,7 @@
   保护的不再只是金库，**还包括本机 shell 执行能力**——持有 token
   即可通过 WebSocket 在会话中执行任意 shell 命令。token 必须严格
   保密，泄露等于本机 shell 访问权泄露。
+- **M5a 只读 CLI**：`vidactl` 当前只调用状态、主机摘要、会话清单和读屏接口，
+  不调用 `RevealCredential`，也不提供终端输入或金库修改命令。但这只是产品接口边界，
+  不是对同一操作系统用户的安全沙箱；持有 `daemon.token` 的本机进程仍具备上述原始
+  daemon 能力。M5 写入策略必须在 daemon 侧实施，不能只依赖 CLI/MCP 隐藏命令。

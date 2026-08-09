@@ -1069,3 +1069,16 @@ socket 位于权限 0700 的配置目录中且自身设为 0600。控制协议�
 宿主与 daemon 分属不同 session/process group，因此 daemon 收到 Ctrl-C 或崩溃不会波及
 shell。宿主发现原父 daemon 已退出、没有控制连接且没有会话时才自行结束并移除 socket；
 新 daemon 接管的长控制连接会阻止仍在使用的空宿主竞态退出。
+
+### M5a 统一客户端与只读边界
+
+GUI、CLI 与 MCP 都是 daemon 的客户端，不允许各自复制 token/端口发现、WebSocket 认证和
+请求关联。M5 将 GUI 已验证的实现下沉到 `vida-client`；GUI 继续复用同一推送注册表，CLI
+与后续 MCP 则复用其请求响应路径。这样 token 轮换或协议错误修复只存在一个实现点。
+
+正式命令行使用独立可执行文件名 `vidactl`；`vida` 继续代表原生 GUI，`vida-mcp` 保留给
+MCP stdio 入口。开发期 `vida-term-test` 仍是底层终端协议探针，不作为产品 CLI 发布。
+
+第一个检查点只提供状态、主机摘要、会话清单和当前屏幕读取。即使 daemon 已经存在
+`SessionInput`，也不直接把它包装成产品命令：在策略、审批和审计落地前暴露写入会形成绕过
+安全模型的永久接口。后续 `keys_send/exec` 与 MCP 工具必须共同经过同一策略入口。

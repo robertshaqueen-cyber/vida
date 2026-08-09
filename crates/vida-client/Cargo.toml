@@ -1,24 +1,15 @@
 [package]
-name = "vida-mcp-cli"
+name = "vida-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "vida-mcp"
-path = "src/main.rs"
-
-[[bin]]
-name = "vidactl"
-path = "src/bin/vidactl.rs"
-
 [dependencies]
 vida-core = { path = "../vida-core" }
-vida-client = { path = "../vida-client" }
 tokio.workspace = true
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 anyhow.workspace = true
-clap = { version = "4", features = ["derive"] }

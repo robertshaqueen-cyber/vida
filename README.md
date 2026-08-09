@@ -17,7 +17,8 @@ vida 解决两个问题：
 二进制增量推送、GPU 渲染、键盘/IME/安全粘贴、窗口 resize 和断线重连；
 **SSH 终端（M3）**已接入系统 OpenSSH，支持金库口令、私钥文件和导入私钥。
 **会话恢复（M4）**使用独立会话宿主持有 PTY/SSH，daemon 崩溃或重启不再结束 shell。
-规划中：MCP 服务端（M5）。
+**Agent 控制层（M5，进行中）**已提供共享 daemon 客户端与只读 `vidactl`；写入策略、
+审计和 MCP Server 仍在后续检查点中。
 
 ## 截图
 
@@ -44,6 +45,8 @@ vida 解决两个问题：
   系统 `ssh`；支持口令、私钥文件和导入私钥，凭据不进入 argv、环境变量或日志
 - ♻️ **持久会话（M4）**：本机独立会话宿主持有 PTY、SSH、回滚历史和 askpass；
   daemon 重启后复用同一个 session id、shell 进程、工作目录与运行中命令
+- 🧭 **只读命令行（M5a）**：`vidactl` 可诊断 daemon、读取金库状态、主机摘要、
+  活动会话和终端屏幕；`--json` 提供稳定 envelope 和退出码，且不会返回凭据
 
 规划中：
 
@@ -81,18 +84,19 @@ vida 解决两个问题：
 ## 架构
 
 ```
-vida (GUI)  ──WebSocket──▶  vida-daemon (金库/同步/协议)
-                              ├── 金库 (vault.age, age 加密)
-                              └── 本机 0600 IPC ──▶ vida session host (PTY/SSH)
+vida (GUI) ──────┐
+vidactl ─────────┼── vida-client ──WebSocket──▶ vida-daemon (金库/同步/协议)
+vida-mcp (M5) ───┘                                ├── 金库 (vault.age, age 加密)
+                                                 └── 本机 0600 IPC ──▶ vida session host (PTY/SSH)
 
-AI Agent ──MCP stdio(规划 M5)──▶ vida-mcp-cli ──WebSocket──▶ vida-daemon
-SSH/PTY 终端（M2-M4）
+AI Agent ──MCP stdio(规划 M5 后续检查点)──▶ vida-mcp
 ```
 
 - **vida-core** — 金库、加密、同步、多语言（纯逻辑库）
+- **vida-client** — GUI、CLI、MCP 共用的 daemon 发现、认证、请求关联和推送客户端
 - **vida-daemon** — 守护进程：WebSocket 服务端、协议路由、状态管理
 - **vida-gui** — iced + wgpu 原生界面
-- **vida-mcp-cli** — stdio→WebSocket 桥接（给只支持 stdio 的 MCP 客户端）
+- **vida-mcp-cli** — 产出 `vidactl`；后续也产出 MCP stdio 入口 `vida-mcp`
 
 ## 构建与运行
 
@@ -112,6 +116,15 @@ cargo build --release
 
 # 启动 daemon（第一个终端）
 cargo run --bin vida-daemon
+
+# 只读 CLI（另一个终端）
+cargo run -p vida-mcp-cli --bin vidactl -- doctor
+cargo run -p vida-mcp-cli --bin vidactl -- host list
+cargo run -p vida-mcp-cli --bin vidactl -- session list
+cargo run -p vida-mcp-cli --bin vidactl -- session screen <session-id>
+
+# 脚本使用稳定 JSON envelope
+cargo run -p vida-mcp-cli --bin vidactl -- --json status
 
 # 启动 GUI（第二个终端）
 cargo run --bin vida
@@ -222,6 +235,21 @@ cargo test --workspace
    主动点击锁定后必须立即撤销该缓存，下次仍要求口令。点击“记住口令”下拉框 →
    预期控件本体及展开菜单与设置页下拉框使用相同的高度、边框、圆角、背景和选中态，
    不出现 iced 默认样式。
+
+## M5a 共享客户端与只读 CLI 手动验收
+
+1. daemon 运行时执行 `vidactl doctor` → 预期显示“可连接、认证成功”、实际配置目录和
+   金库状态；不会要求或显示金库口令。
+2. 执行 `vidactl status` 以及 `vidactl --json status` → 预期前者是适合人阅读的中文，
+   后者为 `{"ok":true,"data":...}`，且进程退出码为 0。
+3. 金库已解锁时执行 `vidactl host list` → 预期只显示主机摘要，不出现保存的密码、
+   私钥内容或私钥口令；`vidactl host show <完整 ID 或唯一名称>` 返回对应主机。
+4. 同时打开本地和 SSH 终端后执行 `vidactl session list` → 预期列出与 GUI 相同的
+   session id、尺寸和进程；执行 `vidactl session screen <session-id>` 显示当前屏幕，
+   但不会发送按键或改变终端状态。
+5. 停止 daemon 后执行 `vidactl doctor` → 预期显示“daemon 可能尚未启动或正在重启”的
+   人话提示并以退出码 10 结束；加 `--json` 时仍输出合法错误 envelope。
+6. 保持 GUI 打开并重复上述只读命令 → 预期 GUI 的连接、标签、终端内容和输入均不受影响。
 
 ## UI 基础框架手动验收
 

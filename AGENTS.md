@@ -82,6 +82,17 @@ daemon 层测试无法覆盖「按钮是否真的发出了请求」——测试�
   `floor(logical bounds × scale / physical cell)`；不得混用逻辑像素与物理像素
 - 键盘、IME、剪贴板内容可能包含口令或私钥，永不写日志
 
+## CLI / MCP 客户端约定
+
+- GUI、正式 CLI 与 MCP 桥必须复用 `vida-client`；禁止各自复制 daemon 端口/token
+  发现、WebSocket 认证、请求关联或错误解码。
+- `vidactl --json` 的成功/错误 envelope 与退出码属于稳定脚本接口；字段变更必须同步
+  测试和 README。机器输出不得混入日志或人类提示。
+- 主机与会话只读命令禁止调用 `RevealCredential`，任何输出都不得包含密码、私钥内容或
+  私钥口令。
+- Agent 写入策略、危险命令审批与审计必须在 daemon 侧统一执行；不得只在 CLI 或 MCP
+  表面隐藏命令，因为持有 daemon token 的客户端可以直接请求底层协议。
+
 ## 内存测量规范
 
 - **唯一指标**：`vmmap --summary <pid>` 中的 `Physical footprint`

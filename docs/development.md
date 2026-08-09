@@ -127,6 +127,32 @@ vida-daemon 的 6592K。宿主保存的是原 PTY/SSH 与 alacritty 网格，不
   `SIGKILL` 后原 shell 状态恢复。
 - 所有者手动验收见 README「M4 持久会话手动验收」。
 
+### M5a 共享 daemon 客户端与只读 CLI
+
+- 原 GUI WebSocket 客户端下沉到独立内部 crate `vida-client`；GUI 仅保留兼容 re-export。
+  daemon 端口/token 发现、认证重试、请求 ID 关联、错误分类和终端推送不再由 GUI、CLI、
+  MCP 分别复制。
+- `vidactl doctor/status/host list/host show/session list/session screen` 通过同一客户端连接
+  daemon。这个检查点严格只读：策略与审计完成前不暴露 `send`、`exec` 或金库修改命令。
+- `--json` 固定输出 `{"ok":true,"data":...}` 或 `{"ok":false,"error":...}`；连接失败
+  退出码为 10，daemon 业务错误为 11，未找到/歧义/响应损坏分别为 12/13/14。
+- 主机命令只消费 `HostSummary`，不调用 `RevealCredential`；口令和私钥内容不会进入 CLI
+  输出。完整 ID 优先于名称；重复名称返回歧义错误，不静默选择第一项。
+- 自动测试覆盖显式地址认证与响应关联、首帧预注册、连接退出、主机选择歧义及 JSON
+  envelope。所有者手动验收见 README「M5a 共享客户端与只读 CLI 手动验收」。
+
+#### M5a release 内存实测（2026-08-10）
+
+macOS、1920×1080、scale factor=1。使用隔离临时配置目录启动 release daemon；在
+`vidactl status` 等待 WebSocket 握手时暂停 daemon，以便按规范用 `vmmap --summary`
+测量短生命周期 CLI，随后恢复 daemon 并确认命令正常结束。
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| `vidactl status`，已加载共享客户端并等待 daemon | **2096K** |
+
+该数字是 `Physical footprint`，不是 RSS；测量用临时目录不含用户金库或会话数据，完成后删除。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |

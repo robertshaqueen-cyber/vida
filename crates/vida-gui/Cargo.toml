@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 vida-core = { path = "../vida-core" }
+vida-client = { path = "../vida-client" }
 tokio.workspace = true
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
