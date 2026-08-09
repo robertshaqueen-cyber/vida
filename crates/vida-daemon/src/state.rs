@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
 use tracing::{info, warn};
 use vida_core::config;
@@ -37,6 +37,17 @@ impl DaemonState {
         })
     }
 
+    /// Production constructor: connect to the detached session host so PTY
+    /// and SSH processes survive a daemon restart. Tests keep using `new`
+    /// with the embedded backend for deterministic isolation.
+    pub fn new_with_session_host(token: String) -> Result<Self> {
+        let mut state = Self::new(token)?;
+        state.pty = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::pty::PtyManager::connect_or_spawn_host()?,
+        ));
+        Ok(state)
+    }
+
     // Vault -----------------------------------------------------------------
 
     pub fn create_vault(&mut self, passphrase: &str) -> Result<VaultStatusInfo> {
@@ -53,16 +64,25 @@ impl DaemonState {
         Ok(self.vault_status())
     }
 
-    pub fn unlock(&mut self, passphrase: &str, remember: bool) -> Result<VaultStatusInfo> {
+    pub fn unlock(
+        &mut self,
+        passphrase: &str,
+        remember_seconds: Option<u64>,
+    ) -> Result<VaultStatusInfo> {
         if !self.vault_path.exists() {
             anyhow::bail!("{}", self.i18n.tr("daemon_vault_missing"));
         }
         let ct = std::fs::read(&self.vault_path).context("Failed to read vault file")?;
         let vault = vida_core::vault::decrypt(&ct, passphrase)?;
-        if remember {
+        if let Some(seconds) = remember_seconds {
             let sec = secrecy::SecretString::from(passphrase.to_string());
-            vida_core::keyring_cache::cache_passphrase(&sec)?;
-            info!("Passphrase cached in keyring");
+            vida_core::keyring_cache::cache_passphrase(
+                &sec,
+                std::time::Duration::from_secs(seconds),
+            )?;
+            info!("Passphrase cached in keyring with bounded expiry");
+        } else if let Err(error) = vida_core::keyring_cache::clear_cache() {
+            warn!("Could not clear passphrase cache: {}", error);
         }
         self.vault = Some(vault);
         self.passphrase = Some(passphrase.to_string());
@@ -71,10 +91,39 @@ impl DaemonState {
         Ok(self.vault_status())
     }
 
+    /// Attempt unattended startup unlock from a still-valid OS-keyring cache.
+    /// Expired, legacy, unavailable, or incorrect entries simply leave the
+    /// vault locked; none of those values are logged.
+    pub fn try_unlock_cached(&mut self) -> Result<bool> {
+        let Some(passphrase) = vida_core::keyring_cache::get_cached_passphrase() else {
+            return Ok(false);
+        };
+        if !self.vault_path.exists() {
+            return Ok(false);
+        }
+        let encrypted = std::fs::read(&self.vault_path).context("Failed to read vault file")?;
+        let vault = match vida_core::vault::decrypt(&encrypted, passphrase.expose_secret()) {
+            Ok(vault) => vault,
+            Err(_) => {
+                let _ = vida_core::keyring_cache::clear_cache();
+                warn!("Cached vault passphrase was rejected and has been cleared");
+                return Ok(false);
+            }
+        };
+        self.vault = Some(vault);
+        self.passphrase = Some(passphrase.expose_secret().to_string());
+        self.init_sync()?;
+        info!("Vault unlocked from unexpired keyring cache");
+        Ok(true)
+    }
+
     pub fn lock(&mut self) {
         self.vault = None;
         self.passphrase = None;
         self.sync = None;
+        if let Err(error) = vida_core::keyring_cache::clear_cache() {
+            warn!("Could not clear passphrase cache while locking: {}", error);
+        }
         info!("Vault locked");
     }
 
@@ -670,7 +719,7 @@ mod tests {
         let passphrase = "test-passphrase";
         state.create_vault(passphrase).unwrap();
         state.lock();
-        state.unlock(passphrase, false).unwrap();
+        state.unlock(passphrase, None).unwrap();
 
         assert!(state.sync.is_none());
 
@@ -706,7 +755,7 @@ mod tests {
         };
         state.create_vault("pass").unwrap();
         state.lock();
-        state.unlock("pass", false).unwrap();
+        state.unlock("pass", None).unwrap();
 
         // Set initial sync path
         let path_a = tmp.path().join("path_a");
@@ -750,7 +799,7 @@ mod tests {
         };
         state.create_vault("pass").unwrap();
         state.lock();
-        state.unlock("pass", false).unwrap();
+        state.unlock("pass", None).unwrap();
 
         // Set sync_local_path to the vault directory itself
         let settings = Settings {
@@ -783,7 +832,7 @@ mod tests {
         };
         state.create_vault("pass").unwrap();
         state.lock();
-        state.unlock("pass", false).unwrap();
+        state.unlock("pass", None).unwrap();
 
         let settings = Settings {
             sync_local_path: Some("/nonexistent/path/abc123".into()),
@@ -819,7 +868,7 @@ mod tests {
         };
         state.create_vault("pass").unwrap();
         state.lock();
-        state.unlock("pass", false).unwrap();
+        state.unlock("pass", None).unwrap();
 
         let settings = Settings {
             sync_local_path: Some(file_path.to_str().unwrap().to_string()),
@@ -847,7 +896,7 @@ mod tests {
         };
         state.create_vault("pass").unwrap();
         state.lock();
-        state.unlock("pass", false).unwrap();
+        state.unlock("pass", None).unwrap();
 
         // Create a symlink pointing to the vault directory
         let symlink_path = tmp.path().join("sync_link");

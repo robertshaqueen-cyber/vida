@@ -1,5 +1,6 @@
 pub mod protocol;
 pub mod pty;
+pub mod session_host;
 pub mod ssh_auth;
 pub mod state;
 pub mod ws_server;

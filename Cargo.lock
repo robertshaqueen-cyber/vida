@@ -5077,6 +5077,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vida-core",
+ "zeroize",
 ]
 
 [[package]]

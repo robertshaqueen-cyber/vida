@@ -196,6 +196,7 @@ impl State {
             .cloned();
         let auth_picker = pick_list(auth_items, selected_auth, AppMessage::EditorAuthChanged)
             .style(ui::picker)
+            .menu_style(ui::picker_menu)
             .padding(10)
             .width(Length::Fill);
 

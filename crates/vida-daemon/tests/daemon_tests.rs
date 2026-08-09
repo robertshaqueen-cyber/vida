@@ -532,7 +532,7 @@ fn create_unlock_lock_cycle() {
     assert!(!info.locked);
     state.lock();
     assert!(state.vault_status().locked);
-    let info = state.unlock("mypass", false).unwrap();
+    let info = state.unlock("mypass", None).unwrap();
     assert!(!info.locked);
 }
 
@@ -541,7 +541,47 @@ fn unlock_wrong_passphrase_fails() {
     let (mut state, _dir) = test_state("tok");
     state.create_vault("correct").unwrap();
     state.lock();
-    assert!(state.unlock("wrong", false).is_err());
+    assert!(state.unlock("wrong", None).is_err());
+}
+
+#[test]
+fn unexpired_keyring_cache_unlocks_restarted_daemon() {
+    let _env_guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("VIDA_CONFIG_DIR", dir.path()) };
+
+    let vault_path = dir.path().join("vault.age");
+    let mut first = DaemonState {
+        token: "first".into(),
+        vault: None,
+        passphrase: None,
+        vault_path: vault_path.clone(),
+        sync: None,
+        i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
+    };
+    first.create_vault("cached-passphrase").unwrap();
+    first.unlock("cached-passphrase", Some(60)).unwrap();
+
+    let mut restarted = DaemonState {
+        token: "restarted".into(),
+        vault: None,
+        passphrase: None,
+        vault_path,
+        sync: None,
+        i18n: vida_core::i18n::I18n::default(),
+        pty: std::sync::Arc::new(std::sync::RwLock::new(
+            vida_daemon::pty::PtyManager::default(),
+        )),
+    };
+    assert!(restarted.try_unlock_cached().unwrap());
+    assert!(!restarted.vault_status().locked);
+
+    restarted.lock();
+    assert!(vida_core::keyring_cache::get_cached_passphrase().is_none());
+    unsafe { std::env::remove_var("VIDA_CONFIG_DIR") };
 }
 
 #[test]
@@ -588,7 +628,7 @@ fn restore_backup_validates_before_replacing_and_rotates_current_vault() {
     assert!(warning.is_none());
 
     state.lock();
-    state.unlock("backup-pass", false).unwrap();
+    state.unlock("backup-pass", None).unwrap();
     assert_eq!(state.list_hosts().unwrap().len(), 1);
 
     let rotated = std::fs::read(dir.path().join("vault.1.age")).unwrap();
@@ -1993,6 +2033,155 @@ async fn reconnect_resubscribe_gets_full_frame() {
     assert_eq!(
         sessions_after, sessions_before,
         "重连不应新增会话（旧会话应被复用）"
+    );
+}
+
+#[cfg(unix)]
+fn spawn_production_daemon(config_dir: &std::path::Path) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_vida-daemon"))
+        .env("VIDA_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "error")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+async fn wait_for_production_daemon(
+    config_dir: &std::path::Path,
+) -> (std::net::SocketAddr, String) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let port = std::fs::read_to_string(config_dir.join("daemon.port"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok());
+        let token = std::fs::read_to_string(config_dir.join("daemon.token")).ok();
+        if let (Some(port), Some(token)) = (port, token) {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return (addr, token);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "production daemon did not become ready"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// M4：真正杀死 daemon 进程后，分离的会话宿主仍保留同一个 shell。
+/// 新 daemon 必须列出原 session_id，并保留 shell 的环境变量与工作目录。
+#[cfg(unix)]
+#[tokio::test]
+async fn production_daemon_restart_preserves_shell_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut first_daemon = spawn_production_daemon(directory.path());
+    let (first_addr, token) = wait_for_production_daemon(directory.path()).await;
+    let (mut ws, mut reader) = connect(first_addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token.trim()
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &auth).await["type"], "Ok");
+    let opened = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":100,"rows":30},"id":2}"#,
+    )
+    .await;
+    let session_id = opened["result"]["session_id"].as_str().unwrap().to_string();
+    let command = b"export VIDA_M4_PROCESS_MARK=preserved; cd /tmp; echo before-restart\r";
+    let input = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{}}},"id":3}}"#,
+        session_id,
+        serde_json::to_string(command.as_slice()).unwrap()
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &input).await["type"], "Ok");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    drop(ws);
+    drop(reader);
+
+    first_daemon.kill().unwrap();
+    first_daemon.wait().unwrap();
+    std::fs::remove_file(directory.path().join("daemon.port")).unwrap();
+
+    let mut second_daemon = spawn_production_daemon(directory.path());
+    let (second_addr, token) = wait_for_production_daemon(directory.path()).await;
+    let (mut ws, mut reader) = connect(second_addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":4}}"#,
+        token.trim()
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &auth).await["type"], "Ok");
+
+    let listed = send_recv(&mut ws, &mut reader, r#"{"method":"ListSessions","id":5}"#).await;
+    assert_eq!(listed["type"], "Ok", "list after restart failed: {listed}");
+    let sessions = listed["result"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "original session should survive: {listed}"
+    );
+    assert_eq!(sessions[0]["session_id"], session_id);
+
+    let command = b"printf '%s:%s\\n' \"$VIDA_M4_PROCESS_MARK\" \"$PWD\"\r";
+    let input = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":{}}},"id":6}}"#,
+        session_id,
+        serde_json::to_string(command.as_slice()).unwrap()
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &input).await["type"], "Ok");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let request = format!(
+            r#"{{"method":"ReadScreen","params":{{"session_id":"{}"}},"id":7}}"#,
+            session_id
+        );
+        let screen = send_recv(&mut ws, &mut reader, &request).await;
+        let text = screen["result"]["lines"]
+            .as_array()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if text.contains("preserved:/tmp") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell state was not preserved: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let close = format!(
+        r#"{{"method":"CloseSession","params":{{"session_id":"{}"}},"id":8}}"#,
+        session_id
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &close).await["type"], "Ok");
+    drop(ws);
+    drop(reader);
+    unsafe {
+        libc::kill(second_daemon.id() as i32, libc::SIGINT);
+    }
+    second_daemon.wait().unwrap();
+
+    let socket = directory.path().join("session-host.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !socket.exists(),
+        "empty detached host should exit with daemon"
     );
 }
 

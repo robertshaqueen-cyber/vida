@@ -397,9 +397,21 @@ async fn handle_message(
                     .unwrap();
                 }
             };
-            pty.list_sessions()
-                .iter()
-                .any(|s| s.session_id == *session_id)
+            let sessions = match pty.try_list_sessions() {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    return serde_json::to_string(&Response {
+                        id,
+                        payload: ResponsePayload::Error {
+                            code: -5,
+                            message: error.to_string(),
+                            category: None,
+                        },
+                    })
+                    .unwrap();
+                }
+            };
+            sessions.iter().any(|s| s.session_id == *session_id)
         };
         if !exists {
             return serde_json::to_string(&Response {
@@ -482,8 +494,11 @@ async fn handle_request(
         Request::Unlock {
             passphrase,
             remember,
+            remember_seconds,
         } => {
-            let info = state.unlock(&passphrase, remember)?;
+            let remember_seconds = remember_seconds
+                .or_else(|| remember.then_some(vida_core::keyring_cache::MAX_CACHE_SECONDS));
+            let info = state.unlock(&passphrase, remember_seconds)?;
             Ok(serde_json::to_value(info)?)
         }
         Request::Lock => {
@@ -697,7 +712,7 @@ async fn handle_pty_request(
         }
         PtyRequest::ListSessions => {
             let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            let sessions = pty.list_sessions();
+            let sessions = pty.try_list_sessions()?;
             Ok(serde_json::to_value(sessions)?)
         }
         PtyRequest::ReadScreen { session_id } => {

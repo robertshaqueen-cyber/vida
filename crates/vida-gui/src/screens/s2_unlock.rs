@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Element, Length, Theme};
 use vida_core::i18n::I18n;
 
@@ -8,6 +8,65 @@ use crate::ui::{self, icons};
 
 /// ID for the unlock password input, used to focus/select-all after error.
 pub const UNLOCK_PASSPHRASE_ID: &str = "unlock_passphrase";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RememberDuration {
+    Never,
+    OneMinute,
+    FiveMinutes,
+    FifteenMinutes,
+    OneHour,
+    OneDay,
+    SevenDays,
+}
+
+impl RememberDuration {
+    pub const ALL: [Self; 7] = [
+        Self::Never,
+        Self::OneMinute,
+        Self::FiveMinutes,
+        Self::FifteenMinutes,
+        Self::OneHour,
+        Self::OneDay,
+        Self::SevenDays,
+    ];
+
+    pub fn seconds(self) -> Option<u64> {
+        match self {
+            Self::Never => None,
+            Self::OneMinute => Some(60),
+            Self::FiveMinutes => Some(5 * 60),
+            Self::FifteenMinutes => Some(15 * 60),
+            Self::OneHour => Some(60 * 60),
+            Self::OneDay => Some(24 * 60 * 60),
+            Self::SevenDays => Some(7 * 24 * 60 * 60),
+        }
+    }
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Never => "unlock_remember_never",
+            Self::OneMinute => "unlock_remember_1m",
+            Self::FiveMinutes => "unlock_remember_5m",
+            Self::FifteenMinutes => "unlock_remember_15m",
+            Self::OneHour => "unlock_remember_1h",
+            Self::OneDay => "unlock_remember_1d",
+            Self::SevenDays => "unlock_remember_7d",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RememberOption {
+    duration: RememberDuration,
+    label: String,
+}
+
+impl std::fmt::Display for RememberOption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
 
 /// Custom text input style with red border for error state.
 fn error_text_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
@@ -20,7 +79,7 @@ fn error_text_input_style(theme: &Theme, status: text_input::Status) -> text_inp
 #[derive(Debug, Clone)]
 pub struct State {
     pub passphrase: String,
-    pub remember: bool,
+    pub remember_duration: RememberDuration,
     pub error: Option<String>,
     pub error_category: Option<String>,
     pub unlocking: bool,
@@ -32,7 +91,7 @@ impl State {
     pub fn new() -> Self {
         Self {
             passphrase: String::new(),
-            remember: false,
+            remember_duration: RememberDuration::SevenDays,
             error: None,
             error_category: None,
             unlocking: false,
@@ -80,9 +139,29 @@ impl State {
             }
         };
 
-        let remember_check = iced::widget::checkbox(self.remember)
-            .label(i18n.tr("unlock_remember"))
-            .on_toggle(AppMessage::UnlockRememberToggled);
+        let remember_options: Vec<RememberOption> = RememberDuration::ALL
+            .into_iter()
+            .map(|duration| RememberOption {
+                duration,
+                label: i18n.tr(duration.label_key()).to_string(),
+            })
+            .collect();
+        let selected_remember = remember_options
+            .iter()
+            .find(|option| option.duration == self.remember_duration)
+            .cloned();
+        let remember_picker = row![
+            ui::muted(i18n.tr("unlock_remember_for")).size(13),
+            pick_list(remember_options, selected_remember, |option| {
+                AppMessage::UnlockRememberChanged(option.duration)
+            })
+            .style(ui::picker)
+            .menu_style(ui::picker_menu)
+            .padding(10)
+            .width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
 
         let unlock_btn = if self.unlocking {
             button(i18n.tr("unlock_unlocking"))
@@ -152,7 +231,7 @@ impl State {
 
         // Main centered content — error_slot sits between input and checkbox
         let main_content = container(
-            column![header, input_row, error_slot, remember_check,]
+            column![header, input_row, error_slot, remember_picker,]
                 .spacing(12)
                 .width(Length::Fill),
         )

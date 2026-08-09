@@ -137,7 +137,7 @@ impl Dimensions for GridSize {
 /// lines 永远是干净文本（无 sentinel），可直接交给 agent 阅读。
 /// wide_cols[row] 给出该行中占两列的字符起始列号（0-based），
 /// 客户端据此还原列对齐。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScreenData {
     pub lines: Vec<String>,
     pub wide_cols: Vec<Vec<u16>>,
@@ -145,14 +145,14 @@ pub struct ScreenData {
 }
 
 /// 光标位置。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CursorPos {
     pub row: u16,
     pub col: u16,
 }
 
 /// 带样式的单元格（用于 --ansi 模式）。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StyledCell {
     pub c: char,
     pub fg: AnsiColor,
@@ -161,7 +161,7 @@ pub struct StyledCell {
 }
 
 /// ANSI 颜色表示。
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AnsiColor {
     Default,
     Indexed(u8),
@@ -169,7 +169,7 @@ pub enum AnsiColor {
 }
 
 /// 带样式的屏幕快照（每行是一个 StyledCell 序列）。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScreenStyled {
     pub rows: Vec<Vec<StyledCell>>,
     pub cols: u16,
@@ -177,7 +177,7 @@ pub struct ScreenStyled {
 }
 
 /// 公开的会话信息（ListSessions 返回值）。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
     pub cols: u16,
@@ -205,8 +205,9 @@ pub enum SshAuth {
 // ---------------------------------------------------------------------------
 
 /// 会话管理器。调用方持有 `Arc<RwLock<PtyManager>>`，独立于金库锁。
+#[doc(hidden)]
 #[derive(Default)]
-pub struct PtyManager {
+pub struct PtyEngine {
     sessions: HashMap<String, Arc<Mutex<SessionInner>>>,
 }
 
@@ -350,7 +351,7 @@ pub fn cleanup_stale_inline_keys() -> Result<usize> {
 }
 
 #[allow(unused_mut)]
-impl PtyManager {
+impl PtyEngine {
     /// 打开本地 shell 会话。命令固定 $SHELL，不接受客户端指定；
     /// cwd 固定 HOME（decisions.md 结论 6）。
     pub fn open_session(&mut self, cols: u16, rows: u16) -> Result<String> {
@@ -821,6 +822,131 @@ impl PtyManager {
         }
         self.sessions.clear();
         info!("所有会话已关闭");
+    }
+}
+
+/// Public PTY facade. Unit tests use the embedded engine; the production
+/// daemon connects to a detached session host that owns the same engine.
+pub enum PtyManager {
+    Embedded(PtyEngine),
+    Hosted(crate::session_host::SessionHostClient),
+}
+
+impl Default for PtyManager {
+    fn default() -> Self {
+        Self::Embedded(PtyEngine::default())
+    }
+}
+
+impl PtyManager {
+    pub fn connect_or_spawn_host() -> Result<Self> {
+        Ok(Self::Hosted(
+            crate::session_host::SessionHostClient::connect_or_spawn()?,
+        ))
+    }
+
+    pub fn open_session(&mut self, cols: u16, rows: u16) -> Result<String> {
+        match self {
+            Self::Embedded(engine) => engine.open_session(cols, rows),
+            Self::Hosted(client) => client.open_session(cols, rows),
+        }
+    }
+
+    pub fn open_ssh_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        host: &str,
+        user: &str,
+        port: u16,
+        auth: SshAuth,
+    ) -> Result<String> {
+        match self {
+            Self::Embedded(engine) => engine.open_ssh_session(cols, rows, host, user, port, auth),
+            Self::Hosted(client) => client.open_ssh_session(cols, rows, host, user, port, auth),
+        }
+    }
+
+    pub fn session_input(&self, session_id: &str, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Embedded(engine) => engine.session_input(session_id, data),
+            Self::Hosted(client) => client.session_input(session_id, data),
+        }
+    }
+
+    pub fn paste_session(&self, session_id: &str, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Embedded(engine) => engine.paste_session(session_id, data),
+            Self::Hosted(client) => client.paste_session(session_id, data),
+        }
+    }
+
+    pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<()> {
+        match self {
+            Self::Embedded(engine) => engine.resize_session(session_id, cols, rows),
+            Self::Hosted(client) => client.resize_session(session_id, cols, rows),
+        }
+    }
+
+    pub fn scroll_session(&self, session_id: &str, lines: i32) -> Result<usize> {
+        match self {
+            Self::Embedded(engine) => engine.scroll_session(session_id, lines),
+            Self::Hosted(client) => client.scroll_session(session_id, lines),
+        }
+    }
+
+    pub fn close_session(&mut self, session_id: &str) -> Result<()> {
+        match self {
+            Self::Embedded(engine) => engine.close_session(session_id),
+            Self::Hosted(client) => client.close_session(session_id),
+        }
+    }
+
+    pub fn list_sessions(&self) -> Vec<SessionInfo> {
+        self.try_list_sessions().unwrap_or_default()
+    }
+
+    pub fn try_list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        match self {
+            Self::Embedded(engine) => Ok(engine.list_sessions()),
+            Self::Hosted(client) => client.list_sessions(),
+        }
+    }
+
+    pub fn read_screen(&self, session_id: &str) -> Result<ScreenData> {
+        match self {
+            Self::Embedded(engine) => engine.read_screen(session_id),
+            Self::Hosted(client) => client.read_screen(session_id),
+        }
+    }
+
+    pub fn read_screen_styled(&self, session_id: &str) -> Result<ScreenStyled> {
+        match self {
+            Self::Embedded(engine) => engine.read_screen_styled(session_id),
+            Self::Hosted(client) => client.read_screen_styled(session_id),
+        }
+    }
+
+    pub fn subscribe_session(&self, session_id: &str) -> Result<BoundedReceiver<PushPayload>> {
+        match self {
+            Self::Embedded(engine) => engine.subscribe_session(session_id),
+            Self::Hosted(client) => client.subscribe_session(session_id),
+        }
+    }
+
+    pub fn unsubscribe_session(&self, session_id: &str, rx: BoundedReceiver<PushPayload>) {
+        match self {
+            Self::Embedded(engine) => engine.unsubscribe_session(session_id, rx),
+            Self::Hosted(client) => client.unsubscribe_session(session_id, rx),
+        }
+    }
+
+    /// Embedded tests own their children and must reap them. A hosted manager
+    /// intentionally leaves the detached host and sessions alive.
+    pub fn shutdown(&mut self) {
+        if let Self::Embedded(engine) = self {
+            engine.shutdown();
+        }
     }
 }
 

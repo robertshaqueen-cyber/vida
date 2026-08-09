@@ -82,6 +82,51 @@
 | MacBook Air 13" | 2560×1664 | ~44M |
 | MacBook Pro 14" | 3024×1964 | ~48M |
 
+### M4 release 实测（独立会话宿主）
+
+**环境**：macOS，1920×1080、scale factor=1；release 构建；打开一个 100×30 本地终端。
+唯一指标为 `vmmap --summary <pid>` 的 `Physical footprint`。
+
+| 进程/场景 | Physical footprint | 峰值 |
+|---|---:|---:|
+| vida-daemon（控制面） | **3088K** | **3120K** |
+| vida session host（一个活动本地终端） | **2640K** | **2640K** |
+| daemon 退出后，session host 单独持有原终端 | **2608K** | **2640K** |
+
+控制面与会话宿主同时运行合计约 **5.6 MiB**，没有因进程拆分超过 M3 最终复测中
+vida-daemon 的 6592K。宿主保存的是原 PTY/SSH 与 alacritty 网格，不在 daemon 中复制
+第二份回滚历史。
+
+#### M4 最终验收复测（2026-08-10）
+
+最终 release 构建在同一台 1920×1080、scale factor=1 的机器上复测。GUI 恢复两个
+活动会话（100×40 与 128×45）；另用隔离的临时配置目录启动全新的空控制面，避免把
+升级前仍在运行的旧 daemon 内存计入结果。临时目录不包含用户金库或会话数据，测量后删除。
+
+| 进程/场景 | Physical footprint | 峰值 |
+|---|---:|---:|
+| Vida GUI，恢复两个终端标签 | **263.4M** | **264.3M** |
+| vida-daemon，全新空控制面 | **3792K** | **3792K** |
+| vida session host，持有两个活动会话 | **6896K** | **7536K** |
+
+两个后台进程当前合计约 **10.4 MiB**；GUI 仍与 M3 最终复测的 263.1M 处于同一范围。
+所有数字均来自 `vmmap --summary <pid>` 的 `Physical footprint`，未使用 RSS。
+
+### M4 持久会话 — 验收清单
+
+- 生产 daemon 使用 0600 Unix socket 连接独立 session host；凭据只经过本机 IPC，
+  不进入 argv、环境变量或日志。
+- 强制杀死真实 daemon 进程并启动新进程后，`ListSessions` 返回相同 session id；原 shell
+  的环境变量、工作目录和运行中进程保持不变。
+- 新 daemon 通过长连接转发输入、粘贴、resize、滚动、读屏和订阅；普通按键不会逐字符
+  新建 IPC 连接。
+- GUI 继续先订阅保存的原 session id；只有宿主也不存在时才创建替代本地/SSH 会话。
+- 主动锁定仍显式关闭 PTY/SSH，作为安全边界；意外 daemon 断开不会关闭会话。
+- 最后一个会话关闭且 daemon 已退出后，空 session host 自动结束并移除 socket。
+- 自动测试包含 session host 控制客户端替换、推送帧编解码，以及真实 daemon 进程被
+  `SIGKILL` 后原 shell 状态恢复。
+- 所有者手动验收见 README「M4 持久会话手动验收」。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |
@@ -149,7 +194,8 @@
 1. 再次启动 GUI → 看到 S2「解锁金库」页面（不出现 S1）
 2. 输入错误口令 → 显示错误提示，留在 S2
 3. 输入正确口令 → 解锁成功 → 进入 S3
-4. 勾选「记住口令」解锁 → 口令缓存到系统钥匙串（Keychain）
+4. 选择「记住 7 天」解锁 → 口令有期缓存到系统钥匙串（Keychain）；
+   daemon 在有效期内重启可自动解锁，过期或主动锁定后必须重新输入口令
 
 ### 场景 4：主机编辑器
 
@@ -280,11 +326,10 @@ cargo run --release -p vida-term-test -- open
 ```
 
 > **注意**：
-> - daemon 重启后所有旧 session_id 全部失效（会话属于 daemon，
->   不属于连接）。每次重启后需重新 open 获取新 session_id。
+> - M4 起 session id 属于独立会话宿主；daemon 重启后仍可用原 session_id 继续操作。
 > - open / send / screen 等均为**一次性命令**，执行完即退出。
->   会话由 daemon 持有，用 open 返回的 session_id 在后续命令中引用。
-> 每个 cargo run --release -p vida-term-test -- 子命令是独立进程，连接后即断，但会话保留在 daemon。
+>   会话由 session host 持有，用 open 返回的 session_id 在后续命令中引用。
+> 每个 cargo run --release -p vida-term-test -- 子命令是独立进程，连接后即断，但会话保留在 session host。
 
 常用变量：
 

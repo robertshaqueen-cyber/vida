@@ -1,10 +1,29 @@
 use crate::vault::{self, Vault};
 use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const ACCOUNT_NAME: &str = "master-passphrase";
+const CACHE_VERSION: u8 = 1;
+pub const MAX_CACHE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Serialize)]
+struct CacheEnvelopeRef<'a> {
+    version: u8,
+    expires_at: u64,
+    passphrase: &'a str,
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+struct CacheEnvelope {
+    version: u8,
+    expires_at: u64,
+    passphrase: String,
+}
 
 /// Compute keyring service name from config directory.
 /// Uses sha2 to ensure stability across Rust toolchain versions.
@@ -24,13 +43,38 @@ fn service_name() -> Result<String> {
 /// This is a CACHE ONLY. The vault must always be decryptable with just
 /// the user-supplied passphrase. If keyring is empty or unavailable,
 /// the app falls back to manual passphrase entry.
-pub fn cache_passphrase(passphrase: &SecretString) -> Result<()> {
-    let svc = service_name()?;
-    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME).context("Failed to open keyring entry")?;
+pub fn cache_passphrase(passphrase: &SecretString, ttl: Duration) -> Result<()> {
+    let service = service_name()?;
+    cache_passphrase_for_service(&service, passphrase, ttl)
+}
+
+fn cache_passphrase_for_service(
+    service: &str,
+    passphrase: &SecretString,
+    ttl: Duration,
+) -> Result<()> {
+    let ttl_seconds = ttl.as_secs();
+    anyhow::ensure!(
+        (1..=MAX_CACHE_SECONDS).contains(&ttl_seconds),
+        "Passphrase cache duration must be between 1 second and 7 days"
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before Unix epoch")?
+        .as_secs();
+    let envelope = CacheEnvelopeRef {
+        version: CACHE_VERSION,
+        expires_at: now.saturating_add(ttl_seconds),
+        passphrase: passphrase.expose_secret(),
+    };
+    let encoded =
+        Zeroizing::new(serde_json::to_string(&envelope).context("Failed to encode keyring cache")?);
+    let entry =
+        keyring::Entry::new(service, ACCOUNT_NAME).context("Failed to open keyring entry")?;
     // Delete existing entry first (macOS keychain errors on duplicate)
     let _ = entry.delete_credential();
     entry
-        .set_password(passphrase.expose_secret())
+        .set_password(encoded.as_str())
         .context("Failed to cache passphrase in keyring")?;
     Ok(())
 }
@@ -40,18 +84,42 @@ pub fn cache_passphrase(passphrase: &SecretString) -> Result<()> {
 /// Returns `None` if no passphrase is cached (first run, cleared cache,
 /// new machine, keyring unavailable).
 pub fn get_cached_passphrase() -> Option<SecretString> {
-    let svc = service_name().ok()?;
-    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME).ok()?;
-    let password = entry.get_password().ok()?;
-    Some(SecretString::from(password))
+    let service = service_name().ok()?;
+    get_cached_passphrase_for_service(&service)
+}
+
+fn get_cached_passphrase_for_service(service: &str) -> Option<SecretString> {
+    let entry = keyring::Entry::new(service, ACCOUNT_NAME).ok()?;
+    let encoded = Zeroizing::new(entry.get_password().ok()?);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let Some(passphrase) = decode_cached_passphrase(&encoded, now) else {
+        let _ = entry.delete_credential();
+        return None;
+    };
+    Some(passphrase)
+}
+
+fn decode_cached_passphrase(encoded: &str, now: u64) -> Option<SecretString> {
+    // Legacy entries stored an unbounded plaintext value. Do not keep
+    // honoring them after duration-based caching is introduced.
+    let mut envelope: CacheEnvelope = serde_json::from_str(encoded).ok()?;
+    if envelope.version != CACHE_VERSION || envelope.expires_at <= now {
+        return None;
+    }
+    Some(SecretString::from(std::mem::take(&mut envelope.passphrase)))
 }
 
 /// Clear the cached passphrase from the OS keyring.
 ///
 /// After this, the user must enter their passphrase manually.
 pub fn clear_cache() -> Result<()> {
-    let svc = service_name()?;
-    let entry = keyring::Entry::new(&svc, ACCOUNT_NAME).context("Failed to open keyring entry")?;
+    let service = service_name()?;
+    clear_cache_for_service(&service)
+}
+
+fn clear_cache_for_service(service: &str) -> Result<()> {
+    let entry =
+        keyring::Entry::new(service, ACCOUNT_NAME).context("Failed to open keyring entry")?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()), // Already cleared
@@ -78,8 +146,16 @@ pub fn unlock_vault(
     encrypted: &[u8],
     manual_passphrase: &SecretString,
 ) -> Result<(Vault, UnlockMethod)> {
+    unlock_vault_with_cached(encrypted, manual_passphrase, get_cached_passphrase())
+}
+
+fn unlock_vault_with_cached(
+    encrypted: &[u8],
+    manual_passphrase: &SecretString,
+    cached_passphrase: Option<SecretString>,
+) -> Result<(Vault, UnlockMethod)> {
     // Try keyring cache first
-    if let Some(cached) = get_cached_passphrase() {
+    if let Some(cached) = cached_passphrase {
         match vault::decrypt(encrypted, cached.expose_secret()) {
             Ok(vault) => return Ok((vault, UnlockMethod::Keyring)),
             Err(e) => {
@@ -105,22 +181,32 @@ mod tests {
     fn cache_lifecycle() {
         // Full lifecycle: cache → retrieve → clear → verify gone
         let passphrase = SecretString::from("test-lifecycle-passphrase".to_owned());
+        let service = format!("com.vida.test.{}", uuid::Uuid::new_v4());
 
         // Cache
-        cache_passphrase(&passphrase).unwrap();
+        cache_passphrase_for_service(&service, &passphrase, Duration::from_secs(60)).unwrap();
 
         // Retrieve
-        let cached = get_cached_passphrase().unwrap();
+        let cached = get_cached_passphrase_for_service(&service).unwrap();
         assert_eq!(cached.expose_secret(), passphrase.expose_secret());
 
         // Clear
-        clear_cache().unwrap();
+        clear_cache_for_service(&service).unwrap();
 
         // Verify cleared (get_cached returns None or error)
         // On macOS, after deletion, get_password returns Err
-        let _after_clear = get_cached_passphrase();
+        let _after_clear = get_cached_passphrase_for_service(&service);
         // We accept either None or Some (if keyring has stale state)
         // The important thing is that clear_cache succeeded
+    }
+
+    #[test]
+    fn bounded_cache_rejects_expired_and_legacy_entries() {
+        let valid = r#"{"version":1,"expires_at":101,"passphrase":"secret"}"#;
+        let decoded = decode_cached_passphrase(valid, 100).unwrap();
+        assert_eq!(decoded.expose_secret(), "secret");
+        assert!(decode_cached_passphrase(valid, 101).is_none());
+        assert!(decode_cached_passphrase("legacy-unbounded-secret", 100).is_none());
     }
 
     #[test]
@@ -166,11 +252,9 @@ mod tests {
         let encrypted =
             crate::vault::encrypt_inner(&vault, passphrase.expose_secret(), 10).unwrap();
 
-        // 3. 清空 keyring
-        clear_cache().unwrap();
-
-        // 4. 调用应用级解锁入口（应走口令回落路径）
-        let (decrypted, method) = unlock_vault(&encrypted, &passphrase).unwrap();
+        // 3. 调用应用级解锁逻辑，显式模拟 keyring 无缓存。
+        // 测试不得读写用户真实的 Vida Keychain 项。
+        let (decrypted, method) = unlock_vault_with_cached(&encrypted, &passphrase, None).unwrap();
 
         // 5. 断言回落到口令输入
         assert!(

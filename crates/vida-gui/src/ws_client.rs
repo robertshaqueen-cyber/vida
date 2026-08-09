@@ -64,11 +64,21 @@ pub enum PushMsg {
     },
 }
 
-/// 推送订阅注册表：session_id → 推送出口。
+/// 推送订阅注册表。
 /// 多路复用：同一连接可订阅多个会话（daemon M2b-1 支持）。
 /// 用 unbounded channel：iced 的 Subscription stream 内部持有 receiver
 /// （不经 Message 传递，Message 只需 PushMsg 数据本身可 Clone）。
-type PushRegistry = Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<PushMsg>>>>;
+///
+/// `prepared_receivers` 解决新会话的交接竞态：向 daemon 发送
+/// SubscribeSession 前先注册 sender，首帧即使在 iced 建立 stream 前到达
+/// 也会在 channel 中等待，而不会被丢弃。
+#[derive(Default)]
+struct PushRegistryState {
+    senders: HashMap<String, mpsc::UnboundedSender<PushMsg>>,
+    prepared_receivers: HashMap<String, mpsc::UnboundedReceiver<PushMsg>>,
+}
+
+type PushRegistry = Arc<std::sync::Mutex<PushRegistryState>>;
 
 #[derive(Clone)]
 pub struct WsClient {
@@ -185,7 +195,8 @@ impl WsClient {
             WsRequest,
             oneshot::Sender<DaemonResult<serde_json::Value>>,
         )>();
-        let push_registry: PushRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let push_registry: PushRegistry =
+            Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
         let push_registry_task = push_registry.clone();
 
         tokio::spawn(async move {
@@ -246,13 +257,32 @@ impl WsClient {
     /// 订阅某会话的推送：注册一个发送端，返回接收端。
     /// 重连后注册表是新的（WsClient 重建），订阅方必须重新订阅。
     pub fn subscribe(&self, session_id: &str) -> mpsc::UnboundedReceiver<PushMsg> {
-        let (push_tx, push_rx) = mpsc::unbounded_channel();
         let mut reg = match self.push_registry.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        reg.insert(session_id.to_string(), push_tx);
+        if let Some(push_rx) = reg.prepared_receivers.remove(session_id) {
+            return push_rx;
+        }
+        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        reg.senders.insert(session_id.to_string(), push_tx);
         push_rx
+    }
+
+    /// 在请求 daemon 发送首帧前预先建立本地推送通道。
+    /// iced 稍后构建 Subscription 时会取走已准备的 receiver。
+    pub fn prepare_subscription(&self, session_id: &str) {
+        let mut reg = match self.push_registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if reg.senders.contains_key(session_id) {
+            return;
+        }
+        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        reg.senders.insert(session_id.to_string(), push_tx);
+        reg.prepared_receivers
+            .insert(session_id.to_string(), push_rx);
     }
 
     /// 取消订阅：移除注册，不再转发该会话的推送。
@@ -261,7 +291,8 @@ impl WsClient {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        reg.remove(session_id);
+        reg.senders.remove(session_id);
+        reg.prepared_receivers.remove(session_id);
     }
 
     /// Send a request with params.
@@ -344,11 +375,14 @@ impl WsClient {
     pub async fn unlock(
         &self,
         passphrase: &str,
-        remember: bool,
+        remember_seconds: Option<u64>,
     ) -> DaemonResult<serde_json::Value> {
         self.send(
             "Unlock",
-            serde_json::json!({"passphrase": passphrase, "remember": remember}),
+            serde_json::json!({
+                "passphrase": passphrase,
+                "remember_seconds": remember_seconds,
+            }),
         )
         .await
     }
@@ -390,7 +424,8 @@ fn close_push_subscriptions(registry: &PushRegistry) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    reg.clear();
+    reg.senders.clear();
+    reg.prepared_receivers.clear();
 }
 
 /// 二进制帧头格式（与 daemon encode_frame 对应）：
@@ -417,7 +452,7 @@ fn forward_binary_push(bytes: &[u8], registry: &PushRegistry) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(tx) = reg.get(&session_id) {
+    if let Some(tx) = reg.senders.get(&session_id) {
         let _ = tx.send(PushMsg::Frame {
             session_id,
             bytes: payload.to_vec(),
@@ -459,7 +494,7 @@ fn forward_text_push(text: &str, registry: &PushRegistry) {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(tx) = reg.get(session_id) {
+        if let Some(tx) = reg.senders.get(session_id) {
             let _ = tx.send(PushMsg::SessionClosed {
                 session_id: session_id.to_string(),
                 exit_code,
@@ -498,16 +533,19 @@ fn read_port() -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PushRegistry, close_push_subscriptions};
-    use std::collections::HashMap;
+    use super::{PushMsg, PushRegistry, PushRegistryState, WsClient, close_push_subscriptions};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
     #[test]
     fn websocket_exit_closes_terminal_subscription_receivers() {
-        let registry: PushRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry: PushRegistry = Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        registry.lock().unwrap().insert("session-1".to_string(), tx);
+        registry
+            .lock()
+            .unwrap()
+            .senders
+            .insert("session-1".to_string(), tx);
 
         close_push_subscriptions(&registry);
 
@@ -515,5 +553,31 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn prepared_subscription_keeps_frame_that_arrives_before_iced_stream() {
+        let (tx, _request_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
+        let client = WsClient {
+            tx,
+            push_registry: registry.clone(),
+        };
+        client.prepare_subscription("new-session");
+
+        let session_id = b"new-session";
+        let mut wire = vec![0x01, 0x00, session_id.len() as u8];
+        wire.extend_from_slice(session_id);
+        wire.extend_from_slice(b"full-frame");
+        super::forward_binary_push(&wire, &registry);
+
+        let mut receiver = client.subscribe("new-session");
+        match receiver.try_recv().expect("prepared first frame") {
+            PushMsg::Frame { session_id, bytes } => {
+                assert_eq!(session_id, "new-session");
+                assert_eq!(bytes, b"full-frame");
+            }
+            other => panic!("unexpected push: {other:?}"),
+        }
     }
 }

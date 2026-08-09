@@ -17,11 +17,15 @@ pub enum Request {
     /// Create a new vault with the given passphrase.
     CreateVault { passphrase: String },
     /// Unlock an existing vault.
-    /// `remember`: if true, cache passphrase in OS keyring for next unlock.
+    /// `remember_seconds`: cache the passphrase in the OS keyring for this
+    /// bounded duration. `remember=true` is retained for older clients and
+    /// maps to seven days.
     Unlock {
         passphrase: String,
         #[serde(default)]
         remember: bool,
+        #[serde(default)]
+        remember_seconds: Option<u64>,
     },
     /// Lock the vault (clear in-memory state).
     Lock,
@@ -367,6 +371,35 @@ mod tests {
             Request::Auth { token } => assert_eq!(token, "xyz"),
             other => panic!("expected Auth, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn unlock_duration_supports_new_and_legacy_clients() {
+        let current: Request = serde_json::from_str(
+            r#"{"method":"Unlock","params":{"passphrase":"x","remember_seconds":3600}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            current,
+            Request::Unlock {
+                remember_seconds: Some(3600),
+                remember: false,
+                ..
+            }
+        ));
+
+        let legacy: Request = serde_json::from_str(
+            r#"{"method":"Unlock","params":{"passphrase":"x","remember":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Request::Unlock {
+                remember_seconds: None,
+                remember: true,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -1028,8 +1028,44 @@ alacritty 的锚定语义，键盘输入或粘贴前由同一有序队列先回�
 
 ### daemon 重启后的终端恢复
 
-WebSocket 断开只把终端标记为等待恢复，不删除标签。连接到新 daemon 后若金库锁定，
-先进入解锁页；`HostsLoaded` 完成后再按每个标签保存的 `remote_host_id` 恢复 SSH，缺少
-该字段的标签恢复为本地终端。用户主动点击锁定仍关闭全部会话和标签，两条路径不得混用。
+WebSocket 断开只把终端标记为等待恢复，不删除标签。M4 后 PTY/SSH 由独立 session host
+持有；已解锁 GUI 意外失去 daemon 时，连接到新 daemon 后可在不解密金库的情况下
+优先订阅原 session id，因此 shell 进程、工作目录、
+运行中命令和回滚历史都不变。只有宿主或系统也已退出、原 session 确实不存在时，才按标签
+保存的 `remote_host_id` 创建替代 SSH，缺少该字段的标签创建本地终端。用户主动点击锁定是
+安全边界：会显式关闭实际会话但保留标签描述，解锁后再创建替代会话；它与意外断线不得混用。
+应用冷启动时也不继承“意外断线”授权，仍先显示金库解锁页。
+
+新建或替代会话的 `SubscribeSession` 存在一个交接窗口：daemon 可能在 iced 尚未
+根据新 session id 重建 Subscription 时就发出首张全量帧。GUI 必须在发送
+`SubscribeSession` 请求之前预注册本地推送通道，并把 receiver 交给稍后建立的 iced
+stream。禁止依赖 shell 的后续输出补帧；否则安静的本地 shell 会空白到用户按回车。
 首次自动连接失败必须进入带“重试连接”按钮的连接页，恢复意图一直保留到成功或用户
 主动关闭/锁定，不能停在无入口的状态文字上。
+
+### 金库按需解锁与有期钥匙串缓存
+
+daemon 重启后，独立 session host 中的现有终端不依赖金库，GUI 允许先恢复它们；
+新建 SSH、编辑主机或其他需要凭据的操作仍必须解锁。快速连接在此状态下不显示
+“金库已锁定”死路错误，而是保留目标 host id、进入 S2，解锁并重载主机后自动继续。
+
+S2 可选不记住、1/5/15 分钟、1 小时、1 天或 7 天。口令仅存在操作系统 Keychain 中，
+值为带版本和绝对过期时间的封装，不进入 Vida 配置或金库文件。daemon 启动时只接受未过期的
+新格式项；旧版无期限项、过期项和解密失败项立即删除。用户主动锁定同时撤销缓存。
+序列化/解析中的临时明文缓冲在 drop 时 zeroize。
+
+### M4 独立 session host
+
+生产 daemon 不再直接持有 `PtyEngine`。同一个 `vida-daemon` 可执行文件以隐藏的
+`--vida-session-host` 模式启动独立进程；宿主持有 PTY 子进程、SSH askpass broker、
+alacritty 网格和订阅者。daemon 是可替换的控制面，重启后通过配置目录中的 Unix socket
+重新发现宿主。v1 目标平台仍为 macOS + Linux。
+
+socket 位于权限 0700 的配置目录中且自身设为 0600。控制协议带显式版本号；若连接到不兼容
+的活动宿主，daemon 报错并保留其 socket，不能把活会话误判成陈旧文件后删除。控制请求使用
+一条长连接，避免每个按键创建连接/线程；每个终端订阅使用独立推送连接。请求枚举不实现
+`Debug`，SSH 凭据不进入 argv/env/log，凭据对象和 JSON 收发缓冲区用完即 zeroize。
+
+宿主与 daemon 分属不同 session/process group，因此 daemon 收到 Ctrl-C 或崩溃不会波及
+shell。宿主发现原父 daemon 已退出、没有控制连接且没有会话时才自行结束并移除 socket；
+新 daemon 接管的长控制连接会阻止仍在使用的空宿主竞态退出。

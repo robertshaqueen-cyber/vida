@@ -375,6 +375,7 @@ impl State {
             AppMessage::SettingsLanguageChanged,
         )
         .style(ui::picker)
+        .menu_style(ui::picker_menu)
         .padding(10)
         .width(Length::Fill);
 
@@ -519,6 +520,7 @@ impl State {
             AppMessage::SettingsSyncModeChanged,
         )
         .style(ui::picker)
+        .menu_style(ui::picker_menu)
         .padding(10)
         .width(Length::Fill);
 
@@ -632,6 +634,7 @@ impl State {
             AppMessage::SettingsTerminalFontFamilyChanged,
         )
         .style(ui::picker)
+        .menu_style(ui::picker_menu)
         .padding(10)
         .width(Length::Fill);
         let font_family_hint = text(i18n.tr("settings_terminal_font_family_hint")).size(11);
@@ -643,6 +646,7 @@ impl State {
             AppMessage::SettingsTerminalFontSizeChanged,
         )
         .style(ui::picker)
+        .menu_style(ui::picker_menu)
         .padding(10)
         .width(Length::Fill);
         let font_size_hint = text(i18n.tr("settings_terminal_font_size_hint")).size(11);

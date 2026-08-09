@@ -37,6 +37,11 @@ pub fn run() -> Result<(), iced::Error> {
 pub struct VidaApp {
     ws_client: Option<WsClient>,
     screen: Screen,
+    /// Last vault state reported by the current daemon. Existing M4 sessions
+    /// remain usable while true, but credential-requiring actions must route
+    /// through the unlock screen instead of surfacing a dead-end error.
+    vault_locked: bool,
+    pending_vault_action: Option<PendingVaultAction>,
     // Business data lives on VidaApp (not inside Screen), so any screen —
     // e.g. conflict/backup screens — can read the host list.
     hosts: Vec<s3_main::HostItem>,
@@ -73,6 +78,10 @@ pub struct VidaApp {
     terminal_appearance: crate::term::primitive::TerminalAppearance,
     /// daemon 连接中断后保留终端标签；金库重新解锁后按原类型恢复会话。
     terminal_restore_pending: bool,
+    /// 仅在 GUI 已经解锁、却意外失去 daemon 连接时置位。M4 的
+    /// session host 仍持有这些会话，新 daemon 可在不解密金库的情况下
+    /// 重新订阅它们。应用冷启动和用户主动锁定不得走这条路径。
+    terminal_resume_without_unlock: bool,
     /// 防止自动定时重连和手动“重试连接”同时建立两条连接。
     /// 成功连回 daemon 后保持为 true，直到终端标签恢复完成。
     terminal_reconnect_in_flight: bool,
@@ -82,6 +91,11 @@ pub struct VidaApp {
     /// Disabled by unit-test fixtures so tests never overwrite the user's
     /// device-local workspace state.
     ui_state_persistence_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+enum PendingVaultAction {
+    OpenSsh(String),
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -199,7 +213,7 @@ pub enum AppMessage {
 
     // S2: Unlock
     UnlockPassphraseChanged(String),
-    UnlockRememberToggled(bool),
+    UnlockRememberChanged(s2_unlock::RememberDuration),
     UnlockVault,
     UnlockSuccess,
     UnlockFailed(String, Option<String>), // (message, category)
@@ -300,6 +314,8 @@ fn new() -> (VidaApp, Task<AppMessage>) {
     let mut app = VidaApp {
         ws_client: None,
         screen: Screen::ConnectionFailure(s0_connection::State::new(connecting.into())),
+        vault_locked: true,
+        pending_vault_action: None,
         hosts: Vec::new(),
         tabs: Vec::new(),
         active_tab_id: String::new(),
@@ -320,6 +336,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         terminal_reconnect_cooldown: None,
         terminal_appearance: crate::term::primitive::TerminalAppearance::default(),
         terminal_restore_pending: false,
+        terminal_resume_without_unlock: false,
         terminal_reconnect_in_flight: false,
         initial_terminal_open_pending: true,
         ui_state_persistence_enabled: true,
@@ -521,6 +538,8 @@ fn close_terminal_session(app: &mut VidaApp, tab_id: &str) {
 /// Explicit vault lock closes daemon PTYs but retains their tab descriptors so
 /// a successful unlock can reopen the same local/SSH workspace.
 fn suspend_all_terminal_sessions(app: &mut VidaApp) {
+    // 主动锁定是安全边界：与 daemon 意外中断不同，下次必须先解锁。
+    app.terminal_resume_without_unlock = false;
     for session in app.terminal_sessions.values_mut() {
         if let Some(client) = app.ws_client.as_ref() {
             client.unsubscribe(&session.session_id);
@@ -564,6 +583,10 @@ fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
         async move {
             let mut mappings = Vec::with_capacity(snapshots.len());
             for (old_session_id, rows, cols, remote_host_id) in snapshots {
+                // Register the GUI-side receiver before daemon emits the full
+                // snapshot. This matters both for an existing M4 session and
+                // for a replacement created below.
+                client.prepare_subscription(&old_session_id);
                 match client
                     .send(
                         "SubscribeSession",
@@ -585,6 +608,7 @@ fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
                         mappings.push((old_session_id.clone(), old_session_id, false));
                     }
                     Err(error) if error.message.contains("会话不存在") => {
+                        client.unsubscribe(&old_session_id);
                         let reopened = match remote_host_id {
                             Some(host_id) => open_ssh_and_subscribe(&client, &host_id).await,
                             None => open_and_subscribe(&client).await,
@@ -609,6 +633,7 @@ fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
                         }
                     }
                     Err(error) => {
+                        client.unsubscribe(&old_session_id);
                         return AppMessage::TerminalReconnectFailed(error.message);
                     }
                 }
@@ -617,6 +642,27 @@ fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
         },
         |message| message,
     )
+}
+
+fn mark_terminal_reconnected(
+    session: &mut s_terminal::TerminalSession,
+    new_session_id: String,
+    replaced: bool,
+) {
+    session.session_id = new_session_id;
+    session.closed = false;
+    session.exit_code = None;
+    // A successful recovery is the normal steady state. Do not leave the old
+    // disconnect/replacement banner visible.
+    session.notice = None;
+    // SubscribeSession sends a full frame. For a reused M4 session that frame
+    // may be applied just before the response reaches update(); clearing here
+    // would erase the only snapshot until the next terminal output.
+    if replaced {
+        let (rows, cols) = (session.grid.rows, session.grid.cols);
+        session.grid.reset(rows, cols);
+    }
+    session.cursor_on = true;
 }
 
 /// Every open terminal tab gets its own push stream. Inactive tabs keep their
@@ -727,10 +773,14 @@ async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "OpenLocalSession 响应缺少 session_id".to_string())?
         .to_string();
-    client
+    client.prepare_subscription(&sid);
+    if let Err(error) = client
         .send("SubscribeSession", serde_json::json!({"session_id": sid}))
         .await
-        .map_err(|e| format!("订阅失败: {}", e.message))?;
+    {
+        client.unsubscribe(&sid);
+        return Err(format!("订阅失败: {}", error.message));
+    }
     Ok(sid)
 }
 
@@ -748,10 +798,14 @@ async fn open_ssh_and_subscribe(client: &WsClient, host_id: &str) -> Result<Stri
         .and_then(|value| value.as_str())
         .ok_or_else(|| "OpenSshSession 响应缺少 session_id".to_string())?
         .to_string();
-    client
+    client.prepare_subscription(&sid);
+    if let Err(error) = client
         .send("SubscribeSession", serde_json::json!({"session_id": sid}))
         .await
-        .map_err(|e| format!("订阅 SSH 会话失败: {}", e.message))?;
+    {
+        client.unsubscribe(&sid);
+        return Err(format!("订阅 SSH 会话失败: {}", error.message));
+    }
     Ok(sid)
 }
 
@@ -818,8 +872,27 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             locked,
             vault_exists,
         } => {
+            app.vault_locked = locked;
             if !vault_exists {
                 app.screen = Screen::Setup(s1_setup::State::new());
+            } else if locked
+                && app.terminal_resume_without_unlock
+                && app.terminal_restore_pending
+                && !app.terminal_sessions.is_empty()
+            {
+                // A restarted daemon has forgotten the in-memory vault key,
+                // but the independent M4 session host still owns the shells.
+                // Re-subscription does not need host credentials, so keep the
+                // user in the terminal workspace instead of forcing an
+                // unrelated vault unlock. Explicit LockVault never sets this
+                // flag, and a cold GUI start therefore still requires unlock.
+                if !matches!(app.screen, Screen::Main(_)) {
+                    app.screen = Screen::Main(s3_main::State {
+                        revealed_credential: None,
+                        credential_copied: false,
+                    });
+                }
+                return restore_terminal_sessions(app);
             } else if locked {
                 app.screen = Screen::Unlock(s2_unlock::State::new());
             } else {
@@ -900,9 +973,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
-        AppMessage::UnlockRememberToggled(v) => {
+        AppMessage::UnlockRememberChanged(duration) => {
             if let Screen::Unlock(s) = &mut app.screen {
-                s.remember = v;
+                s.remember_duration = duration;
             }
             Task::none()
         }
@@ -911,11 +984,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 s.unlocking = true;
                 s.error = None;
                 let passphrase = s.passphrase.clone();
-                let remember = s.remember;
+                let remember_seconds = s.remember_duration.seconds();
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
                     async move {
-                        match client.unlock(&passphrase, remember).await {
+                        match client.unlock(&passphrase, remember_seconds).await {
                             Ok(_) => AppMessage::UnlockSuccess,
                             Err(e) => AppMessage::UnlockFailed(e.message, e.category),
                         }
@@ -957,6 +1030,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::UnlockSuccess => {
+            app.vault_locked = false;
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
                 async move {
@@ -1089,6 +1163,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             // Business data lives on VidaApp so conflict/backup screens can
             // read it regardless of the current screen.
             app.set_hosts(hosts);
+            app.vault_locked = false;
             app.recent_host_ids
                 .retain(|id| app.hosts.iter().any(|host| &host.id == id));
             app.screen = Screen::Main(s3_main::State {
@@ -1117,8 +1192,14 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             } else {
                 Task::none()
             };
+            let pending_task = match app.pending_vault_action.take() {
+                Some(PendingVaultAction::OpenSsh(host_id)) => {
+                    update(app, AppMessage::OpenSshTerminal(host_id))
+                }
+                None => Task::none(),
+            };
             persist_ui_state(app);
-            Task::batch([settings_task, restore_task])
+            Task::batch([settings_task, restore_task, pending_task])
         }
         AppMessage::EditHost(host_id) => {
             // Find host data and open editor in a new tab
@@ -1664,6 +1745,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::VaultLocked => {
             app.terminal_opening = false;
             app.terminal_error = None;
+            app.vault_locked = true;
+            app.pending_vault_action = None;
             app.screen = Screen::Unlock(s2_unlock::State::new());
             Task::none()
         }
@@ -2339,6 +2422,14 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             if app.terminal_opening || !matches!(app.screen, Screen::Main(_)) {
                 return Task::none();
             }
+            if app.vault_locked {
+                app.pending_vault_action = Some(PendingVaultAction::OpenSsh(host_id));
+                app.terminal_error = None;
+                app.screen = Screen::Unlock(s2_unlock::State::new());
+                return iced::widget::operation::focus::<AppMessage>(iced::widget::Id::from(
+                    crate::screens::s2_unlock::UNLOCK_PASSPHRASE_ID,
+                ));
+            }
             let Some(host) = app.hosts.iter().find(|host| host.id == host_id) else {
                 app.terminal_error = Some(app.i18n.tr("main_host_not_found").to_string());
                 return Task::none();
@@ -2430,6 +2521,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 session.notice = Some(app.i18n.tr("terminal_reconnecting").to_string());
             }
             app.terminal_restore_pending = true;
+            app.terminal_resume_without_unlock = true;
 
             let now = std::time::Instant::now();
             if app
@@ -2456,24 +2548,17 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.ws_client = Some(client);
             app.terminal_reconnect_cooldown = None;
             app.terminal_restore_pending = false;
+            app.terminal_resume_without_unlock = false;
             app.terminal_reconnect_in_flight = false;
             app.terminal_error = None;
 
-            for (old_session_id, new_session_id, _replaced) in mappings {
+            for (old_session_id, new_session_id, replaced) in mappings {
                 if let Some(session) = app
                     .terminal_sessions
                     .values_mut()
                     .find(|session| session.session_id == old_session_id)
                 {
-                    session.session_id = new_session_id.clone();
-                    session.closed = false;
-                    session.exit_code = None;
-                    // A successful recovery is the normal steady state. Do not
-                    // leave the old disconnect/replacement banner visible.
-                    session.notice = None;
-                    let (rows, cols) = (session.grid.rows, session.grid.cols);
-                    session.grid.reset(rows, cols);
-                    session.cursor_on = true;
+                    mark_terminal_reconnected(session, new_session_id.clone(), replaced);
                 }
                 for tab in &mut app.tabs {
                     if let crate::screens::TabKind::Terminal { session_id, .. } = &mut tab.kind
@@ -2907,11 +2992,11 @@ fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, editor_focus_event,
-        parse_backup_bytes, restore_persisted_terminal_layout, suspend_all_terminal_sessions,
-        update,
+        AppMessage, PendingVaultAction, Screen, Tab, VidaApp, classify_ssh_failure,
+        editor_focus_event, mark_terminal_reconnected, parse_backup_bytes,
+        restore_persisted_terminal_layout, suspend_all_terminal_sessions, update,
     };
-    use crate::screens::{s_terminal, s3_main};
+    use crate::screens::{s_terminal, s0_connection, s3_main};
     use crate::term::primitive::TerminalAppearance;
     use crate::ws_client::PushMsg;
 
@@ -3077,6 +3162,32 @@ mod tests {
     }
 
     #[test]
+    fn reconnecting_same_m4_session_does_not_erase_early_full_frame() {
+        let mut session = s_terminal::TerminalSession::new(
+            "preserved-session".into(),
+            None,
+            "Local terminal".into(),
+            40,
+            100,
+            TerminalAppearance::default(),
+        );
+        // A full snapshot may be applied before TerminalReconnected reaches
+        // update(). Its version must survive finalizing the reused mapping.
+        session.grid.version = 17;
+        session.closed = true;
+        mark_terminal_reconnected(&mut session, "preserved-session".into(), false);
+
+        assert_eq!(session.grid.version, 17);
+        assert!(!session.closed);
+
+        // A genuinely replacement shell must still clear the old contents.
+        session.closed = true;
+        mark_terminal_reconnected(&mut session, "replacement-session".into(), true);
+        assert_eq!(session.grid.version, 18);
+        assert_eq!(session.session_id, "replacement-session");
+    }
+
+    #[test]
     fn explicit_lock_suspends_but_keeps_terminal_layout() {
         let mut app = app_with_two_terminal_tabs();
         suspend_all_terminal_sessions(&mut app);
@@ -3140,7 +3251,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_disconnect_preserves_terminal_tabs_for_unlock_restore() {
+    fn daemon_disconnect_preserves_terminal_tabs_for_transparent_restore() {
         let mut app = app_with_two_terminal_tabs();
         let terminal_tab_ids: Vec<String> = app
             .tabs
@@ -3157,6 +3268,7 @@ mod tests {
         );
 
         assert!(app.terminal_restore_pending);
+        assert!(app.terminal_resume_without_unlock);
         assert!(app.terminal_sessions.values().all(|session| session.closed));
         assert!(
             terminal_tab_ids
@@ -3172,5 +3284,66 @@ mod tests {
                 .iter()
                 .all(|id| app.tabs.iter().any(|tab| &tab.id == id))
         );
+    }
+
+    #[test]
+    fn restarted_locked_daemon_restores_live_sessions_without_unlock_overlay() {
+        let mut app = app_with_two_terminal_tabs();
+        let _ = update(
+            &mut app,
+            AppMessage::TerminalDisconnected {
+                session_id: "session-a".to_string(),
+            },
+        );
+        app.screen = Screen::ConnectionFailure(s0_connection::State::new("disconnected".into()));
+
+        let _ = update(
+            &mut app,
+            AppMessage::DaemonChecked {
+                locked: true,
+                vault_exists: true,
+            },
+        );
+
+        assert!(matches!(app.screen, Screen::Main(_)));
+        assert!(app.terminal_restore_pending);
+        assert!(app.terminal_resume_without_unlock);
+    }
+
+    #[test]
+    fn cold_start_with_saved_tabs_still_requires_vault_unlock() {
+        let mut app = app_with_two_terminal_tabs();
+        for session in app.terminal_sessions.values_mut() {
+            session.closed = true;
+        }
+        app.terminal_restore_pending = true;
+        app.terminal_resume_without_unlock = false;
+
+        let _ = update(
+            &mut app,
+            AppMessage::DaemonChecked {
+                locked: true,
+                vault_exists: true,
+            },
+        );
+
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+    }
+
+    #[test]
+    fn locked_vault_quick_ssh_routes_to_unlock_and_keeps_intent() {
+        let mut app = app_with_two_terminal_tabs();
+        app.vault_locked = true;
+
+        let _ = update(
+            &mut app,
+            AppMessage::OpenSshTerminal("host-after-unlock".to_string()),
+        );
+
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+        assert!(matches!(
+            app.pending_vault_action,
+            Some(PendingVaultAction::OpenSsh(ref host_id)) if host_id == "host-after-unlock"
+        ));
     }
 }

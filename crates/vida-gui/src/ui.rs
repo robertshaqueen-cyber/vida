@@ -4,7 +4,7 @@
 //! single palette, one small icon font, and stateless style functions. This
 //! keeps the UI coherent without adding a web runtime or an SVG renderer.
 
-use iced::widget::{button, container, pick_list, text, text_input};
+use iced::widget::{button, container, overlay::menu, pick_list, text, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 pub const BG_APP: Color = Color::from_rgb(0.058, 0.082, 0.078);
@@ -338,6 +338,30 @@ pub fn picker(_: &Theme, status: pick_list::Status) -> pick_list::Style {
             color: if emphasized { ACCENT } else { BORDER },
             width: 1.0,
             radius: RADIUS_SM.into(),
+        },
+    }
+}
+
+/// Shared popup treatment for every Vida picker.
+///
+/// iced styles the closed picker and its overlay menu independently. Always
+/// pair this with [`picker`] so opening a dropdown does not fall back to the
+/// toolkit's default surface, selection color, or square corners.
+pub fn picker_menu(_: &Theme) -> menu::Style {
+    menu::Style {
+        background: Background::Color(BG_SURFACE),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
+        text_color: TEXT_PRIMARY,
+        selected_text_color: TEXT_PRIMARY,
+        selected_background: Background::Color(ACCENT_MUTED),
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.30),
+            offset: Vector::new(0.0, 5.0),
+            blur_radius: 16.0,
         },
     }
 }
