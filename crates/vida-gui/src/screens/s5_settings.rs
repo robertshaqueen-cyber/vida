@@ -737,6 +737,17 @@ fn connection_host_item<'a>(host: &'a HostItem, i18n: &'a I18n) -> Element<'a, A
     .on_press(AppMessage::OpenSshTerminal(host.id.clone()))
     .style(ui::primary_button)
     .padding([7, 10]);
+    let details = button(
+        row![
+            icons::icon(icons::EYE, 13),
+            text(i18n.tr("main_details")).size(12),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press(AppMessage::OpenHostDetail(host.id.clone()))
+    .style(ui::secondary_button)
+    .padding([7, 10]);
     let edit = button(
         row![
             icons::icon(icons::PENCIL, 13),
@@ -750,7 +761,7 @@ fn connection_host_item<'a>(host: &'a HostItem, i18n: &'a I18n) -> Element<'a, A
     .padding([7, 10]);
 
     container(
-        row![identity, connect, edit]
+        row![identity, connect, edit, details]
             .spacing(8)
             .align_y(Alignment::Center),
     )
