@@ -18,6 +18,7 @@ pub struct HostItem {
     pub color: Option<String>,
     pub auth_kind: String,
     pub notes: Option<String>,
+    pub agent_trust: String,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ impl State {
         active_tab_id: &'a str,
         i18n: &'a I18n,
         show_connect_panel: bool,
+        agent_approval_count: usize,
         sync_symbol: &'static str,
         sync_label: String,
     ) -> Element<'a, AppMessage> {
@@ -161,7 +163,28 @@ impl State {
             tooltip::Position::Bottom,
         );
 
-        let right_buttons = row![sync_btn, settings_btn, lock_btn]
+        let approval_btn: Element<'a, AppMessage> = if agent_approval_count > 0 {
+            tooltip(
+                button(
+                    row![
+                        icons::icon(icons::CIRCLE_ALERT, 16).color(ui::WARNING),
+                        text(agent_approval_count).size(12).color(ui::WARNING),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(AppMessage::ToggleAgentApprovalPanel)
+                .style(ui::icon_button(true))
+                .padding([9, 10]),
+                i18n.tr("agent_approval_open"),
+                tooltip::Position::Bottom,
+            )
+            .into()
+        } else {
+            Space::new().width(0).into()
+        };
+
+        let right_buttons = row![approval_btn, sync_btn, settings_btn, lock_btn]
             .spacing(2)
             .align_y(Alignment::Center);
 
@@ -394,6 +417,15 @@ impl State {
                 info_card(icons::KEY, i18n.trf("main_auth_kind", &[&host.auth_kind])),
                 info_card(icons::FOLDER, group.to_string()),
                 info_card(icons::DATABASE, tags),
+                info_card(
+                    icons::SHIELD,
+                    i18n.tr(match host.agent_trust.as_str() {
+                        "readonly" => "agent_trust_readonly",
+                        "trusted" => "agent_trust_trusted",
+                        _ => "agent_trust_ask",
+                    })
+                    .to_string(),
+                ),
             ]
             .spacing(12)
             .width(Length::Fill);

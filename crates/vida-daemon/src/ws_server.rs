@@ -9,10 +9,24 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::PushPayload;
+use crate::agent::{AgentController, CommandDecision, SessionTarget};
 use crate::protocol::{PtyRequest, Request, Response, ResponsePayload, SyncResponse};
+use crate::pty::SessionInfo;
 use crate::pty::push::{BoundedReceiver, PushKind};
 use crate::state::DaemonState;
 use vida_core::sync::SyncResult;
+
+/// Agent-facing session identity. PTY owns the live process facts while the
+/// Agent binding and device-local GUI layout own what that process represents.
+#[derive(Debug, serde::Serialize)]
+struct ListedSession {
+    #[serde(flatten)]
+    process: SessionInfo,
+    title: String,
+    target_kind: &'static str,
+    host_id: Option<String>,
+    host_name: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Token management
@@ -36,6 +50,7 @@ pub fn load_or_create_token() -> Result<String> {
         let token = std::fs::read_to_string(&path).context("Failed to read daemon.token")?;
         let token = token.trim().to_string();
         if !token.is_empty() {
+            write_agent_token(&token)?;
             return Ok(token);
         }
     }
@@ -50,12 +65,36 @@ pub fn load_or_create_token() -> Result<String> {
     }
 
     info!("Generated new daemon token: {}", &token[..8]);
+    write_agent_token(&token)?;
     Ok(token)
+}
+
+fn derive_agent_token(owner_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(
+        format!("vida-agent:{owner_token}").as_bytes(),
+    ))
+}
+
+fn write_agent_token(owner_token: &str) -> Result<()> {
+    let path = vida_core::config::config_dir()?.join("agent.token");
+    std::fs::write(&path, derive_agent_token(owner_token))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn cleanup_token() {
     let _ = std::fs::remove_file(token_path().unwrap_or_default());
     let _ = std::fs::remove_file(port_path().unwrap_or_default());
+    let _ = std::fs::remove_file(
+        vida_core::config::config_dir()
+            .unwrap_or_default()
+            .join("agent.token"),
+    );
 }
 
 fn port_path() -> Result<std::path::PathBuf> {
@@ -75,7 +114,18 @@ fn tokens_match(a: &str, b: &str) -> bool {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<DaemonState>>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientRole {
+    Owner,
+    Agent,
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    state: Arc<Mutex<DaemonState>>,
+    agent: Arc<Mutex<AgentController>>,
+) {
     info!("New WebSocket connection from {}", addr);
 
     let ws_stream = match tokio_tungstenite::accept_hdr_async(
@@ -103,7 +153,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
     };
 
     let (mut write, mut read) = ws_stream.split();
-    let mut authenticated = false;
+    let mut role = None;
+    let mut agent_event_rx = agent.lock().await.subscribe_events();
 
     // 推送通道：PTY 推送循环 → 桥接任务 → tokio channel → 此处
     // (session_id, payload)：多路复用，一个连接可订阅多个会话。
@@ -121,7 +172,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         let push_cmd_arc: Arc<Mutex<Option<PushCommand>>> =
                             Arc::new(Mutex::new(None));
                         let response = handle_message(
-                            &text, &state, &mut authenticated, &push_cmd_arc,
+                            &text, &state, &agent, &mut role, &push_cmd_arc,
                         ).await;
                         // 处理推送相关命令（订阅/取消订阅）
                         if let Some(cmd) = push_cmd_arc.lock().await.take() {
@@ -220,6 +271,27 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                     }
                 }
             }
+
+            event = agent_event_rx.recv() => {
+                match event {
+                    Ok(event) if role == Some(ClientRole::Owner) => {
+                        let event = serde_json::json!({
+                            "type": "Event",
+                            "event": "agent_approval",
+                            "data": event,
+                        });
+                        if let Err(error) = write.send(Message::Text(event.to_string().into())).await {
+                            debug!("Failed to push Agent approval event to {}: {}", addr, error);
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        warn!("Agent approval event receiver for {} lagged by {} events", addr, count);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 
@@ -246,7 +318,8 @@ enum PushCommand {
 async fn handle_message(
     text: &str,
     state: &Arc<Mutex<DaemonState>>,
-    authenticated: &mut bool,
+    agent: &Arc<Mutex<AgentController>>,
+    role: &mut Option<ClientRole>,
     push_cmd_out: &Arc<Mutex<Option<PushCommand>>>,
 ) -> String {
     // Clone i18n once (lightweight, language table only) for all messages in this call
@@ -271,7 +344,7 @@ async fn handle_message(
     let method = raw.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
     // Auth check: first message must be "auth"
-    if !*authenticated {
+    if role.is_none() {
         if method != "Auth" {
             return serde_json::to_string(&Response {
                 id,
@@ -289,10 +362,24 @@ async fn handle_message(
             .and_then(|p| p.get("token"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
+        let requested_role = raw
+            .get("params")
+            .and_then(|p| p.get("role"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("owner");
 
         let state_token = state.lock().await.token.clone();
+        let authenticated_role = if requested_role == "agent"
+            && tokens_match(token, &derive_agent_token(&state_token))
+        {
+            Some(ClientRole::Agent)
+        } else if requested_role == "owner" && tokens_match(token, &state_token) {
+            Some(ClientRole::Owner)
+        } else {
+            None
+        };
 
-        if !tokens_match(token, &state_token) {
+        if authenticated_role.is_none() {
             return serde_json::to_string(&Response {
                 id,
                 payload: ResponsePayload::Error {
@@ -304,12 +391,18 @@ async fn handle_message(
             .unwrap();
         }
 
-        *authenticated = true;
-        info!("Client authenticated");
+        *role = authenticated_role;
+        info!("Client authenticated as {:?}", role.unwrap());
         return serde_json::to_string(&Response {
             id,
             payload: ResponsePayload::Ok {
-                result: serde_json::json!({"authenticated": true}),
+                result: serde_json::json!({
+                    "authenticated": true,
+                    "role": match role.unwrap() {
+                        ClientRole::Owner => "owner",
+                        ClientRole::Agent => "agent",
+                    }
+                }),
             },
         })
         .unwrap();
@@ -330,6 +423,19 @@ async fn handle_message(
             .unwrap();
         }
     };
+
+    let role = role.expect("authenticated role established above");
+    if !request_allowed_for_role(&request, role) {
+        return serde_json::to_string(&Response {
+            id,
+            payload: ResponsePayload::Error {
+                code: -6,
+                message: "该客户端无权调用此操作。Agent 必须使用受策略保护的专用接口。".to_string(),
+                category: Some("forbidden".to_string()),
+            },
+        })
+        .unwrap();
+    }
 
     // 提前取出 pty 的 Arc 引用（避免持 tokio MutexGuard 跨 await）
     let pty_arc = state.lock().await.pty.clone();
@@ -438,7 +544,7 @@ async fn handle_message(
         .unwrap();
     }
 
-    let result = handle_request(request, state).await;
+    let result = handle_request(request, state, agent).await;
 
     match result {
         Ok(payload) => serde_json::to_string(&Response {
@@ -469,12 +575,24 @@ async fn handle_message(
 async fn handle_request(
     request: Request,
     state: &Arc<Mutex<DaemonState>>,
+    agent: &Arc<Mutex<AgentController>>,
 ) -> Result<serde_json::Value> {
     // PTY 请求：不持金库锁，只锁 state.pty（独立 RwLock）。
     // PtyRequest 由 #[serde(untagged)] 在反序列化时已分流，
     // 编译器保证 handle_pty_request 穷尽匹配所有 PtyRequest 变体。
     if let Request::Pty(pty_req) = &request {
-        return handle_pty_request(pty_req, state).await;
+        return handle_pty_request(pty_req, state, agent).await;
+    }
+
+    if matches!(
+        &request,
+        Request::AgentExec { .. }
+            | Request::ListAgentApprovals
+            | Request::ApproveAgentAction { .. }
+            | Request::DenyAgentAction { .. }
+            | Request::ReadAgentAudit { .. }
+    ) {
+        return handle_agent_request(request, state, agent).await;
     }
 
     let mut state = state.lock().await;
@@ -562,6 +680,18 @@ async fn handle_request(
             state.delete_host(&host_id)?;
             Ok(serde_json::json!({"deleted": true}))
         }
+        Request::SetHostAgentTrust { host_id, trust } => {
+            state.set_host_agent_trust(&host_id, trust)?;
+            Ok(serde_json::json!({"updated": true, "trust": trust}))
+        }
+
+        Request::AgentExec { .. }
+        | Request::ListAgentApprovals
+        | Request::ApproveAgentAction { .. }
+        | Request::DenyAgentAction { .. }
+        | Request::ReadAgentAudit { .. } => {
+            unreachable!("Agent requests handled before state lock")
+        }
 
         // Sync
         Request::Sync => {
@@ -623,6 +753,151 @@ async fn handle_request(
     }
 }
 
+fn request_allowed_for_role(request: &Request, role: ClientRole) -> bool {
+    match role {
+        ClientRole::Owner => !matches!(request, Request::AgentExec { .. }),
+        ClientRole::Agent => matches!(
+            request,
+            Request::AgentExec { .. }
+                | Request::VaultStatus
+                | Request::ListHosts
+                | Request::Pty(PtyRequest::ListSessions)
+                | Request::Pty(PtyRequest::ReadScreen { .. })
+                | Request::Pty(PtyRequest::ReadScreenStyled { .. })
+                | Request::Pty(PtyRequest::SubscribeSession { .. })
+                | Request::Pty(PtyRequest::UnsubscribeSession { .. })
+        ),
+    }
+}
+
+async fn handle_agent_request(
+    request: Request,
+    state: &Arc<Mutex<DaemonState>>,
+    agent: &Arc<Mutex<AgentController>>,
+) -> Result<serde_json::Value> {
+    let now = chrono::Utc::now().timestamp();
+    match request {
+        Request::AgentExec {
+            session_id,
+            command,
+        } => {
+            if command.is_empty() || command.len() > 65_536 {
+                anyhow::bail!("Agent 命令必须为 1–65536 字节");
+            }
+            if command.contains(['\r', '\n', '\0']) {
+                anyhow::bail!("Agent exec 只接受一条不含换行或 NUL 的完整命令");
+            }
+
+            let target = agent.lock().await.target(&session_id).cloned();
+            let trust = match target {
+                Some(SessionTarget::Local) => vida_core::agent_policy::AgentTrust::Ask,
+                Some(SessionTarget::Host { host_id }) => {
+                    state.lock().await.host_agent_trust(&host_id)?
+                }
+                None => vida_core::agent_policy::AgentTrust::Ask,
+            };
+            let decision = agent
+                .lock()
+                .await
+                .evaluate(&session_id, &command, trust, now)?;
+            match decision {
+                CommandDecision::RejectUnknownSession => Ok(serde_json::json!({
+                    "status": "rejected",
+                    "reason": "unknown_session",
+                    "message": "该会话没有可信的主机映射。请在人类客户端重新打开会话后再试。"
+                })),
+                CommandDecision::RejectReadonly => Ok(serde_json::json!({
+                    "status": "rejected",
+                    "reason": "readonly",
+                    "message": "该主机的 Agent 权限为只读，命令未发送。"
+                })),
+                CommandDecision::NeedsApproval(item) => Ok(serde_json::json!({
+                    "status": "needs_approval",
+                    "approval_id": item.approval_id,
+                    "command": item.command,
+                    "reasons": item.reasons,
+                    "matched_rules": item.matched_rules,
+                    "expires_at": item.expires_at,
+                })),
+                CommandDecision::Allow { matches } => {
+                    // Persist the policy decision before sending bytes so an
+                    // audit-file failure can never produce an unaudited write.
+                    agent
+                        .lock()
+                        .await
+                        .record_allowed(&session_id, &command, &matches)?;
+                    let pty = state.lock().await.pty.clone();
+                    let send_result = pty
+                        .write()
+                        .map_err(|_| anyhow::anyhow!("PTY 锁异常"))
+                        .and_then(|pty| {
+                            let mut bytes = command.as_bytes().to_vec();
+                            bytes.push(b'\r');
+                            pty.session_input(&session_id, &bytes)
+                        });
+                    if let Err(error) = send_result {
+                        agent.lock().await.record_dispatch_failed(
+                            &session_id,
+                            &command,
+                            &matches,
+                            None,
+                            "terminal dispatch failed",
+                        )?;
+                        return Err(error);
+                    }
+                    Ok(serde_json::json!({
+                        "status": "sent",
+                        "matched_rules": matches,
+                    }))
+                }
+            }
+        }
+        Request::ListAgentApprovals => {
+            let pending = agent.lock().await.pending(now)?;
+            Ok(serde_json::to_value(pending)?)
+        }
+        Request::ApproveAgentAction { approval_id } => {
+            let item = agent.lock().await.take_for_approval(&approval_id, now)?;
+            // As above, approval must be durable before the command is sent.
+            agent.lock().await.record_approved(&item)?;
+            let pty = state.lock().await.pty.clone();
+            let send_result = pty
+                .write()
+                .map_err(|_| anyhow::anyhow!("PTY 锁异常"))
+                .and_then(|pty| {
+                    let mut bytes = item.command.as_bytes().to_vec();
+                    bytes.push(b'\r');
+                    pty.session_input(&item.session_id, &bytes)
+                });
+            if let Err(error) = send_result {
+                agent.lock().await.record_dispatch_failed(
+                    &item.session_id,
+                    &item.command,
+                    &[],
+                    Some(item.approval_id.clone()),
+                    "approved command dispatch failed",
+                )?;
+                agent.lock().await.resolve(&item.approval_id, "failed");
+                return Err(error);
+            }
+            agent.lock().await.resolve(&item.approval_id, "approved");
+            Ok(serde_json::json!({"status": "approved", "sent": true}))
+        }
+        Request::DenyAgentAction { approval_id } => {
+            agent.lock().await.deny(&approval_id, now)?;
+            Ok(serde_json::json!({"status": "denied", "sent": false}))
+        }
+        Request::ReadAgentAudit { limit, host_id } => {
+            let entries = agent
+                .lock()
+                .await
+                .read_audit(limit.min(1000), host_id.as_deref())?;
+            Ok(serde_json::to_value(entries)?)
+        }
+        _ => unreachable!("only Agent requests reach handle_agent_request"),
+    }
+}
+
 /// Keep the encrypted backup bytes in the response. The GUI owns destination
 /// selection and persists these bytes only after the user confirms a path.
 fn backup_response(data: Vec<u8>) -> serde_json::Value {
@@ -636,6 +911,7 @@ fn backup_response(data: Vec<u8>) -> serde_json::Value {
 async fn handle_pty_request(
     request: &PtyRequest,
     state: &Arc<Mutex<DaemonState>>,
+    agent: &Arc<Mutex<AgentController>>,
 ) -> Result<serde_json::Value> {
     // 短暂拿金库锁仅为了取出 pty 的 Arc 引用，随即释放；
     // 后续 PTY 操作只持有 pty 自己的 RwLock，不与金库锁争用。
@@ -643,8 +919,14 @@ async fn handle_pty_request(
 
     match request {
         PtyRequest::OpenLocalSession { cols, rows } => {
-            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            let session_id = pty.open_session(*cols, *rows)?;
+            let session_id = {
+                let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+                pty.open_session(*cols, *rows)?
+            };
+            agent
+                .lock()
+                .await
+                .register_session(&session_id, SessionTarget::Local)?;
             Ok(serde_json::json!({"session_id": session_id}))
         }
         PtyRequest::OpenSshSession {
@@ -676,9 +958,16 @@ async fn handle_pty_request(
                         .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
                 },
             };
-            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            let session_id =
-                pty.open_ssh_session(*cols, *rows, &host.host, &host.user, host.port, auth)?;
+            let session_id = {
+                let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+                pty.open_ssh_session(*cols, *rows, &host.host, &host.user, host.port, auth)?
+            };
+            agent.lock().await.register_session(
+                &session_id,
+                SessionTarget::Host {
+                    host_id: host_id.clone(),
+                },
+            )?;
             Ok(serde_json::json!({"session_id": session_id}))
         }
         PtyRequest::SessionInput { session_id, data } => {
@@ -706,13 +995,19 @@ async fn handle_pty_request(
             Ok(serde_json::json!({"ok": true, "display_offset": display_offset}))
         }
         PtyRequest::CloseSession { session_id } => {
-            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            pty.close_session(session_id)?;
+            {
+                let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+                pty.close_session(session_id)?;
+            }
+            agent.lock().await.remove_session(session_id)?;
             Ok(serde_json::json!({"ok": true}))
         }
         PtyRequest::ListSessions => {
-            let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            let sessions = pty.try_list_sessions()?;
+            let sessions = {
+                let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+                pty.try_list_sessions()?
+            };
+            let sessions = describe_sessions(sessions, state, agent).await;
             Ok(serde_json::to_value(sessions)?)
         }
         PtyRequest::ReadScreen { session_id } => {
@@ -730,6 +1025,106 @@ async fn handle_pty_request(
             anyhow::bail!("PTY 订阅请求未在上游处理（内部错误）")
         }
     }
+}
+
+async fn describe_sessions(
+    sessions: Vec<SessionInfo>,
+    state: &Arc<Mutex<DaemonState>>,
+    agent: &Arc<Mutex<AgentController>>,
+) -> Vec<ListedSession> {
+    let layout = vida_core::config::load_ui_state().terminal_layout;
+    let targets: std::collections::HashMap<_, _> = {
+        let agent = agent.lock().await;
+        sessions
+            .iter()
+            .filter_map(|session| {
+                agent
+                    .target(&session.session_id)
+                    .cloned()
+                    .map(|target| (session.session_id.clone(), target))
+            })
+            .collect()
+    };
+    let (host_names, local_title, local_numbered) = {
+        let state = state.lock().await;
+        let host_names = state
+            .list_hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|host| (host.id, host.name))
+            .collect::<std::collections::HashMap<_, _>>();
+        let local_title = state.i18n.tr("terminal_local_title").to_string();
+        let local_numbered = layout
+            .iter()
+            .map(|entry| {
+                (
+                    entry.session_id.clone(),
+                    state
+                        .i18n
+                        .trf("terminal_local_numbered", &[&entry.number.to_string()]),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        (host_names, local_title, local_numbered)
+    };
+
+    let mut described = sessions
+        .into_iter()
+        .map(|process| {
+            let layout_entry = layout
+                .iter()
+                .find(|entry| entry.session_id == process.session_id);
+            let target = targets.get(&process.session_id).cloned().or_else(|| {
+                layout_entry.map(|entry| {
+                    entry
+                        .host_id
+                        .clone()
+                        .map(|host_id| SessionTarget::Host { host_id })
+                        .unwrap_or(SessionTarget::Local)
+                })
+            });
+
+            match target {
+                Some(SessionTarget::Host { host_id }) => {
+                    let host_name = host_names.get(&host_id).cloned();
+                    ListedSession {
+                        title: host_name.clone().unwrap_or_else(|| host_id.clone()),
+                        target_kind: "ssh",
+                        host_id: Some(host_id),
+                        host_name,
+                        process,
+                    }
+                }
+                Some(SessionTarget::Local) => ListedSession {
+                    title: local_numbered
+                        .get(&process.session_id)
+                        .cloned()
+                        .unwrap_or_else(|| local_title.clone()),
+                    target_kind: "local",
+                    host_id: None,
+                    host_name: None,
+                    process,
+                },
+                None => ListedSession {
+                    title: process.session_id.clone(),
+                    target_kind: "unknown",
+                    host_id: None,
+                    host_name: None,
+                    process,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Match the GUI's persisted tab order; detached sessions not present in
+    // the layout remain visible after the known tabs.
+    described.sort_by_key(|session| {
+        layout
+            .iter()
+            .position(|entry| entry.session_id == session.process.session_id)
+            .unwrap_or(usize::MAX)
+    });
+    described
 }
 
 fn sync_status_string(result: &SyncResult) -> String {
@@ -803,12 +1198,25 @@ pub async fn start(state: Arc<Mutex<DaemonState>>) -> Result<SocketAddr> {
     std::fs::write(&port_file, addr.port().to_string())
         .with_context(|| format!("Failed to write daemon port to {}", port_file.display()))?;
 
+    let agent_dir = state
+        .lock()
+        .await
+        .vault_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let include_ui_state = vida_core::config::config_dir().is_ok_and(|dir| dir == agent_dir);
+    let agent = Arc::new(Mutex::new(AgentController::load_at(
+        &agent_dir,
+        include_ui_state,
+    )?));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     let state = Arc::clone(&state);
-                    tokio::spawn(handle_connection(stream, addr, state));
+                    let agent = Arc::clone(&agent);
+                    tokio::spawn(handle_connection(stream, addr, state, agent));
                 }
                 Err(e) => {
                     error!("Accept error: {}", e);

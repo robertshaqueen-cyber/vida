@@ -121,6 +121,45 @@ pub fn accent_badge(_: &Theme) -> container::Style {
     }
 }
 
+pub fn warning_badge(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(WARNING.scale_alpha(0.12))),
+        text_color: Some(WARNING),
+        border: Border {
+            color: WARNING.scale_alpha(0.35),
+            width: 1.0,
+            radius: RADIUS_MD.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn code_surface(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_INPUT)),
+        text_color: Some(TEXT_PRIMARY),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn notice(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(ACCENT_MUTED.scale_alpha(0.35))),
+        text_color: Some(TEXT_SECONDARY),
+        border: Border {
+            color: ACCENT_MUTED,
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 pub fn error_notice(_: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(DANGER.scale_alpha(0.10))),

@@ -1069,3 +1069,53 @@ socket 位于权限 0700 的配置目录中且自身设为 0600。控制协议�
 宿主与 daemon 分属不同 session/process group，因此 daemon 收到 Ctrl-C 或崩溃不会波及
 shell。宿主发现原父 daemon 已退出、没有控制连接且没有会话时才自行结束并移除 socket；
 新 daemon 接管的长控制连接会阻止仍在使用的空宿主竞态退出。
+
+### M5a 统一客户端与只读边界
+
+GUI、CLI 与 MCP 都是 daemon 的客户端，不允许各自复制 token/端口发现、WebSocket 认证和
+请求关联。M5 将 GUI 已验证的实现下沉到 `vida-client`；GUI 继续复用同一推送注册表，CLI
+与后续 MCP 则复用其请求响应路径。这样 token 轮换或协议错误修复只存在一个实现点。
+
+正式命令行使用独立可执行文件名 `vidactl`；`vida` 继续代表原生 GUI，`vida-mcp` 保留给
+MCP stdio 入口。开发期 `vida-term-test` 仍是底层终端协议探针，不作为产品 CLI 发布。
+
+`vidactl` 的人类可读状态、标签和本地错误跟随 GUI 保存在设备配置中的语言选择；选择
+`system` 时两者使用同一套系统语言检测。脚本接口不参与本地化：`--json` 的字段名、
+envelope、枚举值和退出码保持固定，`session screen` 返回的远端终端文本也保持原样。
+
+第一个检查点只提供状态、主机摘要、会话清单和当前屏幕读取。即使 daemon 已经存在
+`SessionInput`，也不直接把它包装成产品命令：在策略、审批和审计落地前暴露写入会形成绕过
+安全模型的永久接口。后续 `keys_send/exec` 与 MCP 工具必须共同经过同一策略入口。
+
+### M5b Agent 身份与统一命令门
+
+Agent 不复用所有者 `daemon.token`，而使用派生并以 0600 保存的 `agent.token`。daemon 在
+认证后绑定连接角色：Agent 可读状态、主机摘要、会话和屏幕，但不能调用 `SessionInput`、
+`PasteSession`、凭据显示、金库写入或审批接口。CLI 的 `session exec` 与后续 MCP `exec`
+必须使用 Agent 身份；审批、审计和信任级别修改只能使用所有者身份。
+
+Agent 写入的原子单位是一条不含 CR/LF/NUL 的完整命令，不是按键流。daemon 依据 session
+建立时保存的真实 host id 查询 v7 金库中的信任级别：`readonly` 拒绝所有 Agent 命令，
+`ask` 只对内置危险规则要求 120 秒审批，`trusted` 直接允许；本地会话固定 `ask`。未知
+session 映射一律拒绝。v6→v7 迁移把全部现有主机设为 `ask`，绝不静默授权 trusted。
+
+危险规则只能防常见误操作，不能成为 shell 隔离边界。因此审批响应展示原命令和命中原因，
+并明确 `trusted` 的风险。完整命令只在待审批内存中存在；持久 JSONL 审计使用字节长度和
+SHA-256 指纹关联事件，避免任何未识别的口令或私钥内容落盘。策略允许/所有者批准的审计先于
+PTY 写入持久化，审计写失败时命令不得发送。
+
+### M5c GUI 实时审批与人工接管
+
+审批不是 GUI 轮询产生的本地推测。daemon 在创建、批准、拒绝、过期或会话关闭时通过
+owner-only WebSocket 旁路事件广播状态；`vida-client` 在认证成功时预先建立全局事件接收器，
+避免 iced 订阅尚未构造时丢失首条通知。GUI 重连后还会主动调用 `ListAgentApprovals` 补偿断线
+窗口，因此实时事件与完整列表共同构成恢复路径。
+
+审批面板展示完整命令、真实 session/host、内置规则的本地化说明和 daemon 到期时间。多条命令
+按创建时间排队，用户可以关闭面板稍后处理，顶栏数量仍然可见；批准仅对当前 approval id
+生效，不把主机永久改为 trusted。完整命令只存在于 daemon/客户端的待审批内存和临时 UI，
+持久审计仍只保存长度与 SHA-256。
+
+主机的 readonly/ask/trusted 在现有编辑页使用共享 `picker` 样式配置，且明确说明只影响 Agent
+协议。人的 `SessionInput`、IME 与 `PasteSession` 不进入这个策略层。GUI 保存主机资料后通过
+owner-only `SetHostAgentTrust` 更新权限；Agent 身份既不能修改权限，也不能批准自己的命令。

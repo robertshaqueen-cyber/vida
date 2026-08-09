@@ -231,6 +231,7 @@ mod tests {
                 password: SecureString::new("deploy-pass".to_owned()),
             },
             notes: Some("Production web server".to_owned()),
+            agent_trust: crate::agent_policy::AgentTrust::Ask,
         });
         vault.hosts.push(HostEntry {
             id: uuid::Uuid::new_v4().to_string(),
@@ -245,6 +246,7 @@ mod tests {
                 password: SecureString::new("admin-pass".to_owned()),
             },
             notes: Some("Staging database".to_owned()),
+            agent_trust: crate::agent_policy::AgentTrust::Ask,
         });
 
         // 2. 加密 (log_n=10 for fast test)

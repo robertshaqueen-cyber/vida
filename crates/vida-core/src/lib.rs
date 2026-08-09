@@ -1,3 +1,4 @@
+pub mod agent_policy;
 pub mod config;
 pub mod host;
 pub mod i18n;

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/vida-core",
+    "crates/vida-client",
     "crates/vida-daemon",
     "crates/vida-gui",
     "crates/vida-mcp-cli",

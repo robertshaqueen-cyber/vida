@@ -17,7 +17,9 @@ vida 解决两个问题：
 二进制增量推送、GPU 渲染、键盘/IME/安全粘贴、窗口 resize 和断线重连；
 **SSH 终端（M3）**已接入系统 OpenSSH，支持金库口令、私钥文件和导入私钥。
 **会话恢复（M4）**使用独立会话宿主持有 PTY/SSH，daemon 崩溃或重启不再结束 shell。
-规划中：MCP 服务端（M5）。
+**Agent 控制层（M5，进行中）**已提供共享 daemon 客户端、`vidactl`、daemon 侧主机信任
+策略、危险命令审批、不含命令明文的审计，以及 GUI 实时审批与人工接管；MCP Server
+仍在后续检查点中。
 
 ## 截图
 
@@ -44,6 +46,11 @@ vida 解决两个问题：
   系统 `ssh`；支持口令、私钥文件和导入私钥，凭据不进入 argv、环境变量或日志
 - ♻️ **持久会话（M4）**：本机独立会话宿主持有 PTY、SSH、回滚历史和 askpass；
   daemon 重启后复用同一个 session id、shell 进程、工作目录与运行中命令
+- 🧭 **Agent 命令行（M5a/M5b）**：`vidactl` 可诊断 daemon、读取金库状态、主机摘要、
+  活动会话和终端屏幕；Agent 写命令经独立角色进入 daemon 的 readonly/ask/trusted
+  策略、120 秒审批与审计，不能调用人的原始输入接口
+- 🛡️ **Agent 人工接管（M5c）**：危险命令由 daemon 实时推送到 GUI，显示目标、完整命令、
+  命中规则和倒计时；支持多条排队、稍后处理、单次批准与拒绝，主机编辑页可配置权限
 
 规划中：
 
@@ -81,18 +88,19 @@ vida 解决两个问题：
 ## 架构
 
 ```
-vida (GUI)  ──WebSocket──▶  vida-daemon (金库/同步/协议)
-                              ├── 金库 (vault.age, age 加密)
-                              └── 本机 0600 IPC ──▶ vida session host (PTY/SSH)
+vida (GUI) ──────┐
+vidactl ─────────┼── vida-client ──WebSocket──▶ vida-daemon (金库/同步/协议)
+vida-mcp (M5) ───┘                                ├── 金库 (vault.age, age 加密)
+                                                 └── 本机 0600 IPC ──▶ vida session host (PTY/SSH)
 
-AI Agent ──MCP stdio(规划 M5)──▶ vida-mcp-cli ──WebSocket──▶ vida-daemon
-SSH/PTY 终端（M2-M4）
+AI Agent ──MCP stdio(规划 M5 后续检查点)──▶ vida-mcp
 ```
 
 - **vida-core** — 金库、加密、同步、多语言（纯逻辑库）
+- **vida-client** — GUI、CLI、MCP 共用的 daemon 发现、认证、请求关联和推送客户端
 - **vida-daemon** — 守护进程：WebSocket 服务端、协议路由、状态管理
 - **vida-gui** — iced + wgpu 原生界面
-- **vida-mcp-cli** — stdio→WebSocket 桥接（给只支持 stdio 的 MCP 客户端）
+- **vida-mcp-cli** — 产出 `vidactl`；后续也产出 MCP stdio 入口 `vida-mcp`
 
 ## 构建与运行
 
@@ -112,6 +120,22 @@ cargo build --release
 
 # 启动 daemon（第一个终端）
 cargo run --bin vida-daemon
+
+# CLI（另一个终端）
+cargo run -p vida-mcp-cli --bin vidactl -- doctor
+cargo run -p vida-mcp-cli --bin vidactl -- host list
+cargo run -p vida-mcp-cli --bin vidactl -- session list
+cargo run -p vida-mcp-cli --bin vidactl -- session screen <session-id>
+
+# Agent 安全写入：普通命令直接发送，危险命令返回待审批 ID
+cargo run -p vida-mcp-cli --bin vidactl -- session exec <session-id> -- df -h
+cargo run -p vida-mcp-cli --bin vidactl -- session exec <session-id> -- rm -rf /tmp/example
+cargo run -p vida-mcp-cli --bin vidactl -- approval list
+cargo run -p vida-mcp-cli --bin vidactl -- approval deny <approval-id>
+cargo run -p vida-mcp-cli --bin vidactl -- audit --limit 20
+
+# 脚本使用稳定 JSON envelope
+cargo run -p vida-mcp-cli --bin vidactl -- --json status
 
 # 启动 GUI（第二个终端）
 cargo run --bin vida
@@ -222,6 +246,73 @@ cargo test --workspace
    主动点击锁定后必须立即撤销该缓存，下次仍要求口令。点击“记住口令”下拉框 →
    预期控件本体及展开菜单与设置页下拉框使用相同的高度、边框、圆角、背景和选中态，
    不出现 iced 默认样式。
+
+## M5a 共享客户端与只读 CLI 手动验收
+
+1. daemon 运行时执行 `vidactl doctor` → 预期显示“可连接、认证成功”、实际配置目录和
+   金库状态；不会要求或显示金库口令。
+2. 在设置中将界面语言切换为 English，再执行 `vidactl status` → 预期人类可读输出为英文；
+   切回中文后预期输出为中文。执行 `vidactl --json status` → 两种语言下都必须保持
+   `{"ok":true,"data":...}` 的相同字段结构，且进程退出码为 0。
+3. 金库已解锁时执行 `vidactl host list` → 预期只显示主机摘要，不出现保存的密码、
+   私钥内容或私钥口令；`vidactl host show <完整 ID 或唯一名称>` 返回对应主机。
+4. 同时打开本地和 SSH 终端后执行 `vidactl session list` → 预期列出与 GUI 相同的
+   session id、可读标签标题、目标类型（`local`/`ssh`）、SSH 主机 ID、尺寸和进程；Agent
+   可据此明确选择目标会话。执行 `vidactl session screen <session-id>` 显示当前屏幕，
+   但不会发送按键或改变终端状态，远端输出不会因 Vida 的界面语言而被翻译。
+5. 停止 daemon 后执行 `vidactl doctor` → 预期显示“daemon 可能尚未启动或正在重启”的
+   人话提示并以退出码 10 结束；加 `--json` 时仍输出合法错误 envelope。
+6. 保持 GUI 打开并重复上述只读命令 → 预期 GUI 的连接、标签、终端内容和输入均不受影响。
+
+## M5b Agent 写入策略、审批与审计手动验收
+
+下面的 `<session-id>` 可由 `vidactl session list` 取得。请先使用临时本地终端或测试主机，
+不要拿生产主机试危险命令。
+
+1. 执行 `vidactl session exec <session-id> -- echo vida-agent-ok` → 预期退出码为 0，终端
+   出现 `vida-agent-ok`；人的键盘、IME、粘贴路径仍照常工作。
+2. 执行 `vidactl session exec <session-id> -- rm -rf /tmp/vida-never-create` → 预期命令不进入
+   终端，显示待审批 ID，并以退出码 20 结束。执行 `vidactl approval list` → 预期能看到
+   完整待审批命令和 120 秒到期时间。
+3. 对该 ID 执行 `vidactl approval deny <approval-id>` → 预期显示已拒绝，终端中没有该命令。
+   再创建一条待审批命令并执行 `approval approve` → 预期只有批准后才发送。
+4. 等待一条待审批命令超过 120 秒后再批准 → 预期返回“找不到或已过期”，命令不发送。
+5. 执行 `vidactl host trust <主机 ID 或唯一名称> readonly`，打开该 SSH 会话后执行安全的
+   Agent 命令 → 预期也被拒绝且退出码为 21；改回 `ask` 后安全命令直接发送、危险命令审批。
+   `trusted` 会跳过内置危险规则，只应用在明确可完全托管的测试主机。
+6. 执行 `vidactl audit --limit 20` → 预期看到时间、session、结果、规则与命令指纹；打开
+   Vida 配置目录中的 `audit.jsonl`，确认不含刚才命令的明文、口令或私钥内容。
+7. 尝试用 Agent 身份直接调用原始 `SessionInput`（自动集成测试已覆盖）→ 预期 daemon 返回
+   `forbidden`；持有 Agent token 也不能修改金库、显示凭据或批准自己的命令。
+8. 将现有 v6 金库交给新 daemon 解锁 → 预期自动迁移为 v7，所有主机默认 `ask`，不会因
+   升级获得 `trusted`；原主机凭据、备注和连接方式保持不变。
+
+## M5c GUI 实时审批与主机权限手动验收
+
+请保持 GUI 和 daemon 打开，并使用临时本地终端或测试主机。下面的危险命令只用于触发策略，
+在批准前不会进入终端。
+
+1. 执行 `vidactl session exec <session-id> -- rm -rf /tmp/vida-gui-approval-test` → 预期 GUI
+   立即弹出统一样式的审批面板，显示目标主机/本地终端、session id、完整命令、中文危险原因
+   和 120 秒倒计时；终端中没有这条命令。
+2. 点击“稍后处理” → 预期面板关闭，顶栏出现带数量的黄色审批入口；点击该入口可重新打开，
+   命令和剩余时间保持正确。
+3. 同时创建两条待审批命令 → 预期顶栏数量为 2，面板左侧可切换两条命令，选中项和详情一致，
+   不会用后一条覆盖前一条。
+4. 选择一条点击“拒绝” → 预期该命令从队列消失、显示拒绝结果，终端没有执行；另一条仍在。
+   对另一条点击“仅批准本次” → 预期只发送这一条，终端出现对应命令结果。
+5. 创建一条待审批命令并等待超过 120 秒 → 预期倒计时变为已过期，daemon 刷新后移除该项，
+   命令始终不执行。若审批期间关闭对应终端，预期显示会话结束/命令取消。
+6. 在 daemon 停止期间创建不了新审批；重启并恢复 GUI 连接后，若 daemon 内仍有待审批项，
+   预期通过列表补偿重新显示，不依赖某一条实时事件恰好到达。
+7. 编辑 SSH 主机 → 预期“Agent 命令权限”下拉框与现有输入框样式一致，默认是“危险命令需要
+   确认”；保存后重新进入编辑页仍保持。主机详情页也显示当前权限。
+8. 把测试主机设为“只读”后执行安全 Agent 命令 → 预期拒绝且 GUI 不出现审批；设为“无需确认”
+   后危险命令会直接发送，因此只应在明确可完全托管的测试主机上选择这一项。人的键盘、IME、
+   鼠标选择和粘贴在三种设置下都不受影响。
+9. 同时打开两个本地终端和一个 SSH 终端，执行 `vidactl session list` → 预期每行显示与 GUI
+   一致的标签标题，并明确标记 `local` 或 `ssh`；SSH 行还显示对应主机 ID。触发审批后，审批
+   面板显示对应标签的完整标题（如“本地终端 1”），不会只显示笼统的“本地终端”。
 
 ## UI 基础框架手动验收
 

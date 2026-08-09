@@ -107,8 +107,17 @@ async fn send_recv(
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .unwrap();
-    // 跳过二进制推送帧，返回第一个文本响应。
-    // 订阅后二进制帧可能与文本响应交织到达。
+    recv_text(reader).await
+}
+
+async fn recv_text(
+    reader: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) -> serde_json::Value {
+    // 跳过二进制推送帧，返回第一个文本响应或事件。
     loop {
         match reader.next().await {
             Some(Ok(Message::Text(text))) => {
@@ -339,6 +348,7 @@ fn remote_missing_after_delete() {
                 password: vida_core::vault::SecureString::new("pass".to_string()),
             },
             notes: None,
+            agent_trust: vida_core::agent_policy::AgentTrust::Ask,
         });
         v.revision += 1;
     }
@@ -836,6 +846,7 @@ fn adopt_conflict_file_replaces_vault() {
             password: vida_core::vault::SecureString::new("conflict-pass".to_string()),
         },
         notes: None,
+        agent_trust: vida_core::agent_policy::AgentTrust::Ask,
     });
     let ct = vida_core::vault::encrypt(&conflict_vault, "pass").unwrap();
     let conflict_path = dir.path().join("vault (conflicted copy).age");
@@ -1399,6 +1410,116 @@ fn sync_end_to_end_config_to_upload() {
 // PTY session tests (M2a-2)
 // -----------------------------------------------------------------------
 
+/// Agent token cannot bypass the daemon gate through human SessionInput.
+/// Safe commands execute; dangerous commands remain unsent until owner action.
+#[tokio::test]
+async fn agent_role_is_policy_gated_and_owner_can_deny() {
+    use sha2::{Digest, Sha256};
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut owner, mut owner_reader) = connect(addr).await;
+    let owner_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"owner"}},"id":1}}"#,
+        token
+    );
+    assert_eq!(
+        send_recv(&mut owner, &mut owner_reader, &owner_auth).await["type"],
+        "Ok"
+    );
+    let opened = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"OpenLocalSession","params":{"cols":80,"rows":24},"id":2}"#,
+    )
+    .await;
+    let session_id = opened["result"]["session_id"].as_str().unwrap();
+
+    let agent_token = hex::encode(Sha256::digest(format!("vida-agent:{token}").as_bytes()));
+    let (mut agent, mut agent_reader) = connect(addr).await;
+    let agent_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"agent"}},"id":1}}"#,
+        agent_token
+    );
+    let response = send_recv(&mut agent, &mut agent_reader, &agent_auth).await;
+    assert_eq!(response["result"]["role"], "agent");
+
+    let raw_input = format!(
+        r#"{{"method":"SessionInput","params":{{"session_id":"{}","data":[101,99,104,111,13]}},"id":2}}"#,
+        session_id
+    );
+    let response = send_recv(&mut agent, &mut agent_reader, &raw_input).await;
+    assert_eq!(response["type"], "Error");
+    assert_eq!(response["category"], "forbidden");
+
+    let safe = format!(
+        r#"{{"method":"AgentExec","params":{{"session_id":"{}","command":"echo VIDA_AGENT_SAFE"}},"id":3}}"#,
+        session_id
+    );
+    let response = send_recv(&mut agent, &mut agent_reader, &safe).await;
+    assert_eq!(response["result"]["status"], "sent");
+
+    let dangerous = format!(
+        r#"{{"method":"AgentExec","params":{{"session_id":"{}","command":"rm -rf /tmp/vida-never-approved"}},"id":4}}"#,
+        session_id
+    );
+    let response = send_recv(&mut agent, &mut agent_reader, &dangerous).await;
+    assert_eq!(response["result"]["status"], "needs_approval");
+    let approval_id = response["result"]["approval_id"].as_str().unwrap();
+
+    let requested = recv_text(&mut owner_reader).await;
+    assert_eq!(requested["type"], "Event");
+    assert_eq!(requested["event"], "agent_approval");
+    assert_eq!(requested["data"]["kind"], "approval_requested");
+    assert_eq!(requested["data"]["approval"]["approval_id"], approval_id);
+    assert_eq!(
+        requested["data"]["approval"]["command"],
+        "rm -rf /tmp/vida-never-approved"
+    );
+
+    let deny = format!(
+        r#"{{"method":"DenyAgentAction","params":{{"approval_id":"{}"}},"id":3}}"#,
+        approval_id
+    );
+    let response = send_recv(&mut owner, &mut owner_reader, &deny).await;
+    assert_eq!(response["result"]["status"], "denied");
+    let resolved = recv_text(&mut owner_reader).await;
+    assert_eq!(resolved["data"]["kind"], "approval_resolved");
+    assert_eq!(resolved["data"]["approval_id"], approval_id);
+    assert_eq!(resolved["data"]["status"], "denied");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let screen = format!(
+        r#"{{"method":"ReadScreen","params":{{"session_id":"{}"}},"id":4}}"#,
+        session_id
+    );
+    let response = send_recv(&mut owner, &mut owner_reader, &screen).await;
+    let text = response["result"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("VIDA_AGENT_SAFE"));
+    assert!(!text.contains("vida-never-approved"));
+
+    let audit = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"ReadAgentAudit","params":{"limit":10},"id":5}"#,
+    )
+    .await;
+    let outcomes: Vec<_> = audit["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["outcome"].as_str())
+        .collect();
+    assert!(outcomes.contains(&"allowed"));
+    assert!(outcomes.contains(&"needs_approval"));
+    assert!(outcomes.contains(&"denied"));
+}
+
 /// 打开会话 → 输入 → 读屏幕 → resize → 列出 → 关闭。
 /// 覆盖规格 5.2 全部 6 个 IPC 方法。
 #[tokio::test]
@@ -1478,6 +1599,15 @@ async fn pty_session_full_cycle() {
     assert_eq!(sessions[0]["cols"], 40, "cols should be resized");
     assert_eq!(sessions[0]["rows"], 12, "rows should be resized");
     assert_eq!(sessions[0]["alive"], true);
+    assert_eq!(sessions[0]["target_kind"], "local");
+    assert!(
+        sessions[0]["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty()),
+        "session title should identify the target: {resp}"
+    );
+    assert!(sessions[0]["host_id"].is_null());
+    assert!(sessions[0]["host_name"].is_null());
 
     // 6. CloseSession
     let close = format!(

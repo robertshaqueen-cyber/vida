@@ -115,6 +115,15 @@ else:
 | `SubscribeSession { session_id }` | 订阅推送：立即回全量，此后增量 |
 | `UnsubscribeSession { session_id }` | 取消订阅 |
 
+`SessionInput` 与 `PasteSession` 只属于人的输入路径，Agent 身份调用会被 daemon 拒绝。
+Agent 使用顶层 `AgentExec { session_id, command }` 发送一条完整命令；daemon 根据会话到
+host id 的持久映射执行 readonly/ask/trusted 策略。`ask` 命中危险规则时返回
+`needs_approval` 和 120 秒有效的 approval id，所有者再通过 `ApproveAgentAction` 或
+`DenyAgentAction` 决定是否写入 PTY。`ReadAgentAudit` 返回的 `input` 是命令长度与 SHA-256
+指纹。daemon 还会只向 owner 角色广播 `agent_approval` Event：`approval_requested` 携带
+待审批详情，`approval_resolved` 携带 id 和最终状态；客户端重连后必须再读完整审批列表，
+不能把实时事件当作唯一事实来源。
+
 终端二进制帧同时携带 `viewport_start`：当前可见第 0 行在 daemon 回滚历史中的稳定行号。
 GUI 用它维护跨屏选择；只保存屏幕相对行号会在滚动后复制错误内容。
 

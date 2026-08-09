@@ -1,3 +1,4 @@
+pub mod agent_approval;
 pub mod s0_connection;
 pub mod s1_setup;
 pub mod s2_unlock;
