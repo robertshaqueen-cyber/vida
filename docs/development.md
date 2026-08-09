@@ -209,6 +209,31 @@ daemon。审批面板本身按需构造，不创建后台轮询线程；有待�
 230.8M 来自既有 wgpu/IOSurface 初始化回收前分配，不作为稳定占用；daemon 峰值包含既有
 scrypt 解锁过程，同样不作为稳定占用。
 
+### M6 标准 MCP 服务端
+
+- `vida-mcp` 使用官方 Rust MCP SDK 提供标准 stdio 生命周期、并发 JSON-RPC、工具发现以及
+  输入/输出 JSON Schema；stdout 只输出 MCP 帧。
+- 工具面固定为状态、主机摘要、活动会话、当前屏幕和安全命令执行。连接使用 `vida-client`
+  的 Agent token，不存在凭据读取、原始 `SessionInput`、金库写入或审批工具。
+- 只读请求在 daemon 重启后安全重连一次；`exec` 不自动重试不确定结果。危险命令仍由 daemon
+  创建审批并实时显示在 GUI，MCP 只能返回 `needs_approval`。
+- 自动测试真实启动 stdio 子进程，完成 initialize、initialized、tools/list 和 tools/call；
+  验证 daemon 不在线是工具级错误而不是 MCP 断线，并锁定五个工具及全部结构化 Schema。
+- 所有者手动验收见 README「M6 MCP 服务端手动验收」。
+
+#### M6 release 内存实测（2026-08-10）
+
+macOS、同机显示器 scale factor=1（`vida-mcp` 是无窗口 stdio 进程，scale factor 不参与其
+内存分配）。使用最终 release 构建完成 MCP initialize，并调用 `vida_status` 建立 Agent
+WebSocket 连接后保持 stdin 打开，按规范测量稳定进程：
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| `vida-mcp`，MCP 已初始化、Agent 连接已建立 | **2640K** |
+
+该数字来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次测得 peak 也是
+2640K。测量过程未修改金库或终端，仅调用状态读取。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |

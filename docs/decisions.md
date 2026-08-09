@@ -1119,3 +1119,19 @@ owner-only WebSocket 旁路事件广播状态；`vida-client` 在认证成功时
 主机的 readonly/ask/trusted 在现有编辑页使用共享 `picker` 样式配置，且明确说明只影响 Agent
 协议。人的 `SessionInput`、IME 与 `PasteSession` 不进入这个策略层。GUI 保存主机资料后通过
 owner-only `SetHostAgentTrust` 更新权限；Agent 身份既不能修改权限，也不能批准自己的命令。
+
+### M6 标准 MCP 服务端与最小工具面
+
+`vida-mcp` 使用官方 Rust MCP SDK 实现 stdio 生命周期、JSON-RPC 并发、工具发现和结构化
+输入/输出 Schema，不再把客户端 JSON 原样转发给 daemon。MCP 进程通过 `vida-client` 的
+Agent 身份连接 daemon，只开放 `vida_status`、`host_list`、`session_list`、`screen_read` 和
+`exec`。凭据、原始按键、金库写入、主机连接和审批接口不属于 MCP 工具面。
+
+工具说明同时写清适用和禁用场景，并在 server instructions 中要求先列会话、再读屏幕、最后
+执行。`exec` 的 `needs_approval` 是稳定的结构化结果：Agent 必须等待人类在 GUI 决定，不能
+重复提交或调用审批。读取请求在连接失效后允许自动重连重试一次；写入响应一旦不确定就不
+自动重试，防止 daemon 已发送命令但 MCP 丢失响应时造成双重执行。
+
+`screen_read` 保留干净文本、宽字符列与光标坐标，但在 MCP 边界去掉每行用于 GPU 网格的尾部
+填充空格，降低 Agent 上下文消耗。MCP stdout 完全归协议使用，未来诊断只能写 stderr，且
+不得含命令或任何凭据材料。

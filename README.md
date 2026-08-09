@@ -6,9 +6,9 @@ vida 解决两个问题：
 
 1. **主机凭据安全**：所有 SSH 主机、口令、私钥存进一个 age 加密的金库（`vault.age`），
    标准 `age` CLI 即可解密，支持本地文件夹同步（Dropbox/Syncthing 友好）。
-2. **让 AI Agent 直接操作你的主机（规划中，M5）**：将内置 MCP 服务端，
-   让 AI 编码助手（Claude Code、Cursor 等）可以通过 MCP 协议读写金库、连接主机，
-   无需把凭据喂给任何第三方。
+2. **让 AI Agent 操作你正在看的终端**：内置 MCP 服务端让 Codex、Claude Code 等
+   AI 编码助手识别活动的本地/SSH 会话、读取当前屏幕，并通过统一策略执行命令；
+   Agent 永远拿不到保存的口令或私钥，也不能批准自己的危险命令。
 
 ## 当前状态
 
@@ -17,9 +17,10 @@ vida 解决两个问题：
 二进制增量推送、GPU 渲染、键盘/IME/安全粘贴、窗口 resize 和断线重连；
 **SSH 终端（M3）**已接入系统 OpenSSH，支持金库口令、私钥文件和导入私钥。
 **会话恢复（M4）**使用独立会话宿主持有 PTY/SSH，daemon 崩溃或重启不再结束 shell。
-**Agent 控制层（M5，进行中）**已提供共享 daemon 客户端、`vidactl`、daemon 侧主机信任
-策略、危险命令审批、不含命令明文的审计，以及 GUI 实时审批与人工接管；MCP Server
-仍在后续检查点中。
+**Agent 控制层（M5）**已提供共享 daemon 客户端、`vidactl`、daemon 侧主机信任策略、
+危险命令审批、不含命令明文的审计，以及 GUI 实时审批与人工接管。
+**MCP 服务端（M6）**已提供标准 stdio 生命周期、结构化工具 Schema 和受限 Agent 身份，
+可把同一套能力安全接入支持 MCP 的 AI 客户端。
 
 ## 截图
 
@@ -51,10 +52,13 @@ vida 解决两个问题：
   策略、120 秒审批与审计，不能调用人的原始输入接口
 - 🛡️ **Agent 人工接管（M5c）**：危险命令由 daemon 实时推送到 GUI，显示目标、完整命令、
   命中规则和倒计时；支持多条排队、稍后处理、单次批准与拒绝，主机编辑页可配置权限
+- 🤖 **MCP 服务端（M6）**：`vida-mcp` 通过标准 stdio MCP 暴露状态、主机摘要、活动会话、
+  当前屏幕和安全命令执行；工具带输入/输出 Schema，重用 `vida-client` 与 daemon 的 Agent
+  身份，不暴露凭据、原始按键、金库写入或审批能力
 
 规划中：
 
-- 🤖 **MCP 服务端**（M5）：AI Agent 通过 stdio↔WebSocket 桥接访问金库与主机
+- 🧰 **Agent 工作流增强**：更高层的任务编排、文件传输和可审计自动化
 
 ## 安全说明（重要）
 
@@ -90,17 +94,17 @@ vida 解决两个问题：
 ```
 vida (GUI) ──────┐
 vidactl ─────────┼── vida-client ──WebSocket──▶ vida-daemon (金库/同步/协议)
-vida-mcp (M5) ───┘                                ├── 金库 (vault.age, age 加密)
+vida-mcp (M6) ───┘                                ├── 金库 (vault.age, age 加密)
                                                  └── 本机 0600 IPC ──▶ vida session host (PTY/SSH)
 
-AI Agent ──MCP stdio(规划 M5 后续检查点)──▶ vida-mcp
+AI Agent ──MCP stdio──▶ vida-mcp ──Agent 身份──▶ vida-daemon ──▶ 人可见的终端
 ```
 
 - **vida-core** — 金库、加密、同步、多语言（纯逻辑库）
 - **vida-client** — GUI、CLI、MCP 共用的 daemon 发现、认证、请求关联和推送客户端
 - **vida-daemon** — 守护进程：WebSocket 服务端、协议路由、状态管理
 - **vida-gui** — iced + wgpu 原生界面
-- **vida-mcp-cli** — 产出 `vidactl`；后续也产出 MCP stdio 入口 `vida-mcp`
+- **vida-mcp-cli** — 产出正式 CLI `vidactl` 与 MCP stdio 服务端 `vida-mcp`
 
 ## 构建与运行
 
@@ -137,12 +141,23 @@ cargo run -p vida-mcp-cli --bin vidactl -- audit --limit 20
 # 脚本使用稳定 JSON envelope
 cargo run -p vida-mcp-cli --bin vidactl -- --json status
 
+# MCP stdio 服务端（由 MCP 客户端启动，不要在普通交互终端里直接使用）
+cargo build --release -p vida-mcp-cli --bin vida-mcp
+
+# Codex：把绝对路径替换为本机实际仓库路径
+codex mcp add vida -- /absolute/path/to/vida/target/release/vida-mcp
+
 # 启动 GUI（第二个终端）
 cargo run --bin vida
 
 # 运行测试（需要 age + expect）
 cargo test --workspace
 ```
+
+其他支持本地 stdio MCP 的客户端使用同一个配置语义：服务名为 `vida`，`command` 指向
+`target/release/vida-mcp` 的绝对路径，不需要参数。`vida-daemon` 与 GUI 仍按平常方式运行；
+MCP 服务端本身不会读取口令或私钥。当前工具固定为 `vida_status`、`host_list`、
+`session_list`、`screen_read`、`exec`。
 
 > 没有安装 age/expect 时，`age_cli_interop` 测试会**失败**（而不是跳过）——
 > 这是有意为之：该测试是设计铁律「金库必须可用标准 age CLI 解密」的唯一验证。
@@ -313,6 +328,28 @@ cargo test --workspace
 9. 同时打开两个本地终端和一个 SSH 终端，执行 `vidactl session list` → 预期每行显示与 GUI
    一致的标签标题，并明确标记 `local` 或 `ssh`；SSH 行还显示对应主机 ID。触发审批后，审批
    面板显示对应标签的完整标题（如“本地终端 1”），不会只显示笼统的“本地终端”。
+
+## M6 MCP 服务端手动验收
+
+请先构建 release 版本并保持 daemon、GUI 和一个临时本地终端运行。将 MCP 客户端配置为启动
+`target/release/vida-mcp`，重启或刷新该客户端的 MCP 连接。
+
+1. 在 MCP 客户端查看 Vida 工具 → 预期只出现 `vida_status`、`host_list`、`session_list`、
+   `screen_read`、`exec` 五个工具，每个都有输入/输出 Schema；不存在凭据显示、原始按键、
+   金库修改或审批工具。
+2. 让 Agent“列出 Vida 当前会话，但不要执行命令” → 预期返回与 GUI 标签一致的标题、
+   `local`/`ssh` 类型、session id；不会显示口令、私钥内容或私钥口令。
+3. 让 Agent 读取刚才的临时本地终端 → 预期返回当前可见屏幕和光标坐标；终端没有收到输入，
+   人仍能正常键入，输出行尾不会出现整屏宽度的无意义空格。
+4. 让 Agent 在该临时终端执行 `echo vida-mcp-owner-ok` → 预期工具返回 `sent`，GUI 终端出现
+   命令与 `vida-mcp-owner-ok`；Agent 随后调用 `screen_read` 能观察到结果。
+5. 让 Agent 请求 `rm -rf /tmp/vida-mcp-never-create` → 预期工具返回 `needs_approval` 和审批 ID，
+   GUI 出现审批面板，终端尚未执行；Agent 不应重复提交。点击“拒绝”后命令始终不进入终端。
+6. 将测试 SSH 主机权限改为“只读”，让 Agent 对它执行安全命令 → 预期返回 `rejected`，GUI
+   不出现审批。改回“危险命令需要确认”后恢复正常策略。
+7. 停止 daemon 后让 Agent 查询状态 → 预期得到“启动 vida-daemon 后重试”的工具级错误，
+   MCP 连接本身仍在；重新启动 daemon 后再次查询可自动恢复。命令执行遇到不确定断线时不得
+   自动重发，而是要求先读取屏幕和检查 GUI 审批/审计状态。
 
 ## UI 基础框架手动验收
 

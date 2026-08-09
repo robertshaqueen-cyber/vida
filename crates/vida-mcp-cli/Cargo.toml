@@ -16,9 +16,9 @@ path = "src/bin/vidactl.rs"
 vida-core = { path = "../vida-core" }
 vida-client = { path = "../vida-client" }
 tokio.workspace = true
-tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
-futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
+rmcp = { version = "=3.1.2", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1.2"

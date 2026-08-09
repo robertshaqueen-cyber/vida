@@ -1,51 +1,452 @@
-use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use rmcp::{
+    Json, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{Implementation, ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
+    transport::stdio,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::Mutex;
+use vida_client::WsClient;
 
-/// stdio-to-WebSocket bridge for MCP clients that only support stdio.
-/// Reads JSON-RPC from stdin, forwards to daemon WebSocket, returns responses to stdout.
-#[tokio::main]
-async fn main() -> Result<()> {
-    let daemon_url =
-        std::env::var("VIDA_DAEMON_URL").unwrap_or_else(|_| "ws://127.0.0.1:9527".to_string());
+const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
 
-    let (ws_stream, _) = connect_async(&daemon_url)
-        .await
-        .context("Failed to connect to vida daemon")?;
+#[derive(Clone)]
+struct VidaMcp {
+    tool_router: ToolRouter<Self>,
+    client: std::sync::Arc<Mutex<Option<WsClient>>>,
+}
 
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Forward to daemon
-        ws_write
-            .send(Message::Text(trimmed.into()))
-            .await
-            .context("Failed to send to daemon")?;
-
-        // Wait for response
-        if let Some(Ok(Message::Text(response))) = ws_read.next().await {
-            stdout.write_all(response.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+impl VidaMcp {
+    fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+            client: Default::default(),
         }
     }
 
+    async fn connect(&self) -> Result<WsClient, String> {
+        if let Some(client) = self.client.lock().await.clone() {
+            return Ok(client);
+        }
+
+        let client = WsClient::connect_agent().await.map_err(|error| {
+            format!(
+                "Unable to connect to the Vida daemon as an Agent. Start vida-daemon and make sure its local configuration files are accessible, then call this tool again. Details: {error:#}"
+            )
+        })?;
+        self.client.lock().await.replace(client.clone());
+        Ok(client)
+    }
+
+    async fn invalidate_client(&self) {
+        self.client.lock().await.take();
+    }
+
+    /// Read-only requests may be retried once after reconnecting. They cannot
+    /// execute terminal input, so retrying after an ambiguous disconnect is safe.
+    async fn read_request(&self, request: ReadRequest) -> Result<Value, String> {
+        let client = self.connect().await?;
+        match request.send(&client).await {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
+                self.invalidate_client().await;
+                let client = self.connect().await.map_err(|reconnect_error| {
+                    format!(
+                        "The Vida daemon connection was lost and reconnecting failed. Start vida-daemon, then call this read-only tool again. First error: {first_error}. Reconnect error: {reconnect_error}"
+                    )
+                })?;
+                request.send(&client).await.map_err(|error| {
+                    format!(
+                        "The Vida daemon rejected the read-only request after reconnecting. The vault may be locked or the session may no longer exist. Inspect the Vida GUI, then retry. Details: {error}"
+                    )
+                })
+            }
+        }
+    }
+
+    /// Writes are deliberately never retried: a lost response does not prove
+    /// that the daemon failed to dispatch the command.
+    async fn exec_request(&self, session_id: &str, command: &str) -> Result<Value, String> {
+        let client = self.connect().await?;
+        match client.agent_exec(session_id, command).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.invalidate_client().await;
+                Err(format!(
+                    "The command result could not be confirmed, so Vida did not retry it. Inspect the target with screen_read and check the Vida GUI approval/audit state before deciding whether to submit a new command. Details: {error}"
+                ))
+            }
+        }
+    }
+}
+
+enum ReadRequest {
+    Status,
+    Hosts,
+    Sessions,
+    Screen(String),
+}
+
+impl ReadRequest {
+    async fn send(&self, client: &WsClient) -> vida_client::DaemonResult<Value> {
+        match self {
+            Self::Status => client.vault_status().await,
+            Self::Hosts => client.list_hosts().await,
+            Self::Sessions => client.list_sessions().await,
+            Self::Screen(session_id) => client.read_screen(session_id).await,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct StatusOutput {
+    vault_exists: bool,
+    locked: bool,
+    host_count: usize,
+    revision: u64,
+    device_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct HostListOutput {
+    hosts: Vec<HostOutput>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct HostOutput {
+    id: String,
+    name: String,
+    host: String,
+    user: String,
+    port: u16,
+    tags: Vec<String>,
+    group: Option<String>,
+    auth_kind: String,
+    agent_trust: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SessionListOutput {
+    sessions: Vec<SessionOutput>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SessionOutput {
+    session_id: String,
+    title: String,
+    target_kind: String,
+    host_id: Option<String>,
+    host_name: Option<String>,
+    cols: u16,
+    rows: u16,
+    alive: bool,
+    exit_code: Option<u32>,
+    foreground_process: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ScreenReadInput {
+    /// Exact session_id returned by session_list.
+    session_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ScreenReadOutput {
+    session_id: String,
+    /// Current terminal viewport as plain text. This is not a complete command transcript.
+    text: String,
+    wide_cols: Vec<Vec<u16>>,
+    cursor: CursorOutput,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CursorOutput {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExecInput {
+    /// Exact session_id returned by session_list.
+    session_id: String,
+    /// One complete shell command without newline, carriage return, or NUL.
+    command: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ExecOutput {
+    session_id: String,
+    /// sent, needs_approval, or rejected.
+    status: String,
+    approval_id: Option<String>,
+    expires_at: Option<i64>,
+    reasons: Vec<String>,
+    matched_rules: Vec<String>,
+    reason: Option<String>,
+    message: Option<String>,
+    next_action: String,
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: Value, operation: &str) -> Result<T, String> {
+    serde_json::from_value(value).map_err(|error| {
+        format!(
+            "Vida returned an unexpected {operation} response. Update vida-mcp, vidactl, the GUI, and vida-daemon together, then retry. Details: {error}"
+        )
+    })
+}
+
+fn string_list(value: Option<&Value>, object_key: &str) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.as_str().map(ToOwned::to_owned).or_else(|| {
+                item.get(object_key)
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .collect()
+}
+
+fn decode_exec_output(session_id: String, value: Value) -> ExecOutput {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("rejected")
+        .to_string();
+    let approval_id = value
+        .get("approval_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let expires_at = value.get("expires_at").and_then(Value::as_i64);
+    let reasons = string_list(value.get("reasons"), "reason");
+    let matched_rules = string_list(value.get("matched_rules"), "rule_id");
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let next_action = match status.as_str() {
+        "sent" => "Use screen_read to observe the command result before taking another action.",
+        "needs_approval" => "Do not call exec again for this command. Ask the human to approve the pending request in the Vida GUI, then use screen_read after they decide.",
+        _ => "The command was not sent. Read the message, inspect the session and host Agent trust in the Vida GUI, and revise the plan.",
+    }
+    .to_string();
+
+    ExecOutput {
+        session_id,
+        status,
+        approval_id,
+        expires_at,
+        reasons,
+        matched_rules,
+        reason,
+        message,
+        next_action,
+    }
+}
+
+#[tool_router(router = tool_router)]
+impl VidaMcp {
+    #[tool(
+        name = "vida_status",
+        description = "Use when you need to verify that Vida is reachable and learn whether its vault is locked before other Vida operations. Do not use when you need terminal contents, session identity, credentials, or host secrets; use session_list, screen_read, or host_list as appropriate."
+    )]
+    async fn vida_status(&self) -> Result<Json<StatusOutput>, String> {
+        let value = self.read_request(ReadRequest::Status).await?;
+        Ok(Json(decode(value, "status")?))
+    }
+
+    #[tool(
+        name = "host_list",
+        description = "Use when you need safe summaries of configured Vida hosts, including IDs, display names, addresses, authentication kind, and Agent trust. Do not use to retrieve credentials, private keys, passphrases, or to open a connection; those capabilities are intentionally unavailable, and active terminals are discovered with session_list."
+    )]
+    async fn host_list(&self) -> Result<Json<HostListOutput>, String> {
+        let value = self.read_request(ReadRequest::Hosts).await?;
+        let hosts = decode(value, "host list")?;
+        Ok(Json(HostListOutput { hosts }))
+    }
+
+    #[tool(
+        name = "session_list",
+        description = "Use before screen_read or exec to identify the intended visible local or SSH terminal by title, host, target kind, and session_id. Do not guess a session ID or use host_list as a substitute; configured hosts are not necessarily active terminal sessions."
+    )]
+    async fn session_list(&self) -> Result<Json<SessionListOutput>, String> {
+        let value = self.read_request(ReadRequest::Sessions).await?;
+        let sessions = decode(value, "session list")?;
+        Ok(Json(SessionListOutput { sessions }))
+    }
+
+    #[tool(
+        name = "screen_read",
+        description = "Use after session_list to inspect the current visible terminal viewport before acting and after a command to observe its result. Do not treat this as a complete shell transcript or use it for a stale/guessed session_id; scrollback outside the current viewport may be absent."
+    )]
+    async fn screen_read(
+        &self,
+        Parameters(input): Parameters<ScreenReadInput>,
+    ) -> Result<Json<ScreenReadOutput>, String> {
+        let value = self
+            .read_request(ReadRequest::Screen(input.session_id.clone()))
+            .await?;
+        #[derive(Deserialize)]
+        struct RawScreen {
+            lines: Vec<String>,
+            wide_cols: Vec<Vec<u16>>,
+            cursor: CursorOutput,
+        }
+        let raw: RawScreen = decode(value, "screen")?;
+        // PTY rows are padded to the terminal width. They are useful to a
+        // renderer but waste Agent context; trailing blanks carry no visible
+        // information, while cursor and wide-column coordinates remain intact.
+        let lines = raw
+            .lines
+            .into_iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect::<Vec<_>>();
+        Ok(Json(ScreenReadOutput {
+            session_id: input.session_id,
+            text: lines.join("\n"),
+            wide_cols: raw.wide_cols,
+            cursor: raw.cursor,
+        }))
+    }
+
+    #[tool(
+        name = "exec",
+        description = "Use only after session_list and screen_read when you need to send one complete non-interactive shell command to a specific visible terminal. Do not use for passwords, private keys, passphrases, raw keystrokes, multiline input, or approval decisions. If status is needs_approval, do not resubmit: ask the human to approve it in the Vida GUI, then inspect the terminal with screen_read."
+    )]
+    async fn exec(
+        &self,
+        Parameters(input): Parameters<ExecInput>,
+    ) -> Result<Json<ExecOutput>, String> {
+        let value = self.exec_request(&input.session_id, &input.command).await?;
+        Ok(Json(decode_exec_output(input.session_id, value)))
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for VidaMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("vida-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(SERVER_INSTRUCTIONS)
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // stdout belongs exclusively to MCP JSON-RPC. Any future diagnostics must
+    // use stderr and must never include commands or credential material.
+    VidaMcp::new().serve(stdio()).await?.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposes_only_the_five_reviewed_tools() {
+        let server = VidaMcp::new();
+        let mut names = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "exec",
+                "host_list",
+                "screen_read",
+                "session_list",
+                "vida_status"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_tool_description_states_when_to_use_and_not_use() {
+        let server = VidaMcp::new();
+        for tool in server.tool_router.list_all() {
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("Use "),
+                "{} lacks Use guidance",
+                tool.name
+            );
+            assert!(
+                description.contains("Do not"),
+                "{} lacks Do not use guidance",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn output_schemas_are_declared_for_agent_validation() {
+        let server = VidaMcp::new();
+        for tool in server.tool_router.list_all() {
+            assert!(
+                tool.output_schema.is_some(),
+                "{} has no output schema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn danger_matches_are_reduced_to_non_command_rule_ids() {
+        let value = serde_json::json!([
+            {"rule_id": "recursive_delete", "reason": "recursive deletion"},
+            "legacy_rule"
+        ]);
+        assert_eq!(
+            string_list(Some(&value), "rule_id"),
+            ["recursive_delete", "legacy_rule"]
+        );
+    }
+
+    #[test]
+    fn terminal_padding_is_not_part_of_agent_text() {
+        let lines = ["prompt %   ", "output", "     "]
+            .into_iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(lines, ["prompt %", "output", ""]);
+    }
+
+    #[test]
+    fn approval_result_tells_agent_to_wait_without_echoing_command() {
+        let output = decode_exec_output(
+            "session-1".to_string(),
+            serde_json::json!({
+                "status": "needs_approval",
+                "approval_id": "approval-1",
+                "command": "sensitive command text",
+                "reasons": ["recursive or forced file deletion"],
+                "matched_rules": [{"rule_id": "recursive_delete", "reason": "delete"}],
+                "expires_at": 1234
+            }),
+        );
+        let json = serde_json::to_value(output).expect("serialize output");
+        assert_eq!(json["status"], "needs_approval");
+        assert!(
+            json["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("Do not call exec again")
+        );
+        assert!(!json.to_string().contains("sensitive command text"));
+    }
 }

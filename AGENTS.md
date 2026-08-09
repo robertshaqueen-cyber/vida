@@ -8,7 +8,7 @@ vida/
 │   ├── vida-core/     # 核心逻辑：金库、配置、主机档案
 │   ├── vida-daemon/   # 守护进程：PTY、SSH、MCP 服务端、WebSocket
 │   ├── vida-gui/      # GUI：iced + wgpu 终端渲染、侧边栏、标签页
-│   └── vida-mcp-cli/  # stdio→WebSocket 桥接（给只支持 stdio 的 MCP 客户端）
+│   └── vida-mcp-cli/  # 正式 CLI + 标准 stdio MCP 服务端（复用 vida-client）
 ```
 
 ## 里程碑流程
@@ -94,6 +94,8 @@ daemon 层测试无法覆盖「按钮是否真的发出了请求」——测试�
   私钥口令。
 - Agent 写入策略、危险命令审批与审计必须在 daemon 侧统一执行；不得只在 CLI 或 MCP
   表面隐藏命令，因为持有 daemon token 的客户端可以直接请求底层协议。
+- MCP 进程的 stdout 只允许输出协议帧；诊断只能写 stderr，且命令、口令和私钥材料均不得
+  进入诊断。写入请求在响应不确定时禁止自动重试，避免同一命令执行两次。
 
 ## 内存测量规范
 
