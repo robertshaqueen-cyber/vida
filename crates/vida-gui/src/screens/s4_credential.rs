@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length};
 use vida_core::i18n::I18n;
 
@@ -10,6 +10,25 @@ use crate::ui::{self, icons};
 pub enum EditorMode {
     Add,
     Edit { host_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    Password,
+    KeyFile,
+    KeyInline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthKindItem {
+    pub kind: AuthKind,
+    pub label: String,
+}
+
+impl std::fmt::Display for AuthKindItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +43,11 @@ pub struct State {
     #[allow(dead_code)] // reserved for future use
     pub color: String,
     pub password: String,
+    pub auth_kind: AuthKind,
+    pub private_key_path: String,
+    pub inline_key: String,
+    pub key_passphrase: String,
+    pub credential_dirty: bool,
     pub notes: String,
     pub saving: bool,
     pub error: Option<String>,
@@ -44,6 +68,11 @@ impl State {
             group: String::new(),
             color: String::new(),
             password: String::new(),
+            auth_kind: AuthKind::Password,
+            private_key_path: String::new(),
+            inline_key: String::new(),
+            key_passphrase: String::new(),
+            credential_dirty: true,
             notes: String::new(),
             saving: false,
             error: None,
@@ -62,6 +91,7 @@ impl State {
         tags: Vec<String>,
         group: Option<String>,
         color: Option<String>,
+        auth_kind: String,
         notes: Option<String>,
     ) -> Self {
         Self {
@@ -74,6 +104,15 @@ impl State {
             group: group.unwrap_or_default(),
             color: color.unwrap_or_default(),
             password: String::new(), // empty = keep existing
+            auth_kind: match auth_kind.as_str() {
+                "key" => AuthKind::KeyFile,
+                "key_inline" => AuthKind::KeyInline,
+                _ => AuthKind::Password,
+            },
+            private_key_path: String::new(),
+            inline_key: String::new(),
+            key_passphrase: String::new(),
+            credential_dirty: false,
             notes: notes.unwrap_or_default(),
             saving: false,
             error: None,
@@ -104,7 +143,7 @@ impl State {
                 ui::muted(if is_edit {
                     i18n.tr("editor_hint_keep_password")
                 } else {
-                    i18n.tr("editor_hint_need_password")
+                    i18n.tr("editor_hint_need_credential")
                 })
                 .size(12),
             ]
@@ -137,7 +176,30 @@ impl State {
             .padding(10)
             .width(Length::Fill);
 
-        let password_label = if is_edit {
+        let auth_items = vec![
+            AuthKindItem {
+                kind: AuthKind::Password,
+                label: i18n.tr("editor_auth_password").to_string(),
+            },
+            AuthKindItem {
+                kind: AuthKind::KeyFile,
+                label: i18n.tr("editor_auth_key_file").to_string(),
+            },
+            AuthKindItem {
+                kind: AuthKind::KeyInline,
+                label: i18n.tr("editor_auth_key_import").to_string(),
+            },
+        ];
+        let selected_auth = auth_items
+            .iter()
+            .find(|item| item.kind == self.auth_kind)
+            .cloned();
+        let auth_picker = pick_list(auth_items, selected_auth, AppMessage::EditorAuthChanged)
+            .style(ui::picker)
+            .padding(10)
+            .width(Length::Fill);
+
+        let password_label = if is_edit && !self.credential_dirty {
             text(i18n.tr("editor_password_edit_hint")).size(12)
         } else {
             text(i18n.tr("editor_password")).size(12)
@@ -148,6 +210,31 @@ impl State {
             .style(ui::input)
             .padding(10)
             .width(Length::Fill);
+
+        let key_path_input = text_input(i18n.tr("editor_key_path"), &self.private_key_path)
+            .on_input(AppMessage::EditorKeyPathChanged)
+            .style(ui::input)
+            .padding(10)
+            .width(Length::Fill);
+        let key_pick_button = button(i18n.tr("editor_choose_key"))
+            .on_press(AppMessage::EditorPickKeyFile)
+            .style(ui::secondary_button)
+            .padding([9, 12]);
+        let import_button = button(if self.inline_key.is_empty() {
+            i18n.tr("editor_import_key")
+        } else {
+            i18n.tr("editor_key_imported")
+        })
+        .on_press(AppMessage::EditorImportKeyFile)
+        .style(ui::secondary_button)
+        .padding([9, 12]);
+        let key_passphrase =
+            SecureTextInput::new(i18n.tr("editor_key_passphrase"), &self.key_passphrase)
+                .on_input(AppMessage::EditorKeyPassphraseChanged)
+                .secure(true)
+                .style(ui::input)
+                .padding(10)
+                .width(Length::Fill);
 
         let tags_input = text_input(i18n.tr("editor_tags"), &self.tags)
             .on_input(AppMessage::EditorTagsChanged)
@@ -172,7 +259,15 @@ impl State {
             && !self.host.is_empty()
             && !self.user.is_empty()
             && self.port.parse::<u16>().is_ok()
-            && (is_edit || !self.password.is_empty()); // new host requires password
+            && if !self.credential_dirty && is_edit {
+                true
+            } else {
+                match self.auth_kind {
+                    AuthKind::Password => !self.password.is_empty(),
+                    AuthKind::KeyFile => !self.private_key_path.is_empty(),
+                    AuthKind::KeyInline => !self.inline_key.is_empty(),
+                }
+            };
 
         let save_btn = if self.saving {
             button(i18n.tr("common_saving"))
@@ -197,25 +292,39 @@ impl State {
             .style(ui::secondary_button)
             .padding([9, 14]);
 
-        let hint = if is_edit {
+        let hint = if is_edit && !self.credential_dirty {
             ui::muted(i18n.tr("editor_hint_keep_password")).size(11)
         } else {
-            ui::muted(i18n.tr("editor_hint_need_password")).size(11)
+            ui::muted(i18n.tr("editor_hint_need_credential")).size(11)
         };
 
-        let fields = column![
+        let mut fields = column![
             name_input,
             host_input,
             row![user_input, port_input].spacing(12),
-            password_label.color(ui::TEXT_SECONDARY),
-            password_input,
-            hint,
-            tags_input,
-            group_input,
-            notes_input,
+            text(i18n.tr("editor_auth_kind"))
+                .size(12)
+                .color(ui::TEXT_SECONDARY),
+            auth_picker,
         ]
         .spacing(11)
         .width(Length::Fill);
+        fields = match self.auth_kind {
+            AuthKind::Password => fields
+                .push(password_label.color(ui::TEXT_SECONDARY))
+                .push(password_input),
+            AuthKind::KeyFile => fields
+                .push(row![key_path_input, key_pick_button].spacing(10))
+                .push(key_passphrase),
+            AuthKind::KeyInline => fields.push(import_button).push(key_passphrase),
+        };
+        let fields = fields
+            .push(hint)
+            .push(tags_input)
+            .push(group_input)
+            .push(notes_input)
+            .spacing(11)
+            .width(Length::Fill);
 
         let mut card = column![header, fields, row![save_btn, cancel_btn].spacing(10)]
             .spacing(18)
@@ -239,14 +348,18 @@ impl State {
 
         let content = container(card)
             .padding(22)
-            .width(Length::Fixed(620.0))
+            .width(Length::Fill)
+            .max_width(620)
             .style(ui::surface);
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .padding(iced::padding::Padding::new(0.0).top(62))
-            .into()
+        scrollable(
+            container(content)
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .padding(iced::padding::Padding::new(20.0).top(36).bottom(36)),
+        )
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .into()
     }
 }

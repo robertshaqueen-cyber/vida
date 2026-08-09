@@ -5,6 +5,9 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if vida_daemon::ssh_auth::run_helper_if_requested()? {
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -17,6 +20,10 @@ async fn main() -> Result<()> {
     // 首次启动：配置目录（如 ~/Library/Application Support/vida）可能不存在，
     // 必须在写入 token/port/金库 之前创建，否则新用户首次启动直接失败。
     vida_core::config::ensure_dirs()?;
+    let stale_keys = vida_daemon::pty::cleanup_stale_inline_keys()?;
+    if stale_keys > 0 {
+        info!("已清理 {} 个上次异常退出遗留的 SSH 临时密钥", stale_keys);
+    }
 
     let token = vida_daemon::ws_server::load_or_create_token()?;
     info!("Auth token loaded");

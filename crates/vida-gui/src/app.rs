@@ -71,6 +71,17 @@ pub struct VidaApp {
     terminal_reconnect_cooldown: Option<std::time::Instant>,
     /// 当前持久化的终端外观；业务设置不放在 Screen 内。
     terminal_appearance: crate::term::primitive::TerminalAppearance,
+    /// daemon 连接中断后保留终端标签；金库重新解锁后按原类型恢复会话。
+    terminal_restore_pending: bool,
+    /// 防止自动定时重连和手动“重试连接”同时建立两条连接。
+    /// 成功连回 daemon 后保持为 true，直到终端标签恢复完成。
+    terminal_reconnect_in_flight: bool,
+    /// First successful host load opens a local terminal only when no saved
+    /// terminal layout exists. Later host refreshes must not create terminals.
+    initial_terminal_open_pending: bool,
+    /// Disabled by unit-test fixtures so tests never overwrite the user's
+    /// device-local workspace state.
+    ui_state_persistence_enabled: bool,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -121,10 +132,13 @@ impl SyncState {
 pub enum AppMessage {
     // Formal local terminal tabs (M2b-3)
     OpenLocalTerminal,
+    OpenSshTerminal(String),
     TerminalPush(PushMsg),
     /// 订阅建立完成。
     TerminalOpened {
         session_id: String,
+        title: String,
+        host_id: Option<String>,
     },
     /// 推送 stream 结束（后台连接断开）——会话标记为已断开。
     TerminalDisconnected {
@@ -136,8 +150,10 @@ pub enum AppMessage {
         client: WsClient,
         mappings: Vec<(String, String, bool)>,
     },
-    /// 自动重连失败（等待冷却后由用户手动重试）。
+    /// 自动重连失败；界面显示原因，并继续定时重试。
     TerminalReconnectFailed(String),
+    /// 自动重连失败后的下一次定时尝试。
+    TerminalReconnectRetry,
     TerminalSetupError(String),
     /// 人在终端 widget 中产生的原始输入字节。
     TerminalInput(Vec<u8>),
@@ -164,8 +180,9 @@ pub enum AppMessage {
     // Tab management
     SwitchTab(String), // tab id
     OpenAddHostTab,    // open host picker/add tab
-    OpenSettingsTab,   // open settings as tab
-    CloseTab(String),  // tab id
+    OpenHostDetail(String),
+    OpenSettingsTab,  // open settings as tab
+    CloseTab(String), // tab id
     // Quick connect panel
     ToggleConnectPanel,
     CloseConnectPanel,
@@ -208,10 +225,17 @@ pub enum AppMessage {
     EditorHostChanged(String),
     EditorUserChanged(String),
     EditorPortChanged(String),
+    EditorAuthChanged(crate::screens::s4_credential::AuthKindItem),
     EditorPasswordChanged(String),
+    EditorKeyPathChanged(String),
+    EditorPickKeyFile,
+    EditorImportKeyFile,
+    EditorKeyPassphraseChanged(String),
     EditorTagsChanged(String),
     EditorGroupChanged(String),
     EditorNotesChanged(String),
+    EditorFocusNext,
+    EditorFocusPrevious,
     EditorSave,
     EditorSaved,
     EditorCancel,
@@ -272,7 +296,8 @@ pub enum AppMessage {
 fn new() -> (VidaApp, Task<AppMessage>) {
     let i18n = I18n::new(i18n::detect_lang());
     let connecting = i18n.tr("connection_connecting");
-    let app = VidaApp {
+    let ui_state = vida_core::config::load_ui_state();
+    let mut app = VidaApp {
         ws_client: None,
         screen: Screen::ConnectionFailure(s0_connection::State::new(connecting.into())),
         hosts: Vec::new(),
@@ -283,7 +308,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         i18n,
         show_connect_panel: false,
         connect_panel_search: String::new(),
-        recent_host_ids: Vec::new(),
+        recent_host_ids: ui_state.recent_host_ids.clone(),
         sync_state: SyncState::default(),
         cred_hide_token: 0,
         clipboard_guard: None,
@@ -294,7 +319,12 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         next_terminal_number: 1,
         terminal_reconnect_cooldown: None,
         terminal_appearance: crate::term::primitive::TerminalAppearance::default(),
+        terminal_restore_pending: false,
+        terminal_reconnect_in_flight: false,
+        initial_terminal_open_pending: true,
+        ui_state_persistence_enabled: true,
     };
+    restore_persisted_terminal_layout(&mut app, &ui_state);
 
     let connect = Task::perform(
         async {
@@ -310,7 +340,8 @@ fn new() -> (VidaApp, Task<AppMessage>) {
 }
 
 impl VidaApp {
-    /// Replace the host list AND rebuild host tabs from it.
+    /// Replace the host list, remove legacy always-open host tabs, and refresh
+    /// names on any restored SSH terminal tabs.
     ///
     /// This is the ONLY entry point for modifying `app.hosts` — all other
     /// callers (HostsLoaded, SyncCompleted downloaded) must route through
@@ -318,21 +349,29 @@ impl VidaApp {
     fn set_hosts(&mut self, hosts: Vec<s3_main::HostItem>) {
         use crate::screens::TabKind;
         self.hosts = hosts;
-        // Preserve non-host tabs (settings, add host, edit host)
-        let non_host_tabs: Vec<Tab> = self
-            .tabs
-            .iter()
-            .filter(|t| !matches!(t.kind, TabKind::Host { .. }))
-            .cloned()
-            .collect();
-        // Rebuild host tabs from the new list (names may have changed)
-        let host_tabs: Vec<Tab> = self
-            .hosts
-            .iter()
-            .map(|h| Tab::host(h.id.clone(), h.name.clone()))
-            .collect();
-        self.tabs = host_tabs;
-        self.tabs.extend(non_host_tabs);
+        self.tabs.retain(|tab| match &tab.kind {
+            TabKind::Host { host_id } => self.hosts.iter().any(|host| &host.id == host_id),
+            _ => true,
+        });
+        for tab in &mut self.tabs {
+            if let TabKind::Host { host_id } = &tab.kind
+                && let Some(host) = self.hosts.iter().find(|host| &host.id == host_id)
+            {
+                tab.name = host.name.clone();
+            }
+        }
+        for (tab_id, session) in &mut self.terminal_sessions {
+            let Some(host_id) = session.remote_host_id.as_ref() else {
+                continue;
+            };
+            let Some(host) = self.hosts.iter().find(|host| &host.id == host_id) else {
+                continue;
+            };
+            session.title = host.name.clone();
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == tab_id) {
+                tab.name = host.name.clone();
+            }
+        }
         // Preserve active tab if it still exists, else fall back to first
         if !self.active_tab_id.is_empty() && self.tabs.iter().any(|t| t.id == self.active_tab_id) {
             // Keep current active tab
@@ -342,12 +381,123 @@ impl VidaApp {
     }
 }
 
+fn restore_persisted_terminal_layout(app: &mut VidaApp, state: &vida_core::config::UiState) {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for entry in &state.terminal_layout {
+        if entry.session_id.is_empty()
+            || entry.number == 0
+            || !seen.insert(entry.session_id.clone())
+        {
+            continue;
+        }
+        let name = match &entry.host_id {
+            Some(host_id) => host_id.clone(),
+            None => app
+                .i18n
+                .trf("terminal_local_numbered", &[&entry.number.to_string()]),
+        };
+        let tab = Tab::terminal(entry.session_id.clone(), entry.number, name.clone());
+        let tab_id = tab.id.clone();
+        let mut session = s_terminal::TerminalSession::new(
+            entry.session_id.clone(),
+            entry.host_id.clone(),
+            name,
+            40,
+            100,
+            app.terminal_appearance.clone(),
+        );
+        session.closed = true;
+        session.notice = Some(app.i18n.tr("terminal_reconnecting").to_string());
+        app.next_terminal_number = app.next_terminal_number.max(entry.number.saturating_add(1));
+        app.terminal_sessions.insert(tab_id.clone(), session);
+        app.tabs.push(tab);
+        if state.active_terminal_session_id.as_deref() == Some(&entry.session_id) {
+            app.active_tab_id = tab_id;
+        }
+    }
+    if app.active_tab_id.is_empty() {
+        app.active_tab_id = app
+            .tabs
+            .first()
+            .map(|tab| tab.id.clone())
+            .unwrap_or_default();
+    }
+    app.terminal_restore_pending = !app.terminal_sessions.is_empty();
+}
+
+fn persist_ui_state(app: &VidaApp) {
+    use vida_core::config::{TerminalLayoutEntry, UiState};
+
+    if !app.ui_state_persistence_enabled {
+        return;
+    }
+
+    let terminal_layout: Vec<TerminalLayoutEntry> = app
+        .tabs
+        .iter()
+        .filter_map(|tab| {
+            let crate::screens::TabKind::Terminal { number, .. } = &tab.kind else {
+                return None;
+            };
+            let session = app.terminal_sessions.get(&tab.id)?;
+            Some(TerminalLayoutEntry {
+                session_id: session.session_id.clone(),
+                host_id: session.remote_host_id.clone(),
+                number: *number,
+            })
+        })
+        .collect();
+    let active_terminal_session_id = app
+        .terminal_sessions
+        .get(&app.active_tab_id)
+        .map(|session| session.session_id.clone());
+    let state = UiState {
+        recent_host_ids: app.recent_host_ids.clone(),
+        terminal_layout,
+        active_terminal_session_id,
+    };
+    if let Err(error) = vida_core::config::save_ui_state(&state) {
+        tracing::warn!("无法保存本机界面状态：{}", error);
+    }
+}
+
 fn active_terminal(app: &VidaApp) -> Option<&s_terminal::TerminalSession> {
     app.terminal_sessions.get(&app.active_tab_id)
 }
 
 fn active_terminal_mut(app: &mut VidaApp) -> Option<&mut s_terminal::TerminalSession> {
     app.terminal_sessions.get_mut(&app.active_tab_id)
+}
+
+fn classify_ssh_failure(i18n: &I18n, output: &str) -> String {
+    let output = output.to_ascii_lowercase();
+    let key = if output.contains("permission denied")
+        || output.contains("authentication failed")
+        || output.contains("too many authentication failures")
+    {
+        "terminal_ssh_auth_failed"
+    } else if output.contains("connection refused") {
+        "terminal_ssh_connection_refused"
+    } else if output.contains("operation timed out")
+        || output.contains("connection timed out")
+        || output.contains("no route to host")
+        || output.contains("network is unreachable")
+    {
+        "terminal_ssh_unreachable"
+    } else if output.contains("could not resolve hostname")
+        || output.contains("name or service not known")
+    {
+        "terminal_ssh_dns_failed"
+    } else if output.contains("host key verification failed")
+        || output.contains("remote host identification has changed")
+    {
+        "terminal_ssh_host_key_failed"
+    } else {
+        "terminal_ssh_failed_generic"
+    };
+    i18n.tr(key).to_string()
 }
 
 /// Close the daemon session owned by a terminal tab. Human input is already
@@ -368,14 +518,105 @@ fn close_terminal_session(app: &mut VidaApp, tab_id: &str) {
     }
 }
 
-fn close_all_terminal_sessions(app: &mut VidaApp) {
-    let tab_ids: Vec<String> = app.terminal_sessions.keys().cloned().collect();
-    for tab_id in tab_ids {
-        close_terminal_session(app, &tab_id);
+/// Explicit vault lock closes daemon PTYs but retains their tab descriptors so
+/// a successful unlock can reopen the same local/SSH workspace.
+fn suspend_all_terminal_sessions(app: &mut VidaApp) {
+    for session in app.terminal_sessions.values_mut() {
+        if let Some(client) = app.ws_client.as_ref() {
+            client.unsubscribe(&session.session_id);
+            let _ = client.send_queued(
+                "CloseSession",
+                serde_json::json!({"session_id": session.session_id}),
+            );
+        }
+        session.closed = true;
+        session.exit_code = None;
+        session.notice = None;
     }
-    app.tabs
-        .retain(|tab| !matches!(tab.kind, crate::screens::TabKind::Terminal { .. }));
     app.terminal_reconnect_cooldown = None;
+    app.terminal_restore_pending = !app.terminal_sessions.is_empty();
+    app.terminal_reconnect_in_flight = false;
+    persist_ui_state(app);
+}
+
+fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
+    let Some(client) = app.ws_client.as_ref().cloned() else {
+        return Task::none();
+    };
+    let snapshots: Vec<(String, u16, u16, Option<String>)> = app
+        .terminal_sessions
+        .values()
+        .filter(|session| session.closed)
+        .map(|session| {
+            (
+                session.session_id.clone(),
+                session.grid.rows,
+                session.grid.cols,
+                session.remote_host_id.clone(),
+            )
+        })
+        .collect();
+    if snapshots.is_empty() {
+        return Task::none();
+    }
+
+    Task::perform(
+        async move {
+            let mut mappings = Vec::with_capacity(snapshots.len());
+            for (old_session_id, rows, cols, remote_host_id) in snapshots {
+                match client
+                    .send(
+                        "SubscribeSession",
+                        serde_json::json!({"session_id": old_session_id}),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = client
+                            .send(
+                                "ResizeSession",
+                                serde_json::json!({
+                                    "session_id": old_session_id,
+                                    "cols": cols,
+                                    "rows": rows,
+                                }),
+                            )
+                            .await;
+                        mappings.push((old_session_id.clone(), old_session_id, false));
+                    }
+                    Err(error) if error.message.contains("会话不存在") => {
+                        let reopened = match remote_host_id {
+                            Some(host_id) => open_ssh_and_subscribe(&client, &host_id).await,
+                            None => open_and_subscribe(&client).await,
+                        };
+                        match reopened {
+                            Ok(new_session_id) => {
+                                let _ = client
+                                    .send(
+                                        "ResizeSession",
+                                        serde_json::json!({
+                                            "session_id": new_session_id,
+                                            "cols": cols,
+                                            "rows": rows,
+                                        }),
+                                    )
+                                    .await;
+                                mappings.push((old_session_id, new_session_id, true));
+                            }
+                            Err(error) => {
+                                return AppMessage::TerminalReconnectFailed(error);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return AppMessage::TerminalReconnectFailed(error.message);
+                    }
+                }
+            }
+            AppMessage::TerminalReconnected { client, mappings }
+        },
+        |message| message,
+    )
 }
 
 /// Every open terminal tab gets its own push stream. Inactive tabs keep their
@@ -384,8 +625,23 @@ fn close_all_terminal_sessions(app: &mut VidaApp) {
 /// active terminal requests cursor blinking.
 fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     let mut subscriptions = Vec::new();
+
+    let editor_is_active = app
+        .tabs
+        .iter()
+        .find(|tab| tab.id == app.active_tab_id)
+        .is_some_and(|tab| {
+            matches!(
+                tab.kind,
+                crate::screens::TabKind::AddHost | crate::screens::TabKind::EditHost { .. }
+            )
+        });
+    if editor_is_active {
+        subscriptions.push(iced::event::listen_with(editor_focus_event));
+    }
+
     let Some(ws) = app.ws_client.as_ref() else {
-        return iced::Subscription::none();
+        return iced::Subscription::batch(subscriptions);
     };
 
     for (tab_id, session) in &app.terminal_sessions {
@@ -432,6 +688,30 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     iced::Subscription::batch(subscriptions)
 }
 
+fn editor_focus_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<AppMessage> {
+    use iced::keyboard::{Key, key};
+
+    match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: Key::Named(key::Named::Tab),
+            modifiers,
+            repeat: false,
+            ..
+        }) if !modifiers.command() && !modifiers.control() && !modifiers.alt() => {
+            Some(if modifiers.shift() {
+                AppMessage::EditorFocusPrevious
+            } else {
+                AppMessage::EditorFocusNext
+            })
+        }
+        _ => None,
+    }
+}
+
 /// 打开本地会话并订阅推送，返回 session_id。
 /// 首次打开与「原会话已结束」兜底路径共用（重连后必须重新订阅拿全量帧）。
 async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
@@ -454,10 +734,34 @@ async fn open_and_subscribe(client: &WsClient) -> Result<String, String> {
     Ok(sid)
 }
 
+/// 通过 daemon 使用金库中的主机与凭据打开系统 SSH，并订阅终端推送。
+async fn open_ssh_and_subscribe(client: &WsClient, host_id: &str) -> Result<String, String> {
+    let resp = client
+        .send(
+            "OpenSshSession",
+            serde_json::json!({"host_id": host_id, "cols": 100, "rows": 40}),
+        )
+        .await
+        .map_err(|e| format!("打开 SSH 会话失败: {}", e.message))?;
+    let sid = resp
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "OpenSshSession 响应缺少 session_id".to_string())?
+        .to_string();
+    client
+        .send("SubscribeSession", serde_json::json!({"session_id": sid}))
+        .await
+        .map_err(|e| format!("订阅 SSH 会话失败: {}", e.message))?;
+    Ok(sid)
+}
+
 fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
     match message {
         // ---- Connection ----
         AppMessage::WsConnected(client) => {
+            if !app.terminal_restore_pending {
+                app.terminal_reconnect_in_flight = false;
+            }
             app.ws_client = Some(client);
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -481,6 +785,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             )
         }
         AppMessage::WsError(e) => {
+            app.terminal_reconnect_in_flight = false;
             // If a sync was in flight, surface the failure via the sync indicator
             if app.sync_state == SyncState::Syncing {
                 app.sync_state = SyncState::Error;
@@ -490,15 +795,25 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.screen = Screen::ConnectionFailure(s0_connection::State::new(display));
             Task::none()
         }
-        AppMessage::RetryConnection => Task::perform(
-            async {
-                match WsClient::connect().await {
-                    Ok(client) => AppMessage::WsConnected(client),
-                    Err(e) => AppMessage::WsError(e.to_string()),
-                }
-            },
-            |r| r,
-        ),
+        AppMessage::RetryConnection | AppMessage::TerminalReconnectRetry => {
+            if app.terminal_reconnect_in_flight {
+                return Task::none();
+            }
+            app.terminal_reconnect_in_flight = true;
+            let restoring_terminals = app.terminal_restore_pending;
+            Task::perform(
+                async move {
+                    match WsClient::connect().await {
+                        Ok(client) => AppMessage::WsConnected(client),
+                        Err(e) if restoring_terminals => {
+                            AppMessage::TerminalReconnectFailed(e.to_string())
+                        }
+                        Err(e) => AppMessage::WsError(e.to_string()),
+                    }
+                },
+                |r| r,
+            )
+        }
         AppMessage::DaemonChecked {
             locked,
             vault_exists,
@@ -657,6 +972,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         // ---- Tab management ----
         AppMessage::SwitchTab(tab_id) => {
             app.active_tab_id = tab_id;
+            persist_ui_state(app);
             // Invalidate any pending credential-hide timer and clear the
             // revealed credential: it belongs to the previous host.
             app.cred_hide_token += 1;
@@ -679,6 +995,16 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             app.active_tab_id = "add_host".into();
             app.editor_state = Some(s4_credential::State::new_add());
+            Task::none()
+        }
+        AppMessage::OpenHostDetail(host_id) => {
+            let Some(host) = app.hosts.iter().find(|host| host.id == host_id) else {
+                return Task::none();
+            };
+            if !app.tabs.iter().any(|tab| tab.id == host_id) {
+                app.tabs.push(Tab::host(host_id.clone(), host.name.clone()));
+            }
+            app.active_tab_id = host_id;
             Task::none()
         }
         AppMessage::OpenSettingsTab => {
@@ -719,6 +1045,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     .map(|tab| tab.id.clone())
                     .unwrap_or_default();
             }
+            persist_ui_state(app);
             Task::none()
         }
         AppMessage::ToggleConnectPanel => {
@@ -742,20 +1069,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::QuickConnectHost(host_id) => {
-            // Open host tab and close panel
             app.show_connect_panel = false;
-            let existing = app.tabs.iter().find(|t| t.id == host_id);
-            if existing.is_none()
-                && let Some(h) = app.hosts.iter().find(|h| h.id == host_id)
-            {
-                app.tabs.push(Tab::host(host_id.clone(), h.name.clone()));
-            }
-            app.active_tab_id = host_id.clone();
-            // Update recent hosts: move to front, dedup, limit to 10
-            app.recent_host_ids.retain(|id| *id != host_id);
-            app.recent_host_ids.insert(0, host_id);
-            app.recent_host_ids.truncate(10);
-            Task::none()
+            update(app, AppMessage::OpenSshTerminal(host_id))
         }
         AppMessage::QuickAddHost => {
             app.show_connect_panel = false;
@@ -774,11 +1089,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             // Business data lives on VidaApp so conflict/backup screens can
             // read it regardless of the current screen.
             app.set_hosts(hosts);
+            app.recent_host_ids
+                .retain(|id| app.hosts.iter().any(|host| &host.id == id));
             app.screen = Screen::Main(s3_main::State {
                 revealed_credential: None,
                 credential_copied: false,
             });
-            if app.settings_state.is_none() {
+            let settings_task = if app.settings_state.is_none() {
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
                     async move {
@@ -791,7 +1108,17 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 )
             } else {
                 Task::none()
-            }
+            };
+            let first_main_load = std::mem::take(&mut app.initial_terminal_open_pending);
+            let restore_task = if app.terminal_restore_pending {
+                restore_terminal_sessions(app)
+            } else if first_main_load && app.terminal_sessions.is_empty() {
+                update(app, AppMessage::OpenLocalTerminal)
+            } else {
+                Task::none()
+            };
+            persist_ui_state(app);
+            Task::batch([settings_task, restore_task])
         }
         AppMessage::EditHost(host_id) => {
             // Find host data and open editor in a new tab
@@ -814,6 +1141,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     h.tags.clone(),
                     h.group.clone(),
                     h.color.clone(),
+                    h.auth_kind.clone(),
                     h.notes.clone(),
                 ));
             }
@@ -980,7 +1308,72 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     s.password_cleared = true;
                 }
                 s.password = v;
+                s.credential_dirty = true;
                 s.password_cleared = false;
+            }
+            Task::none()
+        }
+        AppMessage::EditorAuthChanged(item) => {
+            if let Some(state) = &mut app.editor_state
+                && state.auth_kind != item.kind
+            {
+                state.auth_kind = item.kind;
+                state.password.clear();
+                state.private_key_path.clear();
+                state.inline_key.clear();
+                state.key_passphrase.clear();
+                state.credential_dirty = true;
+            }
+            Task::none()
+        }
+        AppMessage::EditorKeyPathChanged(value) => {
+            if let Some(state) = &mut app.editor_state {
+                state.private_key_path = value;
+                state.credential_dirty = true;
+            }
+            Task::none()
+        }
+        AppMessage::EditorPickKeyFile => {
+            if let Some(state) = &mut app.editor_state
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title(app.i18n.tr("editor_choose_key"))
+                    .pick_file()
+            {
+                state.private_key_path = path.to_string_lossy().into_owned();
+                state.credential_dirty = true;
+                state.error = None;
+            }
+            Task::none()
+        }
+        AppMessage::EditorImportKeyFile => {
+            if let Some(state) = &mut app.editor_state
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title(app.i18n.tr("editor_import_key"))
+                    .pick_file()
+            {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) if !contents.is_empty() => {
+                        state.inline_key = contents;
+                        state.credential_dirty = true;
+                        state.error = None;
+                    }
+                    Ok(_) => {
+                        state.error = Some(app.i18n.tr("editor_key_empty").to_string());
+                    }
+                    Err(error) => {
+                        state.error = Some(
+                            app.i18n
+                                .trf("editor_key_read_failed", &[&error.to_string()]),
+                        );
+                    }
+                }
+            }
+            Task::none()
+        }
+        AppMessage::EditorKeyPassphraseChanged(value) => {
+            if let Some(state) = &mut app.editor_state {
+                state.key_passphrase = value;
+                state.credential_dirty = true;
             }
             Task::none()
         }
@@ -1002,6 +1395,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
+        AppMessage::EditorFocusNext => iced::widget::operation::focus_next(),
+        AppMessage::EditorFocusPrevious => iced::widget::operation::focus_previous(),
         AppMessage::EditorSave => {
             if let Some(s) = &mut app.editor_state {
                 s.saving = true;
@@ -1030,11 +1425,27 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 } else {
                     Some(s.notes.clone())
                 };
-                // Password: empty on edit → None (keep existing); non-empty → Some
-                let password = if s.password.is_empty() {
-                    None // keep existing (edit) or validation catches (add)
+                let auth = if !s.credential_dirty {
+                    None
                 } else {
-                    Some(s.password.clone())
+                    let passphrase =
+                        (!s.key_passphrase.is_empty()).then(|| s.key_passphrase.clone());
+                    Some(match s.auth_kind {
+                        s4_credential::AuthKind::Password => serde_json::json!({
+                            "kind": "password",
+                            "password": s.password,
+                        }),
+                        s4_credential::AuthKind::KeyFile => serde_json::json!({
+                            "kind": "key",
+                            "private_key_path": s.private_key_path,
+                            "passphrase": passphrase,
+                        }),
+                        s4_credential::AuthKind::KeyInline => serde_json::json!({
+                            "kind": "key_inline",
+                            "private_key": s.inline_key,
+                            "passphrase": passphrase,
+                        }),
+                    })
                 };
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
@@ -1049,7 +1460,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                                 "tags": tags,
                                 "group": group,
                                 "color": null,
-                                "password": password,
+                                "password": null,
+                                "auth": auth,
                                 "notes": notes,
                             }
                         });
@@ -1208,8 +1620,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 }
                 "downloaded" => {
                     app.sync_state = SyncState::Synced;
-                    // Replace business data + rebuild host tabs (names may
-                    // have changed on the remote side).
+                    // Replace business data and refresh any on-demand host or
+                    // SSH terminal tab titles changed on the remote side.
                     app.set_hosts(val.get("hosts").map(parse_hosts).unwrap_or_default());
                     if !matches!(app.screen, Screen::Main(_)) {
                         app.screen = Screen::Main(s3_main::State {
@@ -1230,15 +1642,15 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
 
         AppMessage::LockVault => {
-            let client = app.ws_client.as_ref().unwrap().clone();
-            close_all_terminal_sessions(app);
-            if !app.tabs.iter().any(|tab| tab.id == app.active_tab_id) {
-                app.active_tab_id = app
-                    .tabs
-                    .first()
-                    .map(|tab| tab.id.clone())
-                    .unwrap_or_default();
+            // During daemon recovery the old client cannot perform Lock. More
+            // importantly, closing tabs here would erase the metadata needed
+            // to restore them. Preserve the tabs and make the action an
+            // immediate reconnect attempt instead.
+            if app.terminal_restore_pending {
+                return update(app, AppMessage::RetryConnection);
             }
+            let client = app.ws_client.as_ref().unwrap().clone();
+            suspend_all_terminal_sessions(app);
             Task::perform(
                 async move {
                     match client.lock().await {
@@ -1277,7 +1689,8 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     .unwrap_or(vida_core::i18n::Lang::En);
                 app.i18n = I18n::new(lang);
             }
-            // Refresh non-host tab names (settings tab name changes with language)
+            // Refresh translated tab names without renaming SSH terminals to
+            // the local-terminal label.
             for tab in app.tabs.iter_mut() {
                 match &tab.kind {
                     crate::screens::TabKind::Settings => {
@@ -1286,7 +1699,12 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     crate::screens::TabKind::AddHost => {
                         tab.name = app.i18n.tr("main_add_host_tab").to_string();
                     }
-                    crate::screens::TabKind::Terminal { number, .. } => {
+                    crate::screens::TabKind::Terminal { number, .. }
+                        if app
+                            .terminal_sessions
+                            .get(&tab.id)
+                            .is_some_and(|session| session.remote_host_id.is_none()) =>
+                    {
                         tab.name = app
                             .i18n
                             .trf("terminal_local_numbered", &[&number.to_string()]);
@@ -1906,14 +2324,55 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::perform(
                 async move {
                     match open_and_subscribe(&client).await {
-                        Ok(sid) => AppMessage::TerminalOpened { session_id: sid },
+                        Ok(sid) => AppMessage::TerminalOpened {
+                            session_id: sid,
+                            title: "".to_string(),
+                            host_id: None,
+                        },
                         Err(e) => AppMessage::TerminalSetupError(e),
                     }
                 },
                 |msg| msg,
             )
         }
-        AppMessage::TerminalOpened { session_id } => {
+        AppMessage::OpenSshTerminal(host_id) => {
+            if app.terminal_opening || !matches!(app.screen, Screen::Main(_)) {
+                return Task::none();
+            }
+            let Some(host) = app.hosts.iter().find(|host| host.id == host_id) else {
+                app.terminal_error = Some(app.i18n.tr("main_host_not_found").to_string());
+                return Task::none();
+            };
+            let title = host.name.clone();
+            app.recent_host_ids.retain(|id| *id != host_id);
+            app.recent_host_ids.insert(0, host_id.clone());
+            app.recent_host_ids.truncate(10);
+            persist_ui_state(app);
+            let client = match app.ws_client.as_ref() {
+                Some(client) => client.clone(),
+                None => return Task::none(),
+            };
+            app.terminal_opening = true;
+            app.terminal_error = None;
+            Task::perform(
+                async move {
+                    match open_ssh_and_subscribe(&client, &host_id).await {
+                        Ok(session_id) => AppMessage::TerminalOpened {
+                            session_id,
+                            title,
+                            host_id: Some(host_id),
+                        },
+                        Err(error) => AppMessage::TerminalSetupError(error),
+                    }
+                },
+                |message| message,
+            )
+        }
+        AppMessage::TerminalOpened {
+            session_id,
+            title,
+            host_id,
+        } => {
             app.terminal_opening = false;
             if !matches!(app.screen, Screen::Main(_)) {
                 if let Some(client) = app.ws_client.as_ref() {
@@ -1927,15 +2386,21 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             let number = app.next_terminal_number;
             app.next_terminal_number = app.next_terminal_number.saturating_add(1);
-            let name = app
-                .i18n
-                .trf("terminal_local_numbered", &[&number.to_string()]);
+            let local_title = app.i18n.tr("terminal_local_title").to_string();
+            let name = if host_id.is_some() {
+                title.clone()
+            } else {
+                app.i18n
+                    .trf("terminal_local_numbered", &[&number.to_string()])
+            };
             let tab = Tab::terminal(session_id.clone(), number, name);
             let tab_id = tab.id.clone();
             app.terminal_sessions.insert(
                 tab_id.clone(),
                 s_terminal::TerminalSession::new(
                     session_id,
+                    host_id,
+                    if title.is_empty() { local_title } else { title },
                     40,
                     100,
                     app.terminal_appearance.clone(),
@@ -1944,6 +2409,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             app.tabs.push(tab);
             app.active_tab_id = tab_id;
             app.show_connect_panel = false;
+            persist_ui_state(app);
             iced::widget::operation::focus::<AppMessage>(crate::term::widget::id())
         }
         AppMessage::TerminalDisconnected { session_id } => {
@@ -1955,18 +2421,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             }
 
-            let snapshots: Vec<(String, u16, u16)> = app
-                .terminal_sessions
-                .values()
-                .filter(|session| !session.closed)
-                .map(|session| {
-                    (
-                        session.session_id.clone(),
-                        session.grid.rows,
-                        session.grid.cols,
-                    )
-                })
-                .collect();
             for session in app
                 .terminal_sessions
                 .values_mut()
@@ -1975,6 +2429,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 session.closed = true;
                 session.notice = Some(app.i18n.tr("terminal_reconnecting").to_string());
             }
+            app.terminal_restore_pending = true;
 
             let now = std::time::Instant::now();
             if app
@@ -1984,64 +2439,15 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             }
             app.terminal_reconnect_cooldown = Some(now + std::time::Duration::from_secs(10));
+            app.terminal_reconnect_in_flight = true;
 
             Task::perform(
                 async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    let client = match WsClient::connect().await {
-                        Ok(client) => client,
-                        Err(error) => {
-                            return AppMessage::TerminalReconnectFailed(error.to_string());
-                        }
-                    };
-                    let mut mappings = Vec::with_capacity(snapshots.len());
-                    for (old_session_id, rows, cols) in snapshots {
-                        match client
-                            .send(
-                                "SubscribeSession",
-                                serde_json::json!({"session_id": old_session_id}),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                let _ = client
-                                    .send(
-                                        "ResizeSession",
-                                        serde_json::json!({
-                                            "session_id": old_session_id,
-                                            "cols": cols,
-                                            "rows": rows,
-                                        }),
-                                    )
-                                    .await;
-                                mappings.push((old_session_id.clone(), old_session_id, false));
-                            }
-                            Err(error) if error.message.contains("会话不存在") => {
-                                match open_and_subscribe(&client).await {
-                                    Ok(new_session_id) => {
-                                        let _ = client
-                                            .send(
-                                                "ResizeSession",
-                                                serde_json::json!({
-                                                    "session_id": new_session_id,
-                                                    "cols": cols,
-                                                    "rows": rows,
-                                                }),
-                                            )
-                                            .await;
-                                        mappings.push((old_session_id, new_session_id, true));
-                                    }
-                                    Err(error) => {
-                                        return AppMessage::TerminalReconnectFailed(error);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                return AppMessage::TerminalReconnectFailed(error.message);
-                            }
-                        }
+                    match WsClient::connect().await {
+                        Ok(client) => AppMessage::WsConnected(client),
+                        Err(error) => AppMessage::TerminalReconnectFailed(error.to_string()),
                     }
-                    AppMessage::TerminalReconnected { client, mappings }
                 },
                 |message| message,
             )
@@ -2049,9 +2455,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::TerminalReconnected { client, mappings } => {
             app.ws_client = Some(client);
             app.terminal_reconnect_cooldown = None;
+            app.terminal_restore_pending = false;
+            app.terminal_reconnect_in_flight = false;
             app.terminal_error = None;
 
-            for (old_session_id, new_session_id, replaced) in mappings {
+            for (old_session_id, new_session_id, _replaced) in mappings {
                 if let Some(session) = app
                     .terminal_sessions
                     .values_mut()
@@ -2060,8 +2468,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     session.session_id = new_session_id.clone();
                     session.closed = false;
                     session.exit_code = None;
-                    session.notice =
-                        replaced.then(|| app.i18n.tr("terminal_session_replaced").to_string());
+                    // A successful recovery is the normal steady state. Do not
+                    // leave the old disconnect/replacement banner visible.
+                    session.notice = None;
                     let (rows, cols) = (session.grid.rows, session.grid.cols);
                     session.grid.reset(rows, cols);
                     session.cursor_on = true;
@@ -2074,12 +2483,21 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     }
                 }
             }
+            persist_ui_state(app);
             Task::none()
         }
         AppMessage::TerminalReconnectFailed(message) => {
+            app.terminal_reconnect_in_flight = false;
             app.terminal_opening = false;
-            app.terminal_error = Some(app.i18n.trf("terminal_reconnect_failed", &[&message]));
-            Task::none()
+            let display = app.i18n.trf("terminal_reconnect_failed", &[&message]);
+            app.terminal_error = Some(display.clone());
+            app.screen = Screen::ConnectionFailure(s0_connection::State::new(display));
+            Task::perform(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                },
+                |_| AppMessage::TerminalReconnectRetry,
+            )
         }
         AppMessage::TerminalSetupError(message) => {
             app.terminal_opening = false;
@@ -2093,7 +2511,11 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             let Some(client) = app.ws_client.as_ref().cloned() else {
                 return Task::none();
             };
-            let closed_notice = app.i18n.tr("terminal_closed_input").to_string();
+            let closed_notice = if app.terminal_restore_pending {
+                app.i18n.tr("terminal_reconnecting").to_string()
+            } else {
+                app.i18n.tr("terminal_closed_input").to_string()
+            };
             let Some(session) = active_terminal_mut(app) else {
                 return Task::none();
             };
@@ -2234,6 +2656,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             };
             session.closed = true;
             session.exit_code = exit_code;
+            if session.remote_host_id.is_some() && exit_code.is_some_and(|code| code != 0) {
+                session.notice = Some(classify_ssh_failure(&app.i18n, &session.grid.plain_text()));
+            }
             match exit_code {
                 Some(code) => tracing::info!("终端会话 {} 结束, exit_code={}", session_id, code),
                 None => tracing::info!("终端会话 {} 结束, 退出码未知", session_id),
@@ -2481,13 +2906,64 @@ fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppMessage, Screen, Tab, VidaApp, parse_backup_bytes, update};
+    use super::{
+        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, editor_focus_event,
+        parse_backup_bytes, restore_persisted_terminal_layout, suspend_all_terminal_sessions,
+        update,
+    };
     use crate::screens::{s_terminal, s3_main};
     use crate::term::primitive::TerminalAppearance;
     use crate::ws_client::PushMsg;
 
+    fn tab_key_event(modifiers: iced::keyboard::Modifiers) -> iced::Event {
+        use iced::keyboard::{Key, Location, key};
+
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: Key::Named(key::Named::Tab),
+            modified_key: Key::Named(key::Named::Tab),
+            physical_key: key::Physical::Code(key::Code::Tab),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn editor_tab_event_maps_forward_and_reverse_focus() {
+        let forward = editor_focus_event(
+            tab_key_event(iced::keyboard::Modifiers::NONE),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+        let reverse = editor_focus_event(
+            tab_key_event(iced::keyboard::Modifiers::SHIFT),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+
+        assert!(matches!(forward, Some(AppMessage::EditorFocusNext)));
+        assert!(matches!(reverse, Some(AppMessage::EditorFocusPrevious)));
+    }
+
+    #[test]
+    fn editor_tab_event_does_not_capture_command_tab() {
+        let result = editor_focus_event(
+            tab_key_event(iced::keyboard::Modifiers::COMMAND),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+
+        assert!(result.is_none());
+    }
+
     fn app_with_two_terminal_tabs() -> VidaApp {
         let (mut app, _) = super::new();
+        app.tabs.clear();
+        app.terminal_sessions.clear();
+        app.active_tab_id.clear();
+        app.terminal_restore_pending = false;
+        app.ui_state_persistence_enabled = false;
         app.screen = Screen::Main(s3_main::State {
             revealed_credential: None,
             credential_copied: false,
@@ -2502,6 +2978,8 @@ mod tests {
                 tab.id.clone(),
                 s_terminal::TerminalSession::new(
                     session_id.to_string(),
+                    None,
+                    format!("Local terminal {number}"),
                     40,
                     100,
                     TerminalAppearance::default(),
@@ -2529,6 +3007,104 @@ mod tests {
             parse_backup_bytes(&serde_json::json!({"data": [256]})),
             Err(())
         );
+    }
+
+    fn host_item(id: &str, name: &str) -> s3_main::HostItem {
+        s3_main::HostItem {
+            id: id.into(),
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            user: "root".into(),
+            port: 22,
+            tags: Vec::new(),
+            group: None,
+            color: None,
+            auth_kind: "password".into(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn loading_hosts_does_not_create_a_tab_for_every_host() {
+        let mut app = app_with_two_terminal_tabs();
+        app.set_hosts(vec![
+            host_item("host-a", "Server A"),
+            host_item("host-b", "Server B"),
+        ]);
+        assert_eq!(app.tabs.len(), 2);
+
+        let _ = update(&mut app, AppMessage::OpenHostDetail("host-a".into()));
+        assert!(app.tabs.iter().any(|tab| tab.id == "host-a"));
+        app.set_hosts(vec![host_item("host-a", "Renamed")]);
+        assert_eq!(
+            app.tabs.iter().find(|tab| tab.id == "host-a").unwrap().name,
+            "Renamed"
+        );
+    }
+
+    #[test]
+    fn persisted_layout_recreates_local_and_ssh_tab_descriptors() {
+        let mut app = app_with_two_terminal_tabs();
+        app.tabs.clear();
+        app.terminal_sessions.clear();
+        app.active_tab_id.clear();
+        let state = vida_core::config::UiState {
+            recent_host_ids: vec!["host-a".into()],
+            terminal_layout: vec![
+                vida_core::config::TerminalLayoutEntry {
+                    session_id: "saved-local".into(),
+                    host_id: None,
+                    number: 3,
+                },
+                vida_core::config::TerminalLayoutEntry {
+                    session_id: "saved-ssh".into(),
+                    host_id: Some("host-a".into()),
+                    number: 4,
+                },
+            ],
+            active_terminal_session_id: Some("saved-ssh".into()),
+        };
+
+        restore_persisted_terminal_layout(&mut app, &state);
+
+        assert_eq!(app.terminal_sessions.len(), 2);
+        assert_eq!(app.active_tab_id, "terminal:saved-ssh");
+        assert!(app.terminal_restore_pending);
+        assert_eq!(
+            app.terminal_sessions["terminal:saved-ssh"].remote_host_id,
+            Some("host-a".into())
+        );
+    }
+
+    #[test]
+    fn explicit_lock_suspends_but_keeps_terminal_layout() {
+        let mut app = app_with_two_terminal_tabs();
+        suspend_all_terminal_sessions(&mut app);
+
+        assert!(app.terminal_restore_pending);
+        assert_eq!(app.terminal_sessions.len(), 2);
+        assert!(app.terminal_sessions.values().all(|session| session.closed));
+        assert_eq!(
+            app.tabs
+                .iter()
+                .filter(|tab| matches!(tab.kind, crate::screens::TabKind::Terminal { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ssh_failure_classifier_turns_exit_255_output_into_actionable_copy() {
+        let i18n = vida_core::i18n::I18n::new(vida_core::i18n::Lang::ZhCn);
+        assert!(
+            classify_ssh_failure(&i18n, "Permission denied (publickey,password)")
+                .contains("认证失败")
+        );
+        assert!(
+            classify_ssh_failure(&i18n, "ssh: connect to host x port 22: Connection refused")
+                .contains("服务器拒绝")
+        );
+        assert!(classify_ssh_failure(&i18n, "").contains("常见原因"));
     }
 
     #[test]
@@ -2561,5 +3137,40 @@ mod tests {
         assert!(!app.terminal_sessions.contains_key("terminal:session-a"));
         assert!(app.terminal_sessions.contains_key("terminal:session-b"));
         assert_eq!(app.active_tab_id, "terminal:session-b");
+    }
+
+    #[test]
+    fn daemon_disconnect_preserves_terminal_tabs_for_unlock_restore() {
+        let mut app = app_with_two_terminal_tabs();
+        let terminal_tab_ids: Vec<String> = app
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab.kind, crate::screens::TabKind::Terminal { .. }))
+            .map(|tab| tab.id.clone())
+            .collect();
+
+        let _ = update(
+            &mut app,
+            AppMessage::TerminalDisconnected {
+                session_id: "session-a".to_string(),
+            },
+        );
+
+        assert!(app.terminal_restore_pending);
+        assert!(app.terminal_sessions.values().all(|session| session.closed));
+        assert!(
+            terminal_tab_ids
+                .iter()
+                .all(|id| app.tabs.iter().any(|tab| &tab.id == id))
+        );
+
+        let _ = update(&mut app, AppMessage::LockVault);
+        assert!(app.terminal_restore_pending);
+        assert_eq!(app.terminal_sessions.len(), 2);
+        assert!(
+            terminal_tab_ids
+                .iter()
+                .all(|id| app.tabs.iter().any(|tab| &tab.id == id))
+        );
     }
 }

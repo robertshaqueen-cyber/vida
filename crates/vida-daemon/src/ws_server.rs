@@ -194,6 +194,16 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
                         }
                     }
                     PushKind::SessionClosed { exit_code } => {
+                        if !payload.bytes.is_empty()
+                            && let Err(e) = write
+                                .send(Message::Binary(
+                                    tokio_tungstenite::tungstenite::Bytes::from(payload.bytes),
+                                ))
+                                .await
+                        {
+                            error!("Failed to push final binary frame to {}: {}", addr, e);
+                            break;
+                        }
                         // 规格 5.3：shell 退出时推送事件
                         let event = serde_json::json!({
                             "type": "Event",
@@ -620,6 +630,40 @@ async fn handle_pty_request(
         PtyRequest::OpenLocalSession { cols, rows } => {
             let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
             let session_id = pty.open_session(*cols, *rows)?;
+            Ok(serde_json::json!({"session_id": session_id}))
+        }
+        PtyRequest::OpenSshSession {
+            host_id,
+            cols,
+            rows,
+        } => {
+            let host = state.lock().await.host_for_ssh(host_id)?;
+            let auth = match host.auth {
+                vida_core::vault::AuthMethod::Password { password } => {
+                    crate::pty::SshAuth::Password(secrecy::SecretString::from(
+                        password.expose().to_owned(),
+                    ))
+                }
+                vida_core::vault::AuthMethod::Key {
+                    private_key_path,
+                    passphrase,
+                } => crate::pty::SshAuth::KeyFile {
+                    path: private_key_path,
+                    passphrase: passphrase
+                        .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
+                },
+                vida_core::vault::AuthMethod::KeyInline {
+                    private_key,
+                    passphrase,
+                } => crate::pty::SshAuth::InlineKey {
+                    private_key: secrecy::SecretString::from(private_key.expose().to_owned()),
+                    passphrase: passphrase
+                        .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
+                },
+            };
+            let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+            let session_id =
+                pty.open_ssh_session(*cols, *rows, &host.host, &host.user, host.port, auth)?;
             Ok(serde_json::json!({"session_id": session_id}))
         }
         PtyRequest::SessionInput { session_id, data } => {

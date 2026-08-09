@@ -106,7 +106,7 @@ else:
 |---|---|
 | `OpenLocalSession { cols, rows }` | 打开会话（固定 $SHELL，cwd=HOME） |
 | `SessionInput { session_id, data }` | 原始字节输入 |
-| `PasteSession { session_id, data }` | 剪贴板输入；按当前 TermMode 应用 bracketed-paste 保护 |
+| `PasteSession { session_id, data }` | 剪贴板输入；按当前 TermMode 应用 bracketed-paste，未启用时安全折叠换行 |
 | `ResizeSession { session_id, cols, rows }` | 调整尺寸 |
 | `CloseSession { session_id }` | 关闭会话 |
 | `ListSessions` | 列出所有会话 |
@@ -114,6 +114,9 @@ else:
 | `ReadScreenStyled { session_id }` | 带样式快照（**消费者：M2b GUI 渲染**） |
 | `SubscribeSession { session_id }` | 订阅推送：立即回全量，此后增量 |
 | `UnsubscribeSession { session_id }` | 取消订阅 |
+
+终端二进制帧同时携带 `viewport_start`：当前可见第 0 行在 daemon 回滚历史中的稳定行号。
+GUI 用它维护跨屏选择；只保存屏幕相对行号会在滚动后复制错误内容。
 
 ### 两个读取接口的分工（防漂移约定）
 

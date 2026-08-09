@@ -1,4 +1,4 @@
-//! 正式终端标签内容（M2b-3）：显示并操作一个本地会话。
+//! 正式终端标签内容：显示并操作本地或 SSH 会话。
 
 use std::sync::Arc;
 
@@ -16,6 +16,10 @@ use crate::ui::{self, icons};
 #[derive(Debug, Clone)]
 pub struct TerminalSession {
     pub session_id: String,
+    /// None 表示本地终端；Some(host_id) 表示 SSH 终端，供 daemon 重启后按原主机恢复。
+    pub remote_host_id: Option<String>,
+    /// 工具栏显示名称（本地终端或主机名称）。
+    pub title: String,
     pub grid: ClientGrid,
     /// 会话是否已结束（session_closed 事件）。
     pub closed: bool,
@@ -30,9 +34,18 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub fn new(session_id: String, rows: u16, cols: u16, appearance: TerminalAppearance) -> Self {
+    pub fn new(
+        session_id: String,
+        remote_host_id: Option<String>,
+        title: String,
+        rows: u16,
+        cols: u16,
+        appearance: TerminalAppearance,
+    ) -> Self {
         Self {
             session_id,
+            remote_host_id,
+            title,
             grid: ClientGrid::new(rows, cols),
             closed: false,
             exit_code: None,
@@ -57,9 +70,13 @@ impl TerminalSession {
     /// 渲染终端画面 + 会话状态栏。
     pub fn view<'a>(&'a self, i18n: &'a I18n) -> Element<'a, AppMessage> {
         let status = if self.closed {
-            let code_text = match self.exit_code {
-                Some(code) => i18n.trf("terminal_closed_code", &[&code.to_string()]),
-                None => i18n.tr("terminal_closed_unknown").to_string(),
+            let code_text = if self.remote_host_id.is_some() {
+                i18n.tr("terminal_ssh_ended").to_string()
+            } else {
+                match self.exit_code {
+                    Some(code) => i18n.trf("terminal_closed_code", &[&code.to_string()]),
+                    None => i18n.tr("terminal_closed_unknown").to_string(),
+                }
             };
             text(code_text).size(11).color(ui::DANGER)
         } else {
@@ -68,7 +85,7 @@ impl TerminalSession {
         let toolbar = container(
             row![
                 icons::icon(icons::TERMINAL, 15).color(ui::ACCENT),
-                text(i18n.tr("terminal_local_title")).size(13),
+                text(&self.title).size(13),
                 Space::new().width(Length::Fill),
                 status,
             ]
@@ -103,11 +120,26 @@ impl TerminalSession {
             ..Default::default()
         });
         let notice_el: Element<'_, AppMessage> = match &self.notice {
-            Some(n) => container(text(n).size(12))
-                .padding([7, 12])
-                .width(Length::Fill)
-                .style(ui::surface)
-                .into(),
+            Some(n) => {
+                let mut notice = row![text(n).size(12).width(Length::Fill)]
+                    .spacing(10)
+                    .align_y(Alignment::Center);
+                if self.closed
+                    && let Some(host_id) = &self.remote_host_id
+                {
+                    notice = notice.push(
+                        iced::widget::button(i18n.tr("terminal_edit_host"))
+                            .on_press(AppMessage::EditHost(host_id.clone()))
+                            .style(ui::secondary_button)
+                            .padding([7, 10]),
+                    );
+                }
+                container(notice)
+                    .padding([7, 12])
+                    .width(Length::Fill)
+                    .style(ui::surface)
+                    .into()
+            }
             None => container(Space::new()).height(0).into(),
         };
         let content = column![toolbar, notice_el, canvas]

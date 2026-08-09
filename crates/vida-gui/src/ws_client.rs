@@ -193,9 +193,9 @@ impl WsClient {
 
             loop {
                 tokio::select! {
-                    Some(msg) = ws_read.next() => {
+                    msg = ws_read.next() => {
                         match msg {
-                            Ok(Message::Text(text)) => {
+                            Some(Ok(Message::Text(text))) => {
                                 match serde_json::from_str::<WsResponse>(&text) {
                                     Ok(WsResponse::Ok { id, result }) => {
                                         if let Some(sender) = pending.remove(&id) {
@@ -211,24 +211,33 @@ impl WsClient {
                                     Err(_) => forward_text_push(&text, &push_registry_task),
                                 }
                             }
-                            Ok(Message::Binary(bytes)) => {
+                            Some(Ok(Message::Binary(bytes))) => {
                                 forward_binary_push(&bytes, &push_registry_task);
                             }
-                            Ok(Message::Close(_)) => break,
-                            Err(_) => break,
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                             _ => {}
                         }
                     }
-                    Some((req, response_tx)) = rx.recv() => {
-                        let id = req.id;
-                        pending.insert(id, response_tx);
-                        let text = serde_json::to_string(&req).unwrap();
-                        if ws_write.send(Message::Text(text.into())).await.is_err() {
-                            break;
+                    request = rx.recv() => {
+                        match request {
+                            Some((req, response_tx)) => {
+                                let id = req.id;
+                                pending.insert(id, response_tx);
+                                let text = serde_json::to_string(&req).unwrap();
+                                if ws_write.send(Message::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
                         }
                     }
                 }
             }
+
+            // The registry owns every terminal subscription sender. If it is
+            // kept alive after the socket task exits, the GUI waits forever on
+            // a dead connection and never enters its reconnect flow.
+            close_push_subscriptions(&push_registry_task);
         });
 
         Ok(Self { tx, push_registry })
@@ -374,6 +383,16 @@ impl WsClient {
     }
 }
 
+/// Drop every terminal push sender when the underlying WebSocket exits.
+/// Receivers wake with `None` and report the disconnect to the GUI.
+fn close_push_subscriptions(registry: &PushRegistry) {
+    let mut reg = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.clear();
+}
+
 /// 二进制帧头格式（与 daemon encode_frame 对应）：
 /// [0x01][session_id_len: u16 BE][session_id][payload]
 fn decode_frame_header(bytes: &[u8]) -> Option<(String, &[u8])> {
@@ -475,4 +494,26 @@ fn read_port() -> Result<u16> {
         .parse()
         .with_context(|| format!("守护进程端口格式无效: '{}'", port_str.trim()))?;
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PushRegistry, close_push_subscriptions};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn websocket_exit_closes_terminal_subscription_receivers() {
+        let registry: PushRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        registry.lock().unwrap().insert("session-1".to_string(), tx);
+
+        close_push_subscriptions(&registry);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
 }

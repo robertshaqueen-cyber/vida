@@ -38,6 +38,34 @@
 | vida GUI 空窗口 (1024×768) | **33.1M** | 含 iced chrome (~6M) |
 | vida daemon | **7 MB** | 无 GPU |
 
+### M3 release 实测（系统 SSH 接入）
+
+**环境**：macOS，1920×1080 @1x；release 构建；Vida GUI 与 daemon 启动并稳定空闲。
+
+| 组件 | Physical footprint | 说明 |
+|---|---:|---|
+| vida GUI | **35.9M** | M3 界面与终端渲染资源已加载，未打开 SSH 标签 |
+| vida daemon | **3104K** | 金库/PTY/SSH askpass broker 代码已加载，无活动 SSH 会话 |
+
+本里程碑仍以 `vmmap --summary <pid>` 的 `Physical footprint` 为唯一指标。
+活动 SSH 标签的 GUI 网格与本地终端使用同一数据结构；多 SSH 标签实测需所有者使用实际
+测试主机完成 README 的 M3 手动验收后补录，不能用 RSS 或无真实连接的估算值代替。
+
+#### M3 最终验收复测（2026-08-09）
+
+所有者完成真实 SSH、本地/SSH 多会话隔离、daemon 重启恢复、锁定恢复、滚动选择和
+布局/最近访问持久化验收后，使用最终 release 构建复测。环境为 macOS、1920×1080、
+显示器 scale factor=1；唯一指标仍为 `vmmap --summary <pid>` 的 Physical footprint。
+
+| 场景 | Physical footprint | 峰值 |
+|---|---:|---:|
+| Vida GUI，一个默认本地终端、稳定空闲 | **263.1M** | **263.3M** |
+| vida-daemon，同一时刻运行 | **6592K** | 不采用旧进程累计峰值 |
+
+同时重新运行 `vida-daemon/examples/term_probe`：`size_of::<Cell>() = 24` 字节。
+5000 行 × 200 列满载纯 Cell 增量为 **24,000,000 字节（约 22.9 MiB）**，尚未计入
+行容器索引等少量开销；默认 3000 行配置仍低于该满载场景。
+
 **内存构成**（vmmap dirty 区域分析）：
 
 | 区域 | 大小 | 说明 |

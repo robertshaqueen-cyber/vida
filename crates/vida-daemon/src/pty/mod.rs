@@ -19,7 +19,9 @@
 pub mod push;
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -30,6 +32,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -60,6 +63,33 @@ struct IoState {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
+#[derive(Default)]
+struct SessionCleanup {
+    askpass: Option<crate::ssh_auth::AskpassBroker>,
+    temp_files: Vec<PathBuf>,
+}
+
+impl SessionCleanup {
+    fn run(&mut self) {
+        if let Some(mut askpass) = self.askpass.take() {
+            askpass.stop();
+        }
+        for path in self.temp_files.drain(..) {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("SSH 临时密钥清理失败: {}", error);
+            }
+        }
+    }
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
 /// 会话内部状态（锁拆分：term + io 两把独立 Mutex）。
 pub(crate) struct SessionInner {
     id: String,
@@ -67,6 +97,7 @@ pub(crate) struct SessionInner {
     rows: u16,
     term: Mutex<TermState>,
     io: Mutex<IoState>,
+    cleanup: Mutex<SessionCleanup>,
     /// shell 是否已退出。
     closed: AtomicBool,
     /// 退出码（shell 自行退出或 CloseSession 时记录）。
@@ -157,6 +188,18 @@ pub struct SessionInfo {
     pub foreground_process: Option<String>,
 }
 
+pub enum SshAuth {
+    Password(SecretString),
+    KeyFile {
+        path: String,
+        passphrase: Option<SecretString>,
+    },
+    InlineKey {
+        private_key: SecretString,
+        passphrase: Option<SecretString>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // PtyManager
 // ---------------------------------------------------------------------------
@@ -204,11 +247,163 @@ fn detect_shell() -> String {
     "/bin/sh".to_string()
 }
 
+fn ssh_args(
+    host: &str,
+    user: &str,
+    port: u16,
+    private_key_path: Option<&str>,
+    password_only: bool,
+) -> Result<Vec<String>> {
+    fn validate(label: &str, value: &str) -> Result<()> {
+        if value.is_empty() || value.starts_with('-') || value.chars().any(char::is_control) {
+            anyhow::bail!("SSH {}无效，请检查主机配置", label);
+        }
+        Ok(())
+    }
+
+    validate("地址", host)?;
+    validate("用户名", user)?;
+    if port == 0 {
+        anyhow::bail!("SSH 端口不能为 0，请检查主机配置");
+    }
+    let mut args = vec![
+        "-p".to_string(),
+        port.to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=30".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+    if password_only {
+        args.extend([
+            "-o".to_string(),
+            "PreferredAuthentications=password,keyboard-interactive".to_string(),
+            "-o".to_string(),
+            "PubkeyAuthentication=no".to_string(),
+        ]);
+    } else if let Some(path) = private_key_path {
+        if path.is_empty() || path.chars().any(char::is_control) {
+            anyhow::bail!("SSH 私钥路径无效，请检查主机配置");
+        }
+        args.extend([
+            "-i".to_string(),
+            path.to_string(),
+            "-o".to_string(),
+            "IdentitiesOnly=yes".to_string(),
+        ]);
+    }
+    args.extend(["-l".to_string(), user.to_string(), host.to_string()]);
+    Ok(args)
+}
+
+fn write_inline_key_in(directory: &std::path::Path, contents: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory).context("无法创建 SSH 临时密钥目录")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = directory.join(format!("{}.key", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).context("无法创建 SSH 临时密钥文件")?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|_| file.flush())
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err(error).context("无法写入 SSH 临时密钥文件");
+    }
+    Ok(path)
+}
+
+fn write_inline_key(contents: &str) -> Result<PathBuf> {
+    write_inline_key_in(&vida_core::config::config_dir()?.join("ssh-keys"), contents)
+}
+
+/// Remove only Vida-owned ephemeral inline-key files left by an unclean prior
+/// daemon exit. Never traverses outside the dedicated `ssh-keys` directory.
+pub fn cleanup_stale_inline_keys() -> Result<usize> {
+    let directory = vida_core::config::config_dir()?.join("ssh-keys");
+    if !directory.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&directory).context("无法检查 SSH 临时密钥目录")? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path.extension().is_some_and(|extension| extension == "key")
+        {
+            std::fs::remove_file(&path).context("无法清理上次遗留的 SSH 临时密钥")?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[allow(unused_mut)]
 impl PtyManager {
     /// 打开本地 shell 会话。命令固定 $SHELL，不接受客户端指定；
     /// cwd 固定 HOME（decisions.md 结论 6）。
     pub fn open_session(&mut self, cols: u16, rows: u16) -> Result<String> {
+        let shell = detect_shell();
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.env("TERM", "xterm-256color");
+        self.open_command_session(cols, rows, cmd, "本地", SessionCleanup::default())
+    }
+
+    /// 通过系统 OpenSSH 打开远程终端。参数直接传给进程，不经过 shell 拼接。
+    pub fn open_ssh_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        host: &str,
+        user: &str,
+        port: u16,
+        auth: SshAuth,
+    ) -> Result<String> {
+        let mut cleanup = SessionCleanup::default();
+        let (private_key_path, password_only, askpass_secret) = match auth {
+            SshAuth::Password(password) => (None, true, Some(password)),
+            SshAuth::KeyFile { path, passphrase } => (Some(path), false, passphrase),
+            SshAuth::InlineKey {
+                private_key,
+                passphrase,
+            } => {
+                let path = write_inline_key(private_key.expose_secret())?;
+                cleanup.temp_files.push(path.clone());
+                (Some(path.to_string_lossy().into_owned()), false, passphrase)
+            }
+        };
+        let args = ssh_args(host, user, port, private_key_path.as_deref(), password_only)?;
+        let mut cmd = CommandBuilder::new("ssh");
+        cmd.args(args);
+        cmd.env("TERM", "xterm-256color");
+        if let Some(secret) = askpass_secret {
+            let (broker, env) = crate::ssh_auth::AskpassBroker::start(secret)?;
+            crate::ssh_auth::apply_env(&mut cmd, &env)?;
+            cleanup.askpass = Some(broker);
+        }
+        self.open_command_session(cols, rows, cmd, "SSH", cleanup)
+            .context("无法启动系统 ssh；请确认 OpenSSH 客户端已安装并可从 PATH 找到")
+    }
+
+    fn open_command_session(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cmd: CommandBuilder,
+        kind: &str,
+        cleanup: SessionCleanup,
+    ) -> Result<String> {
         validate_size(cols, rows)?;
 
         // --- PTY ---
@@ -221,14 +416,10 @@ impl PtyManager {
             })
             .context("openpty 失败")?;
 
-        // --- shell（固定 $SHELL，cwd=HOME）---
-        let shell = detect_shell();
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.env("TERM", "xterm-256color");
         let child = pair
             .slave
             .spawn_command(cmd)
-            .with_context(|| format!("spawn {} 失败", shell))?;
+            .with_context(|| format!("启动{}会话进程失败", kind))?;
         drop(pair.slave);
 
         // --- Term + Processor ---
@@ -264,6 +455,7 @@ impl PtyManager {
                 master: Some(pair.master),
                 child: Some(child),
             }),
+            cleanup: Mutex::new(cleanup),
             closed: AtomicBool::new(false),
             exit_code: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
@@ -273,7 +465,7 @@ impl PtyManager {
         // 泵线程：消费 PTY 输出 → advance Term
         let pump_session = Arc::clone(&session);
         let pump_id = id.clone();
-        thread::spawn(move || {
+        let pump_handle = thread::spawn(move || {
             for bytes in rx {
                 let inner = match pump_session.lock() {
                     Ok(g) => g,
@@ -312,12 +504,17 @@ impl PtyManager {
                     Err(_) => break, // 读错误（PTY 关闭）
                 }
             }
+            // All bytes read before EOF must reach the terminal model before
+            // SessionClosed is emitted. Otherwise short-lived failures such as
+            // `ssh: connect ... refused` can disappear behind exit_code=255.
+            drop(tx);
+            let _ = pump_handle.join();
             // EOF 到达：回收会话
             finalize_session(reader_session);
         });
 
         self.sessions.insert(id.clone(), session);
-        info!("会话 {} 已打开 ({}×{})", id, cols, rows);
+        info!("{} 会话 {} 已打开 ({}×{})", kind, id, cols, rows);
         Ok(id)
     }
 
@@ -339,10 +536,11 @@ impl PtyManager {
         Ok(())
     }
 
-    /// 粘贴文本：仅当终端应用启用了 bracketed-paste 时加保护边界。
+    /// 粘贴文本：终端应用启用 bracketed-paste 时加保护边界，否则使用安全回退。
     ///
     /// 与 `session_input` 分开，确保普通键盘输入继续严格原始透传。保护模式下
-    /// 移除 ESC，防止剪贴板内容伪造结束边界后注入额外控制序列。
+    /// 移除 ESC，防止剪贴板内容伪造结束边界后注入额外控制序列。未启用保护
+    /// 模式时把换行折叠为空格，避免 shell 把多行剪贴板立即逐行执行。
     pub fn paste_session(&self, session_id: &str, data: &[u8]) -> Result<()> {
         let session = self
             .sessions
@@ -460,6 +658,10 @@ impl PtyManager {
                 }
                 Err(e) => warn!("会话 {} wait 失败: {}", session_id, e),
             }
+        }
+        drop(io);
+        if let Ok(mut cleanup) = inner.cleanup.lock() {
+            cleanup.run();
         }
         info!("会话 {} 已关闭", session_id);
         Ok(())
@@ -624,7 +826,23 @@ impl PtyManager {
 
 fn encode_paste(data: &[u8], bracketed: bool) -> Vec<u8> {
     if !bracketed {
-        return data.to_vec();
+        let mut encoded = Vec::with_capacity(data.len());
+        let mut line_break = false;
+        for byte in data.iter().copied().filter(|byte| *byte != 0x1b) {
+            if matches!(byte, b'\r' | b'\n') {
+                line_break = true;
+                continue;
+            }
+            if line_break && encoded.last().is_some_and(|last| *last != b' ') {
+                encoded.push(b' ');
+            }
+            line_break = false;
+            encoded.push(byte);
+        }
+        if line_break && encoded.last().is_some_and(|last| *last != b' ') {
+            encoded.push(b' ');
+        }
+        return encoded;
     }
     const START: &[u8] = b"\x1b[200~";
     const END: &[u8] = b"\x1b[201~";
@@ -700,14 +918,30 @@ fn finalize_session(session: Arc<Mutex<SessionInner>>) {
     {
         *ec = Some(c);
     }
+    if let Ok(mut cleanup) = inner.cleanup.lock() {
+        cleanup.run();
+    }
+
+    // Package one authoritative final screen with SessionClosed after the pump
+    // has consumed every PTY byte. The WebSocket layer writes these bytes first,
+    // so a short-lived SSH error cannot disappear behind exit_code=255.
+    let (final_seq, final_bytes) = {
+        let term = match inner.term.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = build_full_frame(&term.term, seq);
+        (seq, encode_frame(&inner.id, &frame))
+    };
 
     // 推送 session_closed 事件到所有订阅者
     let event_payload = PushPayload {
-        frame_seq: inner.next_seq.load(Ordering::Relaxed),
+        frame_seq: final_seq,
         kind: push::PushKind::SessionClosed {
             exit_code: exit_code.unwrap_or(0),
         },
-        bytes: Vec::new(),
+        bytes: final_bytes,
     };
     let mut subs = match inner.subscribers.lock() {
         Ok(g) => g,
@@ -799,7 +1033,12 @@ mod tests {
 
     #[test]
     fn paste_encoding_respects_mode_and_blocks_escape_injection() {
-        assert_eq!(encode_paste(b"one\ntwo", false), b"one\ntwo");
+        assert_eq!(encode_paste(b"one\ntwo", false), b"one two");
+        assert_eq!(
+            encode_paste(b"one\r\ntwo\rthree\n", false),
+            b"one two three "
+        );
+        assert_eq!(encode_paste(b"one\x1b[201~two", false), b"one[201~two");
         assert_eq!(
             encode_paste(b"one\n\x1b[201~two", true),
             b"\x1b[200~one\n[201~two\x1b[201~"
@@ -854,6 +1093,77 @@ mod tests {
         assert_eq!(info.len(), 1);
         assert!(info[0].alive);
         pm.close_session(&id).unwrap();
+    }
+
+    #[test]
+    fn ssh_arguments_are_structured_and_reject_option_injection() {
+        let args = ssh_args(
+            "server.example",
+            "deploy",
+            2222,
+            Some("/tmp/test key"),
+            false,
+        )
+        .expect("valid ssh args");
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "2222",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-i",
+                "/tmp/test key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-l",
+                "deploy",
+                "server.example",
+            ]
+        );
+        assert!(ssh_args("-oProxyCommand=bad", "deploy", 22, None, false).is_err());
+        assert!(ssh_args("server.example", "-V", 22, None, false).is_err());
+        assert!(ssh_args("server.example", "deploy", 0, None, false).is_err());
+
+        let password_args = ssh_args("server.example", "deploy", 22, None, true).unwrap();
+        assert!(
+            password_args
+                .iter()
+                .any(|arg| arg == "PubkeyAuthentication=no")
+        );
+        assert!(
+            password_args
+                .iter()
+                .any(|arg| arg == "PreferredAuthentications=password,keyboard-interactive")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_key_is_private_and_cleanup_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_inline_key_in(directory.path(), "PRIVATE KEY CONTENT").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "PRIVATE KEY CONTENT"
+        );
+
+        let mut cleanup = SessionCleanup {
+            askpass: None,
+            temp_files: vec![path.clone()],
+        };
+        cleanup.run();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1119,6 +1429,10 @@ mod tests {
                 Some(payload) => {
                     if let push::PushKind::SessionClosed { exit_code } = payload.kind {
                         assert_eq!(exit_code, 0, "exit 应返回 0");
+                        assert!(
+                            !payload.bytes.is_empty(),
+                            "结束事件必须携带最终屏幕，WebSocket 会先发送该帧"
+                        );
                         got_event = true;
                     }
                 }
@@ -1129,6 +1443,33 @@ mod tests {
 
         // 3. 无僵尸：child 已被 wait（try_wait 返回 Some）
         // 通过再次 close 验证：若已回收，close 直接成功（幂等分支）
+        pm.close_session(&id).unwrap();
+    }
+
+    #[test]
+    fn short_lived_process_output_is_applied_before_session_closes() {
+        let mut pm = PtyManager::default();
+        let id = pm.open_session(80, 24).unwrap();
+        pm.session_input(&id, b"printf 'FINAL_SSH_ERROR_MARKER\\n' >&2; exit 255\r")
+            .unwrap();
+        thread::sleep(Duration::from_millis(1000));
+
+        let screen = pm.read_screen(&id).unwrap();
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("FINAL_SSH_ERROR_MARKER")),
+            "进程退出前的最后错误不能被 closed 状态抢先丢弃: {:?}",
+            screen.lines
+        );
+        assert_eq!(
+            pm.list_sessions()
+                .into_iter()
+                .find(|session| session.session_id == id)
+                .and_then(|session| session.exit_code),
+            Some(255)
+        );
         pm.close_session(&id).unwrap();
     }
 

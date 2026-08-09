@@ -279,7 +279,7 @@ impl State {
 
     /// Hosts are business data on VidaApp; the screen reads them from the
     /// caller instead of caching a snapshot (prevents stale lists).
-    pub fn view(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
+    pub fn view<'a>(&'a self, i18n: &'a I18n, hosts: &'a [HostItem]) -> Element<'a, AppMessage> {
         let sidebar = self.view_sidebar(i18n);
         let content = self.view_content(i18n, hosts);
 
@@ -333,7 +333,11 @@ impl State {
             .into()
     }
 
-    fn view_content(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
+    fn view_content<'a>(
+        &'a self,
+        i18n: &'a I18n,
+        hosts: &'a [HostItem],
+    ) -> Element<'a, AppMessage> {
         let content: Element<'_, AppMessage> = match self.active_section {
             SettingsSection::Application => self.view_application(i18n),
             SettingsSection::Connections => self.view_connections(i18n, hosts),
@@ -417,7 +421,11 @@ impl State {
         )
     }
 
-    fn view_connections(&self, i18n: &I18n, hosts: &[HostItem]) -> Element<'_, AppMessage> {
+    fn view_connections<'a>(
+        &'a self,
+        i18n: &'a I18n,
+        hosts: &'a [HostItem],
+    ) -> Element<'a, AppMessage> {
         let title = text(i18n.tr("settings_connections")).size(20);
 
         let mut items: Vec<Element<'_, AppMessage>> = Vec::new();
@@ -444,28 +452,7 @@ impl State {
                     .into(),
             );
             for host in &ungrouped {
-                let label = row![
-                    container(icons::icon(icons::SERVER, 15).color(ui::ACCENT))
-                        .center_x(34)
-                        .center_y(34)
-                        .style(ui::accent_badge),
-                    column![
-                        text(host.name.clone()).size(14),
-                        ui::muted(format!("{}@{}", host.user, host.host)).size(12),
-                    ]
-                    .spacing(2)
-                    .width(Length::Fill),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center)
-                .width(Length::Fill);
-                items.push(
-                    button(label)
-                        .style(ui::nav_item(false))
-                        .padding([8, 10])
-                        .width(Length::Fill)
-                        .into(),
-                );
+                items.push(connection_host_item(host, i18n));
             }
         }
 
@@ -477,28 +464,7 @@ impl State {
                 items.push(rule::horizontal(1).into());
                 items.push(text(group_name.clone()).size(13).into());
                 for host in hosts {
-                    let label = row![
-                        container(icons::icon(icons::SERVER, 15).color(ui::ACCENT))
-                            .center_x(34)
-                            .center_y(34)
-                            .style(ui::accent_badge),
-                        column![
-                            text(host.name.clone()).size(14),
-                            ui::muted(format!("{}@{}", host.user, host.host)).size(12),
-                        ]
-                        .spacing(2)
-                        .width(Length::Fill),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center)
-                    .width(Length::Fill);
-                    items.push(
-                        button(label)
-                            .style(ui::nav_item(false))
-                            .padding([8, 10])
-                            .width(Length::Fill)
-                            .into(),
-                    );
+                    items.push(connection_host_item(host, i18n));
                 }
             }
         }
@@ -742,6 +708,67 @@ impl State {
         let title = text(i18n.tr("backup_page_title")).size(20);
         settings_section(title, self.backup.view_settings_content(i18n))
     }
+}
+
+fn connection_host_item<'a>(host: &'a HostItem, i18n: &'a I18n) -> Element<'a, AppMessage> {
+    let identity = row![
+        container(icons::icon(icons::SERVER, 15).color(ui::ACCENT))
+            .center_x(34)
+            .center_y(34)
+            .style(ui::accent_badge),
+        column![
+            text(host.name.clone()).size(14),
+            ui::muted(format!("{}@{}:{}", host.user, host.host, host.port)).size(12),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+    let connect = button(
+        row![
+            icons::icon(icons::TERMINAL, 13),
+            text(i18n.tr("main_connect")).size(12),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press(AppMessage::OpenSshTerminal(host.id.clone()))
+    .style(ui::primary_button)
+    .padding([7, 10]);
+    let details = button(
+        row![
+            icons::icon(icons::EYE, 13),
+            text(i18n.tr("main_details")).size(12),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press(AppMessage::OpenHostDetail(host.id.clone()))
+    .style(ui::secondary_button)
+    .padding([7, 10]);
+    let edit = button(
+        row![
+            icons::icon(icons::PENCIL, 13),
+            text(i18n.tr("main_edit")).size(12),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press(AppMessage::EditHost(host.id.clone()))
+    .style(ui::secondary_button)
+    .padding([7, 10]);
+
+    container(
+        row![identity, connect, edit, details]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .padding([8, 10])
+    .width(Length::Fill)
+    .style(ui::surface)
+    .into()
 }
 
 fn settings_section<'a>(

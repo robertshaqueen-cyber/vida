@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! [seq: u64 BE][cursor_row: u16][cursor_col: u16][cursor_visible: u8]
+//! [viewport_start: u64 BE]
 //! [line_count: u16]
 //!   每行：
 //!     [row: u16][start_col: u16][end_col: u16]
@@ -61,6 +62,7 @@ pub struct TerminalFrame {
     pub cursor_row: u16,
     pub cursor_col: u16,
     pub cursor_visible: bool,
+    pub viewport_start: u64,
     pub lines: Vec<LineUpdate>,
 }
 
@@ -112,6 +114,7 @@ pub fn decode_frame(payload: &[u8]) -> Option<TerminalFrame> {
         0 => false,
         _ => return None,
     };
+    let viewport_start = r.u64()?;
     let line_count = r.u16()?;
     let mut lines = Vec::with_capacity(line_count as usize);
     for _ in 0..line_count {
@@ -153,6 +156,7 @@ pub fn decode_frame(payload: &[u8]) -> Option<TerminalFrame> {
         cursor_row,
         cursor_col,
         cursor_visible,
+        viewport_start,
         lines,
     })
 }
@@ -203,5 +207,26 @@ pub fn expand_run(run: &Run, cells: &mut Vec<ClientCell>, cols: u16) {
                 remaining -= 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_frame;
+
+    #[test]
+    fn frame_decodes_viewport_history_origin() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7_u64.to_be_bytes());
+        payload.extend_from_slice(&2_u16.to_be_bytes());
+        payload.extend_from_slice(&3_u16.to_be_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&42_u64.to_be_bytes());
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+
+        let frame = decode_frame(&payload).expect("frame should decode");
+        assert_eq!(frame.seq, 7);
+        assert_eq!(frame.viewport_start, 42);
+        assert!(frame.lines.is_empty());
     }
 }

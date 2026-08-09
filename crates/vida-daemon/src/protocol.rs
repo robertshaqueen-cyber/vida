@@ -88,6 +88,12 @@ pub enum Request {
 pub enum PtyRequest {
     /// Open a local shell session. Fixed $SHELL, cwd=HOME.
     OpenLocalSession { cols: u16, rows: u16 },
+    /// Open a configured host through the system OpenSSH client.
+    OpenSshSession {
+        host_id: String,
+        cols: u16,
+        rows: u16,
+    },
     /// Send raw bytes to a session (no line/byte conversion).
     SessionInput { session_id: String, data: Vec<u8> },
     /// Paste text, honoring the terminal's bracketed-paste mode.
@@ -149,7 +155,7 @@ pub enum ResponsePayload {
 // Supporting types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HostRequest {
     pub id: Option<String>,
     pub name: String,
@@ -163,7 +169,70 @@ pub struct HostRequest {
     /// None = keep existing (update only). Some = replace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// New credential shape. `None` keeps the existing credential on update.
+    /// `password` above remains accepted for wire compatibility with older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<HostAuthRequest>,
     pub notes: Option<String>,
+}
+
+impl std::fmt::Debug for HostRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostRequest")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("port", &self.port)
+            .field("tags", &self.tags)
+            .field("group", &self.group)
+            .field("color", &self.color)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("auth", &self.auth)
+            .field("notes", &self.notes)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostAuthRequest {
+    Password {
+        password: String,
+    },
+    Key {
+        private_key_path: String,
+        passphrase: Option<String>,
+    },
+    KeyInline {
+        private_key: String,
+        passphrase: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for HostAuthRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password { .. } => formatter
+                .debug_struct("Password")
+                .field("password", &"[REDACTED]")
+                .finish(),
+            Self::Key {
+                private_key_path,
+                passphrase,
+            } => formatter
+                .debug_struct("Key")
+                .field("private_key_path", private_key_path)
+                .field("passphrase", &passphrase.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+            Self::KeyInline { passphrase, .. } => formatter
+                .debug_struct("KeyInline")
+                .field("private_key", &"[REDACTED]")
+                .field("passphrase", &passphrase.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +312,21 @@ mod tests {
         );
         assert!(back.contains("\"cols\":80"), "serialized: {}", back);
 
+        let json =
+            r#"{"method":"OpenSshSession","params":{"host_id":"host-1","cols":100,"rows":30}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Pty(PtyRequest::OpenSshSession {
+                host_id,
+                cols,
+                rows,
+            }) => {
+                assert_eq!(host_id, "host-1");
+                assert_eq!((cols, rows), (100, 30));
+            }
+            other => panic!("expected Pty(OpenSshSession), got {:?}", other),
+        }
+
         // SessionInput（data 是字节数组）
         let json =
             r#"{"method":"SessionInput","params":{"session_id":"abc","data":[101,99,104,111]}}"#;
@@ -283,5 +367,30 @@ mod tests {
             Request::Auth { token } => assert_eq!(token, "xyz"),
             other => panic!("expected Auth, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn host_request_debug_redacts_every_credential_shape() {
+        let request = HostRequest {
+            id: None,
+            name: "server".to_string(),
+            host: "server.example".to_string(),
+            user: "deploy".to_string(),
+            port: 22,
+            tags: vec![],
+            group: None,
+            color: None,
+            password: Some("legacy-secret".to_string()),
+            auth: Some(HostAuthRequest::KeyInline {
+                private_key: "private-key-secret".to_string(),
+                passphrase: Some("key-passphrase-secret".to_string()),
+            }),
+            notes: None,
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("legacy-secret"));
+        assert!(!debug.contains("private-key-secret"));
+        assert!(!debug.contains("key-passphrase-secret"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }

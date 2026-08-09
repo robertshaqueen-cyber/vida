@@ -6,7 +6,7 @@ use vida_core::config;
 use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
 use vida_core::vault::{AuthMethod, Settings, Vault};
 
-use crate::protocol::{ConflictChoice, HostRequest, HostSummary, VaultStatusInfo};
+use crate::protocol::{ConflictChoice, HostAuthRequest, HostRequest, HostSummary, VaultStatusInfo};
 
 // ---------------------------------------------------------------------------
 // DaemonState — shared across all WebSocket connections
@@ -307,6 +307,17 @@ impl DaemonState {
         }
     }
 
+    /// Return an owned host profile for launching SSH after releasing the vault lock.
+    pub fn host_for_ssh(&self, host_id: &str) -> Result<vida_core::vault::HostEntry> {
+        let vault = self.ensure_unlocked()?;
+        vault
+            .hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .cloned()
+            .context(self.i18n.tr("daemon_host_not_found"))
+    }
+
     pub fn update_host(&mut self, req: HostRequest) -> Result<HostSummary> {
         let passphrase = self.ensure_passphrase()?.to_string();
         let vault_path = self.vault_path.clone();
@@ -328,17 +339,20 @@ impl DaemonState {
             host.group = req.group;
             host.color = req.color;
             host.notes = req.notes;
-            if let Some(password) = req.password {
+            if let Some(auth) = req.auth {
+                host.auth = auth_request_into_method(auth)?;
+            } else if let Some(password) = req.password {
                 host.auth = AuthMethod::Password {
                     password: vida_core::vault::SecureString::new(password),
                 };
             }
         } else {
-            let auth = match req.password {
-                Some(p) => AuthMethod::Password {
-                    password: vida_core::vault::SecureString::new(p),
+            let auth = match (req.auth, req.password) {
+                (Some(auth), _) => auth_request_into_method(auth)?,
+                (None, Some(password)) => AuthMethod::Password {
+                    password: vida_core::vault::SecureString::new(password),
                 },
-                None => anyhow::bail!("{}", i18n.tr("daemon_host_need_password")),
+                (None, None) => anyhow::bail!("{}", i18n.tr("daemon_host_need_password")),
             };
             vault.hosts.push(vida_core::vault::HostEntry {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -580,6 +594,38 @@ impl DaemonState {
             _ => anyhow::bail!("{}", self.i18n.trf("daemon_unknown_action", &[action])),
         }
         Ok(())
+    }
+}
+
+fn auth_request_into_method(request: HostAuthRequest) -> Result<AuthMethod> {
+    let secure_optional = |value: Option<String>| {
+        value
+            .filter(|value| !value.is_empty())
+            .map(vida_core::vault::SecureString::new)
+    };
+    match request {
+        HostAuthRequest::Password { password } if !password.is_empty() => {
+            Ok(AuthMethod::Password {
+                password: vida_core::vault::SecureString::new(password),
+            })
+        }
+        HostAuthRequest::Password { .. } => anyhow::bail!("SSH 口令不能为空"),
+        HostAuthRequest::Key {
+            private_key_path,
+            passphrase,
+        } if !private_key_path.is_empty() => Ok(AuthMethod::Key {
+            private_key_path,
+            passphrase: secure_optional(passphrase),
+        }),
+        HostAuthRequest::Key { .. } => anyhow::bail!("SSH 私钥路径不能为空"),
+        HostAuthRequest::KeyInline {
+            private_key,
+            passphrase,
+        } if !private_key.is_empty() => Ok(AuthMethod::KeyInline {
+            private_key: vida_core::vault::SecureString::new(private_key),
+            passphrase: secure_optional(passphrase),
+        }),
+        HostAuthRequest::KeyInline { .. } => anyhow::bail!("SSH 内嵌私钥不能为空"),
     }
 }
 

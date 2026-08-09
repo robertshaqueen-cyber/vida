@@ -1,5 +1,24 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Non-secret, device-local GUI state. This deliberately lives outside the
+/// encrypted vault: terminal session IDs and recent host IDs describe this
+/// computer's workspace and must not be synced to other devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiState {
+    pub recent_host_ids: Vec<String>,
+    pub terminal_layout: Vec<TerminalLayoutEntry>,
+    pub active_terminal_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalLayoutEntry {
+    pub session_id: String,
+    pub host_id: Option<String>,
+    pub number: u32,
+}
 
 /// Returns the config directory.
 ///
@@ -72,6 +91,42 @@ pub fn language_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("language.toml"))
 }
 
+/// Returns the device-local GUI state path.
+pub fn ui_state_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("ui-state.toml"))
+}
+
+/// Load device-local GUI state. Missing or malformed state is treated as a
+/// clean first launch so a damaged convenience file can never block unlock.
+pub fn load_ui_state() -> UiState {
+    let Ok(path) = ui_state_path() else {
+        return UiState::default();
+    };
+    load_ui_state_from(&path)
+}
+
+fn load_ui_state_from(path: &std::path::Path) -> UiState {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return UiState::default();
+    };
+    toml::from_str(&content).unwrap_or_default()
+}
+
+/// Atomically save device-local GUI state.
+pub fn save_ui_state(state: &UiState) -> Result<()> {
+    let dir = config_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    save_ui_state_to(state, &ui_state_path()?)
+}
+
+fn save_ui_state_to(state: &UiState, path: &std::path::Path) -> Result<()> {
+    let content = toml::to_string_pretty(state)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Load the language choice from config file.
 ///
 /// Returns `None` if the file does not exist (use system language).
@@ -105,4 +160,34 @@ pub fn save_language_choice(choice: &str) -> Result<()> {
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, language_path()?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TerminalLayoutEntry, UiState, load_ui_state_from, save_ui_state_to};
+
+    #[test]
+    fn ui_state_round_trip_preserves_recent_hosts_and_terminal_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ui-state.toml");
+        let state = UiState {
+            recent_host_ids: vec!["host-b".into(), "host-a".into()],
+            terminal_layout: vec![
+                TerminalLayoutEntry {
+                    session_id: "local-session".into(),
+                    host_id: None,
+                    number: 1,
+                },
+                TerminalLayoutEntry {
+                    session_id: "ssh-session".into(),
+                    host_id: Some("host-b".into()),
+                    number: 2,
+                },
+            ],
+            active_terminal_session_id: Some("ssh-session".into()),
+        };
+
+        save_ui_state_to(&state, &path).unwrap();
+        assert_eq!(load_ui_state_from(&path), state);
+    }
 }
