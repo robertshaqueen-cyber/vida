@@ -146,6 +146,14 @@ struct HostSummary {
 #[derive(Debug, Deserialize, serde::Serialize)]
 struct SessionInfo {
     session_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    target_kind: String,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    host_name: Option<String>,
     cols: u16,
     rows: u16,
     alive: bool,
@@ -503,8 +511,19 @@ impl Output {
                         .iter()
                         .map(|session| {
                             format!(
-                                "{}\t{}×{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}×{}\t{}\t{}",
                                 session.session_id,
+                                if session.title.is_empty() {
+                                    "—"
+                                } else {
+                                    &session.title
+                                },
+                                if session.target_kind.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &session.target_kind
+                                },
+                                session.host_id.as_deref().unwrap_or("—"),
                                 session.cols,
                                 session.rows,
                                 if session.alive {
@@ -774,6 +793,30 @@ mod tests {
         assert!(english.contains("Vault exists: Yes"));
         assert!(english.contains("Lock state: Unlocked"));
         assert!(!english.contains("金库"));
+    }
+
+    #[test]
+    fn session_output_exposes_agent_target_identity() {
+        let session = SessionInfo {
+            session_id: "session-1".into(),
+            title: "Tokyo production".into(),
+            target_kind: "ssh".into(),
+            host_id: Some("host-1".into()),
+            host_name: Some("Tokyo production".into()),
+            cols: 120,
+            rows: 40,
+            alive: true,
+            exit_code: None,
+            foreground_process: Some("bash".into()),
+        };
+        let output = Output::Sessions(vec![session]);
+
+        let human = output.human_text(&I18n::new(Lang::En));
+        assert!(human.contains("session-1\tTokyo production\tssh\thost-1\t120×40"));
+        let json = success_envelope(&output);
+        assert_eq!(json["data"][0]["title"], "Tokyo production");
+        assert_eq!(json["data"][0]["target_kind"], "ssh");
+        assert_eq!(json["data"][0]["host_id"], "host-1");
     }
 
     #[test]

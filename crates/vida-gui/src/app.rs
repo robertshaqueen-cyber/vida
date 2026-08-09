@@ -3262,7 +3262,10 @@ fn with_agent_approval_overlay<'a>(
         app.agent_approval_busy_id.as_deref(),
         app.agent_approval_notice.as_deref(),
         app.agent_approval_notice_is_error,
-        &app.hosts,
+        crate::screens::agent_approval::TargetLabels {
+            hosts: &app.hosts,
+            terminal_sessions: &app.terminal_sessions,
+        },
         &app.i18n,
     );
     let panel: Element<'a, AppMessage> = container(panel)

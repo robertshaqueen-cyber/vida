@@ -1599,6 +1599,15 @@ async fn pty_session_full_cycle() {
     assert_eq!(sessions[0]["cols"], 40, "cols should be resized");
     assert_eq!(sessions[0]["rows"], 12, "rows should be resized");
     assert_eq!(sessions[0]["alive"], true);
+    assert_eq!(sessions[0]["target_kind"], "local");
+    assert!(
+        sessions[0]["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty()),
+        "session title should identify the target: {resp}"
+    );
+    assert!(sessions[0]["host_id"].is_null());
+    assert!(sessions[0]["host_name"].is_null());
 
     // 6. CloseSession
     let close = format!(

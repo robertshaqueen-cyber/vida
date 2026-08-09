@@ -257,7 +257,8 @@ cargo test --workspace
 3. 金库已解锁时执行 `vidactl host list` → 预期只显示主机摘要，不出现保存的密码、
    私钥内容或私钥口令；`vidactl host show <完整 ID 或唯一名称>` 返回对应主机。
 4. 同时打开本地和 SSH 终端后执行 `vidactl session list` → 预期列出与 GUI 相同的
-   session id、尺寸和进程；执行 `vidactl session screen <session-id>` 显示当前屏幕，
+   session id、可读标签标题、目标类型（`local`/`ssh`）、SSH 主机 ID、尺寸和进程；Agent
+   可据此明确选择目标会话。执行 `vidactl session screen <session-id>` 显示当前屏幕，
    但不会发送按键或改变终端状态，远端输出不会因 Vida 的界面语言而被翻译。
 5. 停止 daemon 后执行 `vidactl doctor` → 预期显示“daemon 可能尚未启动或正在重启”的
    人话提示并以退出码 10 结束；加 `--json` 时仍输出合法错误 envelope。
@@ -309,6 +310,9 @@ cargo test --workspace
 8. 把测试主机设为“只读”后执行安全 Agent 命令 → 预期拒绝且 GUI 不出现审批；设为“无需确认”
    后危险命令会直接发送，因此只应在明确可完全托管的测试主机上选择这一项。人的键盘、IME、
    鼠标选择和粘贴在三种设置下都不受影响。
+9. 同时打开两个本地终端和一个 SSH 终端，执行 `vidactl session list` → 预期每行显示与 GUI
+   一致的标签标题，并明确标记 `local` 或 `ssh`；SSH 行还显示对应主机 ID。触发审批后，审批
+   面板显示对应标签的完整标题（如“本地终端 1”），不会只显示笼统的“本地终端”。
 
 ## UI 基础框架手动验收
 

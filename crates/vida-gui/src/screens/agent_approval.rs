@@ -1,11 +1,18 @@
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length};
+use std::collections::HashMap;
 use vida_client::AgentApproval;
 use vida_core::i18n::I18n;
 
 use crate::app::AppMessage;
+use crate::screens::s_terminal::TerminalSession;
 use crate::screens::s3_main::HostItem;
 use crate::ui::{self, icons};
+
+pub struct TargetLabels<'a> {
+    pub hosts: &'a [HostItem],
+    pub terminal_sessions: &'a HashMap<String, TerminalSession>,
+}
 
 pub fn view<'a>(
     approvals: &'a [AgentApproval],
@@ -13,7 +20,7 @@ pub fn view<'a>(
     busy_id: Option<&str>,
     notice: Option<&'a str>,
     notice_is_error: bool,
-    hosts: &'a [HostItem],
+    targets: TargetLabels<'a>,
     i18n: &'a I18n,
 ) -> Element<'a, AppMessage> {
     let header = row![
@@ -66,7 +73,7 @@ pub fn view<'a>(
 
     let approval_items = approvals.iter().map(|approval| {
         let selected_item = approval.approval_id == selected.approval_id;
-        let host = target_label(approval, hosts, i18n);
+        let host = target_label(approval, &targets, i18n);
         button(
             column![
                 text(host).size(12),
@@ -87,7 +94,7 @@ pub fn view<'a>(
         .height(Length::Fixed(210.0))
         .width(Length::Fixed(210.0));
 
-    let target = target_label(selected, hosts, i18n);
+    let target = target_label(selected, &targets, i18n);
     let reasons = if selected.matched_rules.is_empty() && selected.reasons.is_empty() {
         i18n.tr("agent_approval_reason_unknown").to_string()
     } else if !selected.matched_rules.is_empty() {
@@ -191,11 +198,18 @@ pub fn view<'a>(
         .into()
 }
 
-fn target_label(approval: &AgentApproval, hosts: &[HostItem], i18n: &I18n) -> String {
+fn target_label(approval: &AgentApproval, targets: &TargetLabels<'_>, i18n: &I18n) -> String {
+    if let Some(session) = targets
+        .terminal_sessions
+        .values()
+        .find(|session| session.session_id == approval.session_id)
+    {
+        return session.title.clone();
+    }
     approval
         .host_id
         .as_deref()
-        .and_then(|id| hosts.iter().find(|host| host.id == id))
+        .and_then(|id| targets.hosts.iter().find(|host| host.id == id))
         .map(|host| host.name.clone())
         .unwrap_or_else(|| i18n.tr("agent_approval_local_terminal").to_string())
 }
@@ -235,4 +249,46 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vida_core::i18n::Lang;
+
+    #[test]
+    fn approval_prefers_exact_gui_terminal_title() {
+        let approval = AgentApproval {
+            approval_id: "approval-1".into(),
+            session_id: "session-1".into(),
+            host_id: None,
+            command: "echo ok".into(),
+            reasons: vec![],
+            matched_rules: vec![],
+            created_at: 1,
+            expires_at: 2,
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "terminal:session-1".into(),
+            TerminalSession::new(
+                "session-1".into(),
+                None,
+                "Local terminal 3".into(),
+                40,
+                100,
+                crate::term::primitive::TerminalAppearance::default(),
+            ),
+        );
+        let hosts = [];
+        let targets = TargetLabels {
+            hosts: &hosts,
+            terminal_sessions: &sessions,
+        };
+
+        assert_eq!(
+            target_label(&approval, &targets, &I18n::new(Lang::En)),
+            "Local terminal 3"
+        );
+    }
 }

@@ -11,9 +11,22 @@ use tracing::{debug, error, info, warn};
 use crate::PushPayload;
 use crate::agent::{AgentController, CommandDecision, SessionTarget};
 use crate::protocol::{PtyRequest, Request, Response, ResponsePayload, SyncResponse};
+use crate::pty::SessionInfo;
 use crate::pty::push::{BoundedReceiver, PushKind};
 use crate::state::DaemonState;
 use vida_core::sync::SyncResult;
+
+/// Agent-facing session identity. PTY owns the live process facts while the
+/// Agent binding and device-local GUI layout own what that process represents.
+#[derive(Debug, serde::Serialize)]
+struct ListedSession {
+    #[serde(flatten)]
+    process: SessionInfo,
+    title: String,
+    target_kind: &'static str,
+    host_id: Option<String>,
+    host_name: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Token management
@@ -990,8 +1003,11 @@ async fn handle_pty_request(
             Ok(serde_json::json!({"ok": true}))
         }
         PtyRequest::ListSessions => {
-            let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
-            let sessions = pty.try_list_sessions()?;
+            let sessions = {
+                let pty = pty.read().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+                pty.try_list_sessions()?
+            };
+            let sessions = describe_sessions(sessions, state, agent).await;
             Ok(serde_json::to_value(sessions)?)
         }
         PtyRequest::ReadScreen { session_id } => {
@@ -1009,6 +1025,106 @@ async fn handle_pty_request(
             anyhow::bail!("PTY 订阅请求未在上游处理（内部错误）")
         }
     }
+}
+
+async fn describe_sessions(
+    sessions: Vec<SessionInfo>,
+    state: &Arc<Mutex<DaemonState>>,
+    agent: &Arc<Mutex<AgentController>>,
+) -> Vec<ListedSession> {
+    let layout = vida_core::config::load_ui_state().terminal_layout;
+    let targets: std::collections::HashMap<_, _> = {
+        let agent = agent.lock().await;
+        sessions
+            .iter()
+            .filter_map(|session| {
+                agent
+                    .target(&session.session_id)
+                    .cloned()
+                    .map(|target| (session.session_id.clone(), target))
+            })
+            .collect()
+    };
+    let (host_names, local_title, local_numbered) = {
+        let state = state.lock().await;
+        let host_names = state
+            .list_hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|host| (host.id, host.name))
+            .collect::<std::collections::HashMap<_, _>>();
+        let local_title = state.i18n.tr("terminal_local_title").to_string();
+        let local_numbered = layout
+            .iter()
+            .map(|entry| {
+                (
+                    entry.session_id.clone(),
+                    state
+                        .i18n
+                        .trf("terminal_local_numbered", &[&entry.number.to_string()]),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        (host_names, local_title, local_numbered)
+    };
+
+    let mut described = sessions
+        .into_iter()
+        .map(|process| {
+            let layout_entry = layout
+                .iter()
+                .find(|entry| entry.session_id == process.session_id);
+            let target = targets.get(&process.session_id).cloned().or_else(|| {
+                layout_entry.map(|entry| {
+                    entry
+                        .host_id
+                        .clone()
+                        .map(|host_id| SessionTarget::Host { host_id })
+                        .unwrap_or(SessionTarget::Local)
+                })
+            });
+
+            match target {
+                Some(SessionTarget::Host { host_id }) => {
+                    let host_name = host_names.get(&host_id).cloned();
+                    ListedSession {
+                        title: host_name.clone().unwrap_or_else(|| host_id.clone()),
+                        target_kind: "ssh",
+                        host_id: Some(host_id),
+                        host_name,
+                        process,
+                    }
+                }
+                Some(SessionTarget::Local) => ListedSession {
+                    title: local_numbered
+                        .get(&process.session_id)
+                        .cloned()
+                        .unwrap_or_else(|| local_title.clone()),
+                    target_kind: "local",
+                    host_id: None,
+                    host_name: None,
+                    process,
+                },
+                None => ListedSession {
+                    title: process.session_id.clone(),
+                    target_kind: "unknown",
+                    host_id: None,
+                    host_name: None,
+                    process,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Match the GUI's persisted tab order; detached sessions not present in
+    // the layout remain visible after the known tabs.
+    described.sort_by_key(|session| {
+        layout
+            .iter()
+            .position(|entry| entry.session_id == session.process.session_id)
+            .unwrap_or(usize::MAX)
+    });
+    described
 }
 
 fn sync_status_string(result: &SyncResult) -> String {
