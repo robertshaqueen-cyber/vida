@@ -115,6 +115,9 @@ else:
 | `SubscribeSession { session_id }` | 订阅推送：立即回全量，此后增量 |
 | `UnsubscribeSession { session_id }` | 取消订阅 |
 
+终端二进制帧同时携带 `viewport_start`：当前可见第 0 行在 daemon 回滚历史中的稳定行号。
+GUI 用它维护跨屏选择；只保存屏幕相对行号会在滚动后复制错误内容。
+
 ### 两个读取接口的分工（防漂移约定）
 
 `ReadScreen` 与 `ReadScreenStyled` 读同一个 Term，共用同一个内部提取

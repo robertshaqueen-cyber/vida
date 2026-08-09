@@ -39,6 +39,8 @@ pub struct ClientGrid {
     pub cursor_row: u16,
     pub cursor_col: u16,
     pub cursor_visible: bool,
+    /// Stable history row represented by visible viewport row 0.
+    pub viewport_start: u64,
     /// 已应用帧的序列号（丢帧检测：不连续时记录一次）。
     pub last_seq: Option<u64>,
     /// 单调递增版本号：grid 内容变化时 +1，渲染层据此跳过未变化的帧。
@@ -61,6 +63,7 @@ impl ClientGrid {
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: false,
+            viewport_start: 0,
             last_seq: None,
             version: 0,
         }
@@ -73,6 +76,14 @@ impl ClientGrid {
         }
         self.cells
             .get(row as usize * self.cols as usize + col as usize)
+    }
+
+    pub fn line_cells(&self, row: u16) -> Option<&[ClientCell]> {
+        if row >= self.rows {
+            return None;
+        }
+        let start = row as usize * self.cols as usize;
+        self.cells.get(start..start + self.cols as usize)
     }
 
     /// 全量帧：重置整个 grid。
@@ -126,6 +137,7 @@ impl ClientGrid {
         self.cursor_row = frame.cursor_row;
         self.cursor_col = frame.cursor_col;
         self.cursor_visible = frame.cursor_visible;
+        self.viewport_start = frame.viewport_start;
         for line in &frame.lines {
             self.apply_line(line);
         }

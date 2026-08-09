@@ -1662,11 +1662,12 @@ fn decode_frame_header(bytes: &[u8]) -> (String, &[u8]) {
 /// 每行：[row:2][start:2][end:2][run_count:2]
 /// 每 run：[len:2][flags:1][fg tag:1(+payload)][bg tag:1(+payload)][char_len:1][chars]
 fn decode_frame_lines(payload: &[u8]) -> Vec<String> {
-    let mut pos = 15usize; // seq(8) + cursor(4) + visible(1) + line_count(2)
+    // seq(8) + cursor(4) + visible(1) + viewport_start(8) + line_count(2)
+    let mut pos = 23usize;
     if payload.len() < pos {
         return Vec::new();
     }
-    let line_count = u16::from_be_bytes([payload[13], payload[14]]) as usize;
+    let line_count = u16::from_be_bytes([payload[21], payload[22]]) as usize;
     let mut rows: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
     for _ in 0..line_count {
         if pos + 8 > payload.len() {

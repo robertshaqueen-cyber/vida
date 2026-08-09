@@ -7,7 +7,7 @@
 //! - widget 自身不设置定时器；光标闪烁由终端屏存活期间的 app subscription 驱动。
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use iced::advanced::Renderer as _;
@@ -52,6 +52,9 @@ struct State {
     last_render_key: Cell<Option<RenderKey>>,
     selecting: bool,
     selection: Option<Selection>,
+    selection_rows: BTreeMap<u64, Vec<super::client_grid::ClientCell>>,
+    drag_viewport_cell: Option<(u16, u16)>,
+    last_viewport_start: u64,
     context_menu: Option<Point>,
     context_hover: Option<ContextItem>,
     wheel_remainder: f32,
@@ -61,7 +64,7 @@ struct State {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CellPosition {
-    row: u16,
+    row: u64,
     col: u16,
 }
 
@@ -113,6 +116,9 @@ impl Default for State {
             last_render_key: Cell::new(None),
             selecting: false,
             selection: None,
+            selection_rows: BTreeMap::new(),
+            drag_viewport_cell: None,
+            last_viewport_start: 0,
             context_menu: None,
             context_hover: None,
             wheel_remainder: 0.0,
@@ -143,6 +149,9 @@ impl State {
         self.session_key.push_str(session_key);
         self.selecting = false;
         self.selection = None;
+        self.selection_rows.clear();
+        self.drag_viewport_cell = None;
+        self.last_viewport_start = 0;
         self.context_menu = None;
         self.context_hover = None;
         self.wheel_remainder = 0.0;
@@ -152,9 +161,48 @@ impl State {
 
     fn clear_transient_interaction(&mut self) {
         self.selecting = false;
+        self.drag_viewport_cell = None;
         self.context_menu = None;
         self.context_hover = None;
         self.interaction_version = self.interaction_version.wrapping_add(1);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_rows.clear();
+        self.drag_viewport_cell = None;
+    }
+
+    fn cache_snapshot(&mut self, grid: &ClientGrid) {
+        if self.selection.is_none() {
+            self.last_viewport_start = grid.viewport_start;
+            return;
+        }
+        for viewport_row in 0..grid.rows {
+            if let Some(cells) = grid.line_cells(viewport_row) {
+                self.selection_rows.insert(
+                    grid.viewport_start + u64::from(viewport_row),
+                    cells.to_vec(),
+                );
+            }
+        }
+        if self.selecting
+            && grid.viewport_start != self.last_viewport_start
+            && let Some((viewport_row, col)) = self.drag_viewport_cell
+            && let Some(selection) = self.selection.as_mut()
+        {
+            selection.head = CellPosition {
+                row: grid.viewport_start + u64::from(viewport_row),
+                col,
+            };
+            self.interaction_version = self.interaction_version.wrapping_add(1);
+        }
+        self.last_viewport_start = grid.viewport_start;
+    }
+
+    fn selected_text(&mut self, grid: &ClientGrid) -> Option<String> {
+        self.cache_snapshot(grid);
+        selected_text(&self.selection_rows, grid.cols, self.selection)
     }
 }
 
@@ -224,6 +272,13 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
         tree::State::new(State::default())
     }
 
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<State>();
+        if state.session_key == self.session_key {
+            state.cache_snapshot(&self.snapshot);
+        }
+    }
+
     fn size(&self) -> Size<Length> {
         Size {
             width: self.width,
@@ -269,6 +324,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
         if state.session_key != self.session_key {
             state.reset_for_session(&self.session_key);
         }
+        state.cache_snapshot(&self.snapshot);
 
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -288,7 +344,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                     if menu.contains(position) {
                         let copy = position.y < menu.y + CONTEXT_ITEM_HEIGHT;
                         if copy {
-                            if let Some(content) = selected_text(&self.snapshot, state.selection) {
+                            if let Some(content) = state.selected_text(&self.snapshot) {
                                 clipboard.write(clipboard::Kind::Standard, content);
                             }
                         } else if let Some(content) = clipboard
@@ -308,12 +364,20 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                     }
                 }
 
-                let cell = point_to_cell(position, &self.appearance, &self.snapshot);
+                let viewport_cell =
+                    point_to_viewport_cell(position, &self.appearance, &self.snapshot);
+                let cell = viewport_cell.map(|(row, col)| CellPosition {
+                    row: self.snapshot.viewport_start + u64::from(row),
+                    col,
+                });
                 state.selection = cell.map(|anchor| Selection {
                     anchor,
                     head: anchor,
                 });
                 state.selecting = cell.is_some();
+                state.drag_viewport_cell = viewport_cell;
+                state.selection_rows.clear();
+                state.cache_snapshot(&self.snapshot);
                 state.context_menu = None;
                 state.context_hover = None;
                 state.interaction_version = state.interaction_version.wrapping_add(1);
@@ -322,13 +386,20 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
                 if let Some(position) = cursor.position_in(bounds)
-                    && let Some(head) = point_to_cell(position, &self.appearance, &self.snapshot)
+                    && let Some((viewport_row, col)) =
+                        point_to_viewport_cell(position, &self.appearance, &self.snapshot)
                     && let Some(selection) = state.selection.as_mut()
-                    && selection.head != head
                 {
-                    selection.head = head;
-                    state.interaction_version = state.interaction_version.wrapping_add(1);
-                    shell.request_redraw();
+                    let head = CellPosition {
+                        row: self.snapshot.viewport_start + u64::from(viewport_row),
+                        col,
+                    };
+                    state.drag_viewport_cell = Some((viewport_row, col));
+                    if selection.head != head {
+                        selection.head = head;
+                        state.interaction_version = state.interaction_version.wrapping_add(1);
+                        shell.request_redraw();
+                    }
                 }
                 shell.capture_event();
             }
@@ -339,7 +410,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                         .and_then(|position| context_item_at(menu_at, bounds.size(), position));
                     match item {
                         Some(ContextItem::Copy)
-                            if selected_text(&self.snapshot, state.selection).is_none() =>
+                            if state.selected_text(&self.snapshot).is_none() =>
                         {
                             None
                         }
@@ -355,6 +426,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.selecting => {
                 state.selecting = false;
+                state.drag_viewport_cell = None;
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
@@ -379,7 +451,6 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                 if lines != 0 {
                     state.wheel_remainder -= lines as f32;
                     state.scrolled = true;
-                    state.selection = None;
                     state.context_menu = None;
                     state.context_hover = None;
                     state.interaction_version = state.interaction_version.wrapping_add(1);
@@ -401,7 +472,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                             shell.publish((self.on_scroll)(SCROLL_TO_BOTTOM));
                             state.scrolled = false;
                         }
-                        state.selection = None;
+                        state.clear_selection();
                         state.context_menu = None;
                         state.context_hover = None;
                         state.interaction_version = state.interaction_version.wrapping_add(1);
@@ -419,7 +490,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                             }
                             shell.publish((self.on_paste)(content.into_bytes()));
                         }
-                        state.selection = None;
+                        state.clear_selection();
                         state.context_menu = None;
                         state.context_hover = None;
                         state.interaction_version = state.interaction_version.wrapping_add(1);
@@ -427,7 +498,7 @@ impl<Message, Theme> Widget<Message, Theme, iced::Renderer> for TermCanvas<Messa
                         shell.capture_event();
                     }
                     KeyAction::Copy => {
-                        if let Some(content) = selected_text(&self.snapshot, state.selection) {
+                        if let Some(content) = state.selected_text(&self.snapshot) {
                             clipboard.write(clipboard::Kind::Standard, content);
                         }
                         state.context_menu = None;
@@ -779,16 +850,27 @@ fn draw_grid(canvas: &mut Frame<iced::Renderer>, grid: &ClientGrid, options: Dra
 
     if let Some(selection) = selection.filter(|selection| selection.is_non_empty()) {
         let (start, end) = selection.ordered();
-        for row in start.row..=end.row {
-            let start_col = if row == start.row { start.col } else { 0 };
-            let end_col = if row == end.row {
+        for viewport_row in 0..grid.rows {
+            let history_row = grid.viewport_start + u64::from(viewport_row);
+            if history_row < start.row || history_row > end.row {
+                continue;
+            }
+            let start_col = if history_row == start.row {
+                start.col
+            } else {
+                0
+            };
+            let end_col = if history_row == end.row {
                 end.col
             } else {
                 grid.cols.saturating_sub(1)
             };
             if start_col <= end_col {
                 canvas.fill_rectangle(
-                    Point::new(start_col as f32 * cell_width, row as f32 * cell_height),
+                    Point::new(
+                        start_col as f32 * cell_width,
+                        viewport_row as f32 * cell_height,
+                    ),
                     Size::new((end_col - start_col + 1) as f32 * cell_width, cell_height),
                     Color::from_rgba8(0x20, 0x9c, 0x91, 0.58),
                 );
@@ -928,7 +1010,7 @@ fn draw_grid(canvas: &mut Frame<iced::Renderer>, grid: &ClientGrid, options: Dra
             Size::new(menu.width, 1.0),
             Color::from_rgb8(0x31, 0x45, 0x42),
         );
-        let copy_color = if selected_text(grid, selection).is_some() {
+        let copy_color = if selection.is_some_and(Selection::is_non_empty) {
             Color::from_rgb8(0xe4, 0xeb, 0xe9)
         } else {
             Color::from_rgb8(0x65, 0x76, 0x73)
@@ -974,11 +1056,11 @@ fn context_item_at(menu_at: Point, bounds: Size, position: Point) -> Option<Cont
     }
 }
 
-fn point_to_cell(
+fn point_to_viewport_cell(
     position: Point,
     appearance: &TerminalAppearance,
     grid: &ClientGrid,
-) -> Option<CellPosition> {
+) -> Option<(u16, u16)> {
     if grid.rows == 0 || grid.cols == 0 || position.x < 0.0 || position.y < 0.0 {
         return None;
     }
@@ -986,26 +1068,30 @@ fn point_to_cell(
     let font = terminal_font(&appearance.font_family, false, false);
     let cell_width = cell_advance(font, appearance.font_size).max(1.0);
     let cell_height = (appearance.font_size * 1.15).max(1.0);
-    Some(CellPosition {
-        row: ((position.y / cell_height).floor() as u16).min(grid.rows - 1),
-        col: ((position.x / cell_width).floor() as u16).min(grid.cols - 1),
-    })
+    Some((
+        ((position.y / cell_height).floor() as u16).min(grid.rows - 1),
+        ((position.x / cell_width).floor() as u16).min(grid.cols - 1),
+    ))
 }
 
-fn selected_text(grid: &ClientGrid, selection: Option<Selection>) -> Option<String> {
+fn selected_text(
+    rows: &BTreeMap<u64, Vec<super::client_grid::ClientCell>>,
+    cols: u16,
+    selection: Option<Selection>,
+) -> Option<String> {
     let selection = selection.filter(|selection| selection.is_non_empty())?;
     let (start, end) = selection.ordered();
     let mut output = String::new();
-    for row in start.row..=end.row.min(grid.rows.saturating_sub(1)) {
+    for row in start.row..=end.row {
         let start_col = if row == start.row { start.col } else { 0 };
         let end_col = if row == end.row {
-            end.col.min(grid.cols.saturating_sub(1))
+            end.col.min(cols.saturating_sub(1))
         } else {
-            grid.cols.saturating_sub(1)
+            cols.saturating_sub(1)
         };
         let mut line = String::new();
         for col in start_col..=end_col {
-            let Some(cell) = grid.cell(row, col) else {
+            let Some(cell) = rows.get(&row).and_then(|cells| cells.get(col as usize)) else {
                 continue;
             };
             if cell.flags & super::client_grid::cell_flags::WIDE_SPACER == 0 {
@@ -1257,6 +1343,7 @@ mod tests {
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
+            viewport_start: 0,
             lines: updates,
         });
         grid
@@ -1315,23 +1402,54 @@ mod tests {
     #[test]
     fn selection_extracts_rows_and_trims_unselected_padding() {
         let grid = grid_with_text(&["hello ", "world "], 6);
+        let rows = (0..grid.rows)
+            .filter_map(|row| {
+                grid.line_cells(row)
+                    .map(|cells| (u64::from(row), cells.to_vec()))
+            })
+            .collect();
         let selection = Selection {
             anchor: CellPosition { row: 0, col: 1 },
             head: CellPosition { row: 1, col: 4 },
         };
         assert_eq!(
-            selected_text(&grid, Some(selection)).as_deref(),
+            selected_text(&rows, grid.cols, Some(selection)).as_deref(),
             Some("ello\nworld")
         );
         assert_eq!(
             selected_text(
-                &grid,
+                &rows,
+                grid.cols,
                 Some(Selection {
                     anchor: selection.head,
                     head: selection.anchor,
                 })
             ),
             Some("ello\nworld".to_string())
+        );
+    }
+
+    #[test]
+    fn selection_keeps_cached_rows_across_scrollback_viewports() {
+        let mut bottom = grid_with_text(&["two  ", "three"], 5);
+        bottom.viewport_start = 2;
+        let mut older = grid_with_text(&["zero ", "one  "], 5);
+        older.viewport_start = 0;
+
+        let mut state = State {
+            selection: Some(Selection {
+                anchor: CellPosition { row: 3, col: 4 },
+                head: CellPosition { row: 3, col: 4 },
+            }),
+            ..State::default()
+        };
+        state.cache_snapshot(&bottom);
+        state.cache_snapshot(&older);
+        state.selection.as_mut().unwrap().head = CellPosition { row: 0, col: 0 };
+
+        assert_eq!(
+            state.selected_text(&older).as_deref(),
+            Some("zero\none\ntwo\nthree")
         );
     }
 

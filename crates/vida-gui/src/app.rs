@@ -71,6 +71,8 @@ pub struct VidaApp {
     terminal_reconnect_cooldown: Option<std::time::Instant>,
     /// 当前持久化的终端外观；业务设置不放在 Screen 内。
     terminal_appearance: crate::term::primitive::TerminalAppearance,
+    /// daemon 连接中断后保留终端标签；金库重新解锁后按原类型恢复会话。
+    terminal_restore_pending: bool,
 }
 
 /// Sync status shown by the tab bar sync button.
@@ -304,6 +306,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         next_terminal_number: 1,
         terminal_reconnect_cooldown: None,
         terminal_appearance: crate::term::primitive::TerminalAppearance::default(),
+        terminal_restore_pending: false,
     };
 
     let connect = Task::perform(
@@ -415,6 +418,87 @@ fn close_all_terminal_sessions(app: &mut VidaApp) {
     app.tabs
         .retain(|tab| !matches!(tab.kind, crate::screens::TabKind::Terminal { .. }));
     app.terminal_reconnect_cooldown = None;
+    app.terminal_restore_pending = false;
+}
+
+fn restore_terminal_sessions(app: &VidaApp) -> Task<AppMessage> {
+    let Some(client) = app.ws_client.as_ref().cloned() else {
+        return Task::none();
+    };
+    let snapshots: Vec<(String, u16, u16, Option<String>)> = app
+        .terminal_sessions
+        .values()
+        .filter(|session| session.closed)
+        .map(|session| {
+            (
+                session.session_id.clone(),
+                session.grid.rows,
+                session.grid.cols,
+                session.remote_host_id.clone(),
+            )
+        })
+        .collect();
+    if snapshots.is_empty() {
+        return Task::none();
+    }
+
+    Task::perform(
+        async move {
+            let mut mappings = Vec::with_capacity(snapshots.len());
+            for (old_session_id, rows, cols, remote_host_id) in snapshots {
+                match client
+                    .send(
+                        "SubscribeSession",
+                        serde_json::json!({"session_id": old_session_id}),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = client
+                            .send(
+                                "ResizeSession",
+                                serde_json::json!({
+                                    "session_id": old_session_id,
+                                    "cols": cols,
+                                    "rows": rows,
+                                }),
+                            )
+                            .await;
+                        mappings.push((old_session_id.clone(), old_session_id, false));
+                    }
+                    Err(error) if error.message.contains("会话不存在") => {
+                        let reopened = match remote_host_id {
+                            Some(host_id) => open_ssh_and_subscribe(&client, &host_id).await,
+                            None => open_and_subscribe(&client).await,
+                        };
+                        match reopened {
+                            Ok(new_session_id) => {
+                                let _ = client
+                                    .send(
+                                        "ResizeSession",
+                                        serde_json::json!({
+                                            "session_id": new_session_id,
+                                            "cols": cols,
+                                            "rows": rows,
+                                        }),
+                                    )
+                                    .await;
+                                mappings.push((old_session_id, new_session_id, true));
+                            }
+                            Err(error) => {
+                                return AppMessage::TerminalReconnectFailed(error);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return AppMessage::TerminalReconnectFailed(error.message);
+                    }
+                }
+            }
+            AppMessage::TerminalReconnected { client, mappings }
+        },
+        |message| message,
+    )
 }
 
 /// Every open terminal tab gets its own push stream. Inactive tabs keep their
@@ -871,7 +955,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 revealed_credential: None,
                 credential_copied: false,
             });
-            if app.settings_state.is_none() {
+            let settings_task = if app.settings_state.is_none() {
                 let client = app.ws_client.as_ref().unwrap().clone();
                 Task::perform(
                     async move {
@@ -884,7 +968,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 )
             } else {
                 Task::none()
-            }
+            };
+            let restore_task = if app.terminal_restore_pending {
+                restore_terminal_sessions(app)
+            } else {
+                Task::none()
+            };
+            Task::batch([settings_task, restore_task])
         }
         AppMessage::EditHost(host_id) => {
             // Find host data and open editor in a new tab
@@ -2176,19 +2266,6 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             }
 
-            let snapshots: Vec<(String, u16, u16, Option<String>)> = app
-                .terminal_sessions
-                .values()
-                .filter(|session| !session.closed)
-                .map(|session| {
-                    (
-                        session.session_id.clone(),
-                        session.grid.rows,
-                        session.grid.cols,
-                        session.remote_host_id.clone(),
-                    )
-                })
-                .collect();
             for session in app
                 .terminal_sessions
                 .values_mut()
@@ -2197,6 +2274,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 session.closed = true;
                 session.notice = Some(app.i18n.tr("terminal_reconnecting").to_string());
             }
+            app.terminal_restore_pending = true;
 
             let now = std::time::Instant::now();
             if app
@@ -2210,66 +2288,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             Task::perform(
                 async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    let client = match WsClient::connect().await {
-                        Ok(client) => client,
-                        Err(error) => {
-                            return AppMessage::TerminalReconnectFailed(error.to_string());
-                        }
-                    };
-                    let mut mappings = Vec::with_capacity(snapshots.len());
-                    for (old_session_id, rows, cols, remote_host_id) in snapshots {
-                        match client
-                            .send(
-                                "SubscribeSession",
-                                serde_json::json!({"session_id": old_session_id}),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                let _ = client
-                                    .send(
-                                        "ResizeSession",
-                                        serde_json::json!({
-                                            "session_id": old_session_id,
-                                            "cols": cols,
-                                            "rows": rows,
-                                        }),
-                                    )
-                                    .await;
-                                mappings.push((old_session_id.clone(), old_session_id, false));
-                            }
-                            Err(error) if error.message.contains("会话不存在") => {
-                                let reopened = match remote_host_id {
-                                    Some(host_id) => {
-                                        open_ssh_and_subscribe(&client, &host_id).await
-                                    }
-                                    None => open_and_subscribe(&client).await,
-                                };
-                                match reopened {
-                                    Ok(new_session_id) => {
-                                        let _ = client
-                                            .send(
-                                                "ResizeSession",
-                                                serde_json::json!({
-                                                    "session_id": new_session_id,
-                                                    "cols": cols,
-                                                    "rows": rows,
-                                                }),
-                                            )
-                                            .await;
-                                        mappings.push((old_session_id, new_session_id, true));
-                                    }
-                                    Err(error) => {
-                                        return AppMessage::TerminalReconnectFailed(error);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                return AppMessage::TerminalReconnectFailed(error.message);
-                            }
-                        }
+                    match WsClient::connect().await {
+                        Ok(client) => AppMessage::WsConnected(client),
+                        Err(error) => AppMessage::TerminalReconnectFailed(error.to_string()),
                     }
-                    AppMessage::TerminalReconnected { client, mappings }
                 },
                 |message| message,
             )
@@ -2277,6 +2299,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::TerminalReconnected { client, mappings } => {
             app.ws_client = Some(client);
             app.terminal_reconnect_cooldown = None;
+            app.terminal_restore_pending = false;
             app.terminal_error = None;
 
             for (old_session_id, new_session_id, replaced) in mappings {
@@ -2306,7 +2329,9 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::TerminalReconnectFailed(message) => {
             app.terminal_opening = false;
-            app.terminal_error = Some(app.i18n.trf("terminal_reconnect_failed", &[&message]));
+            let display = app.i18n.trf("terminal_reconnect_failed", &[&message]);
+            app.terminal_error = Some(display.clone());
+            app.screen = Screen::ConnectionFailure(s0_connection::State::new(display));
             Task::none()
         }
         AppMessage::TerminalSetupError(message) => {
@@ -2713,8 +2738,8 @@ fn parse_backup_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, editor_focus_event,
-        parse_backup_bytes, update,
+        AppMessage, Screen, Tab, VidaApp, classify_ssh_failure, close_all_terminal_sessions,
+        editor_focus_event, parse_backup_bytes, update,
     };
     use crate::screens::{s_terminal, s3_main};
     use crate::term::primitive::TerminalAppearance;
@@ -2853,5 +2878,35 @@ mod tests {
         assert!(!app.terminal_sessions.contains_key("terminal:session-a"));
         assert!(app.terminal_sessions.contains_key("terminal:session-b"));
         assert_eq!(app.active_tab_id, "terminal:session-b");
+    }
+
+    #[test]
+    fn daemon_disconnect_preserves_terminal_tabs_for_unlock_restore() {
+        let mut app = app_with_two_terminal_tabs();
+        let terminal_tab_ids: Vec<String> = app
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab.kind, crate::screens::TabKind::Terminal { .. }))
+            .map(|tab| tab.id.clone())
+            .collect();
+
+        let _ = update(
+            &mut app,
+            AppMessage::TerminalDisconnected {
+                session_id: "session-a".to_string(),
+            },
+        );
+
+        assert!(app.terminal_restore_pending);
+        assert!(app.terminal_sessions.values().all(|session| session.closed));
+        assert!(
+            terminal_tab_ids
+                .iter()
+                .all(|id| app.tabs.iter().any(|tab| &tab.id == id))
+        );
+
+        close_all_terminal_sessions(&mut app);
+        assert!(!app.terminal_restore_pending);
+        assert!(app.terminal_sessions.is_empty());
     }
 }

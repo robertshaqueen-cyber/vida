@@ -27,6 +27,8 @@ pub struct Frame {
     pub cursor_row: u16,
     pub cursor_col: u16,
     pub cursor_visible: bool,
+    /// Stable row number of viewport row 0 while retained history has not wrapped.
+    pub viewport_start: u64,
     pub lines: Vec<DirtyLine>,
 }
 
@@ -145,6 +147,7 @@ pub fn encode_frame(session_id: &str, frame: &Frame) -> Vec<u8> {
     buf.extend_from_slice(&frame.cursor_row.to_be_bytes());
     buf.extend_from_slice(&frame.cursor_col.to_be_bytes());
     buf.push(if frame.cursor_visible { 1 } else { 0 });
+    buf.extend_from_slice(&frame.viewport_start.to_be_bytes());
     buf.extend_from_slice(&(frame.lines.len() as u16).to_be_bytes());
     for line in &frame.lines {
         buf.extend_from_slice(&line.row.to_be_bytes());
@@ -188,6 +191,10 @@ fn encode_color(buf: &mut Vec<u8>, color: &ColorSpec) {
 pub fn build_full_frame(term: &Term<alacritty_terminal::event::VoidListener>, seq: u64) -> Frame {
     let rows: usize = term.grid().screen_lines();
     let display_offset = term.grid().display_offset() as i32;
+    let viewport_start = term
+        .grid()
+        .history_size()
+        .saturating_sub(display_offset as usize) as u64;
     let mut lines: Vec<DirtyLine> = Vec::new();
     for row in 0..rows {
         if let Some(line) = build_dirty_line_full(term, row as u16, row as i32 - display_offset) {
@@ -200,6 +207,7 @@ pub fn build_full_frame(term: &Term<alacritty_terminal::event::VoidListener>, se
         cursor_row: cursor.line.0 as u16,
         cursor_col: cursor.column.0 as u16,
         cursor_visible: display_offset == 0,
+        viewport_start,
         lines,
     }
 }
@@ -225,11 +233,13 @@ pub fn build_partial_frame(
         }
     }
     let cursor: alacritty_terminal::index::Point = term.grid().cursor.point;
+    let display_offset = term.grid().display_offset();
     Frame {
         seq,
         cursor_row: cursor.line.0 as u16,
         cursor_col: cursor.column.0 as u16,
-        cursor_visible: true,
+        cursor_visible: display_offset == 0,
+        viewport_start: term.grid().history_size().saturating_sub(display_offset) as u64,
         lines,
     }
 }
@@ -540,6 +550,7 @@ mod tests {
             cursor_row: 0,
             cursor_col: 5,
             cursor_visible: true,
+            viewport_start: 0,
             lines: vec![DirtyLine {
                 row: 0,
                 start_col: 0,
