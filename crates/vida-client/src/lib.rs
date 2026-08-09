@@ -70,6 +70,25 @@ pub enum PushMsg {
     },
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AgentApproval {
+    pub approval_id: String,
+    pub session_id: String,
+    pub host_id: Option<String>,
+    pub command: String,
+    pub reasons: Vec<String>,
+    pub matched_rules: Vec<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerEvent {
+    ApprovalRequested { approval: AgentApproval },
+    ApprovalResolved { approval_id: String, status: String },
+}
+
 /// 推送订阅注册表。
 /// 多路复用：同一连接可订阅多个会话（daemon M2b-1 支持）。
 /// 用 unbounded channel：iced 的 Subscription stream 内部持有 receiver
@@ -82,6 +101,8 @@ pub enum PushMsg {
 struct PushRegistryState {
     senders: HashMap<String, mpsc::UnboundedSender<PushMsg>>,
     prepared_receivers: HashMap<String, mpsc::UnboundedReceiver<PushMsg>>,
+    owner_event_sender: Option<mpsc::UnboundedSender<OwnerEvent>>,
+    prepared_owner_event_receiver: Option<mpsc::UnboundedReceiver<OwnerEvent>>,
 }
 
 type PushRegistry = Arc<std::sync::Mutex<PushRegistryState>>;
@@ -227,8 +248,12 @@ impl WsClient {
             WsRequest,
             oneshot::Sender<DaemonResult<serde_json::Value>>,
         )>();
-        let push_registry: PushRegistry =
-            Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
+        let (owner_event_sender, owner_event_receiver) = mpsc::unbounded_channel();
+        let push_registry: PushRegistry = Arc::new(std::sync::Mutex::new(PushRegistryState {
+            owner_event_sender: Some(owner_event_sender),
+            prepared_owner_event_receiver: Some(owner_event_receiver),
+            ..PushRegistryState::default()
+        }));
         let push_registry_task = push_registry.clone();
 
         tokio::spawn(async move {
@@ -325,6 +350,22 @@ impl WsClient {
         };
         reg.senders.remove(session_id);
         reg.prepared_receivers.remove(session_id);
+    }
+
+    /// Take the one owner-event stream attached to this WebSocket connection.
+    /// It is prepared during connect so approval events arriving before iced
+    /// builds its Subscription remain queued instead of being lost.
+    pub fn subscribe_owner_events(&self) -> mpsc::UnboundedReceiver<OwnerEvent> {
+        let mut reg = match self.push_registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(receiver) = reg.prepared_owner_event_receiver.take() {
+            return receiver;
+        }
+        let (sender, receiver) = mpsc::unbounded_channel();
+        reg.owner_event_sender = Some(sender);
+        receiver
     }
 
     /// Send a request with params.
@@ -523,6 +564,8 @@ fn close_push_subscriptions(registry: &PushRegistry) {
     };
     reg.senders.clear();
     reg.prepared_receivers.clear();
+    reg.owner_event_sender = None;
+    reg.prepared_owner_event_receiver = None;
 }
 
 /// 二进制帧头格式（与 daemon encode_frame 对应）：
@@ -574,7 +617,22 @@ fn forward_text_push(text: &str, registry: &PushRegistry) {
     if event.event_type != "Event" {
         return;
     }
-    if event.event.as_str() == "session_closed" {
+    if event.event.as_str() == "agent_approval" {
+        let owner_event = match serde_json::from_value::<OwnerEvent>(event.data) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!("Agent approval event has invalid data: {error}");
+                return;
+            }
+        };
+        let reg = match registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(sender) = &reg.owner_event_sender {
+            let _ = sender.send(owner_event);
+        }
+    } else if event.event.as_str() == "session_closed" {
         // session_id 缺失/类型错误：记 warn 并丢弃，不构造空串——
         // 否则 reg.get("") 查不到订阅者，事件被静默吞掉。
         let Some(session_id) = event.data.get("session_id").and_then(|v| v.as_str()) else {
@@ -635,7 +693,10 @@ fn read_port() -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PushMsg, PushRegistry, PushRegistryState, WsClient, close_push_subscriptions};
+    use super::{
+        OwnerEvent, PushMsg, PushRegistry, PushRegistryState, WsClient, close_push_subscriptions,
+        forward_text_push,
+    };
     use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -683,6 +744,34 @@ mod tests {
             }
             other => panic!("unexpected push: {other:?}"),
         }
+    }
+
+    #[test]
+    fn owner_approval_event_is_queued_before_gui_subscribes() {
+        let (tx, _request_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
+        let client = WsClient {
+            tx,
+            push_registry: registry.clone(),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        {
+            let mut state = registry.lock().unwrap();
+            state.owner_event_sender = Some(sender);
+            state.prepared_owner_event_receiver = Some(receiver);
+        }
+
+        forward_text_push(
+            r#"{"type":"Event","event":"agent_approval","data":{"kind":"approval_requested","approval":{"approval_id":"approval-1","session_id":"session-1","host_id":null,"command":"reboot","reasons":["server restart"],"matched_rules":["power_control"],"created_at":10,"expires_at":130}}}"#,
+            &registry,
+        );
+
+        let mut receiver = client.subscribe_owner_events();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            OwnerEvent::ApprovalRequested { approval }
+                if approval.approval_id == "approval-1" && approval.command == "reboot"
+        ));
     }
 
     #[tokio::test]

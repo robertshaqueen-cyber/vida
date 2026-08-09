@@ -107,8 +107,17 @@ async fn send_recv(
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .unwrap();
-    // 跳过二进制推送帧，返回第一个文本响应。
-    // 订阅后二进制帧可能与文本响应交织到达。
+    recv_text(reader).await
+}
+
+async fn recv_text(
+    reader: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) -> serde_json::Value {
+    // 跳过二进制推送帧，返回第一个文本响应或事件。
     loop {
         match reader.next().await {
             Some(Ok(Message::Text(text))) => {
@@ -1457,12 +1466,26 @@ async fn agent_role_is_policy_gated_and_owner_can_deny() {
     assert_eq!(response["result"]["status"], "needs_approval");
     let approval_id = response["result"]["approval_id"].as_str().unwrap();
 
+    let requested = recv_text(&mut owner_reader).await;
+    assert_eq!(requested["type"], "Event");
+    assert_eq!(requested["event"], "agent_approval");
+    assert_eq!(requested["data"]["kind"], "approval_requested");
+    assert_eq!(requested["data"]["approval"]["approval_id"], approval_id);
+    assert_eq!(
+        requested["data"]["approval"]["command"],
+        "rm -rf /tmp/vida-never-approved"
+    );
+
     let deny = format!(
         r#"{{"method":"DenyAgentAction","params":{{"approval_id":"{}"}},"id":3}}"#,
         approval_id
     );
     let response = send_recv(&mut owner, &mut owner_reader, &deny).await;
     assert_eq!(response["result"]["status"], "denied");
+    let resolved = recv_text(&mut owner_reader).await;
+    assert_eq!(resolved["data"]["kind"], "approval_resolved");
+    assert_eq!(resolved["data"]["approval_id"], approval_id);
+    assert_eq!(resolved["data"]["status"], "denied");
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let screen = format!(

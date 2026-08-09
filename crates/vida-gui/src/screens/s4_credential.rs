@@ -25,6 +25,18 @@ pub struct AuthKindItem {
     pub label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTrustItem {
+    pub value: &'static str,
+    pub label: String,
+}
+
+impl std::fmt::Display for AgentTrustItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
 impl std::fmt::Display for AuthKindItem {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.label)
@@ -49,6 +61,7 @@ pub struct State {
     pub key_passphrase: String,
     pub credential_dirty: bool,
     pub notes: String,
+    pub agent_trust: String,
     pub saving: bool,
     pub error: Option<String>,
     /// True when user cleared the password field and we showed the intercept dialog.
@@ -74,6 +87,7 @@ impl State {
             key_passphrase: String::new(),
             credential_dirty: true,
             notes: String::new(),
+            agent_trust: "ask".to_string(),
             saving: false,
             error: None,
             password_cleared: false,
@@ -93,6 +107,7 @@ impl State {
         color: Option<String>,
         auth_kind: String,
         notes: Option<String>,
+        agent_trust: String,
     ) -> Self {
         Self {
             mode: EditorMode::Edit { host_id },
@@ -114,6 +129,7 @@ impl State {
             key_passphrase: String::new(),
             credential_dirty: false,
             notes: notes.unwrap_or_default(),
+            agent_trust,
             saving: false,
             error: None,
             password_cleared: false,
@@ -199,6 +215,34 @@ impl State {
             .menu_style(ui::picker_menu)
             .padding(10)
             .width(Length::Fill);
+
+        let trust_items = vec![
+            AgentTrustItem {
+                value: "readonly",
+                label: i18n.tr("agent_trust_readonly").to_string(),
+            },
+            AgentTrustItem {
+                value: "ask",
+                label: i18n.tr("agent_trust_ask").to_string(),
+            },
+            AgentTrustItem {
+                value: "trusted",
+                label: i18n.tr("agent_trust_trusted").to_string(),
+            },
+        ];
+        let selected_trust = trust_items
+            .iter()
+            .find(|item| item.value == self.agent_trust)
+            .cloned();
+        let trust_picker = pick_list(
+            trust_items,
+            selected_trust,
+            AppMessage::EditorAgentTrustChanged,
+        )
+        .style(ui::picker)
+        .menu_style(ui::picker_menu)
+        .padding(10)
+        .width(Length::Fill);
 
         let password_label = if is_edit && !self.credential_dirty {
             text(i18n.tr("editor_password_edit_hint")).size(12)
@@ -321,6 +365,13 @@ impl State {
         };
         let fields = fields
             .push(hint)
+            .push(
+                text(i18n.tr("agent_trust_label"))
+                    .size(12)
+                    .color(ui::TEXT_SECONDARY),
+            )
+            .push(trust_picker)
+            .push(ui::muted(i18n.tr("agent_trust_hint")).size(11))
             .push(tags_input)
             .push(group_input)
             .push(notes_input)

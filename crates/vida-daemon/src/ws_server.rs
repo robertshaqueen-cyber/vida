@@ -141,6 +141,7 @@ async fn handle_connection(
 
     let (mut write, mut read) = ws_stream.split();
     let mut role = None;
+    let mut agent_event_rx = agent.lock().await.subscribe_events();
 
     // 推送通道：PTY 推送循环 → 桥接任务 → tokio channel → 此处
     // (session_id, payload)：多路复用，一个连接可订阅多个会话。
@@ -255,6 +256,27 @@ async fn handle_connection(
                             break;
                         }
                     }
+                }
+            }
+
+            event = agent_event_rx.recv() => {
+                match event {
+                    Ok(event) if role == Some(ClientRole::Owner) => {
+                        let event = serde_json::json!({
+                            "type": "Event",
+                            "event": "agent_approval",
+                            "data": event,
+                        });
+                        if let Err(error) = write.send(Message::Text(event.to_string().into())).await {
+                            debug!("Failed to push Agent approval event to {}: {}", addr, error);
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        warn!("Agent approval event receiver for {} lagged by {} events", addr, count);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
@@ -839,11 +861,13 @@ async fn handle_agent_request(
                     &item.session_id,
                     &item.command,
                     &[],
-                    Some(item.approval_id),
+                    Some(item.approval_id.clone()),
                     "approved command dispatch failed",
                 )?;
+                agent.lock().await.resolve(&item.approval_id, "failed");
                 return Err(error);
             }
+            agent.lock().await.resolve(&item.approval_id, "approved");
             Ok(serde_json::json!({"status": "approved", "sent": true}))
         }
         Request::DenyAgentAction { approval_id } => {

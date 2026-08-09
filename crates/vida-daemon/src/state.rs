@@ -732,6 +732,10 @@ fn host_to_summary(h: &vida_core::vault::HostEntry) -> HostSummary {
 mod tests {
     use super::*;
 
+    // These tests deliberately keep the state returned by create_vault.
+    // Calling the product lock/unlock path would clear the developer's real
+    // OS keyring cache even though each vault file itself is temporary.
+
     #[tokio::test]
     async fn sync_not_configured_returns_sync_not_configured() {
         let tmp = tempfile::tempdir().unwrap();
@@ -749,8 +753,6 @@ mod tests {
 
         let passphrase = "test-passphrase";
         state.create_vault(passphrase).unwrap();
-        state.lock();
-        state.unlock(passphrase, None).unwrap();
 
         assert!(state.sync.is_none());
 
@@ -785,8 +787,6 @@ mod tests {
             pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
-        state.lock();
-        state.unlock("pass", None).unwrap();
 
         // Set initial sync path
         let path_a = tmp.path().join("path_a");
@@ -829,8 +829,6 @@ mod tests {
             pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
-        state.lock();
-        state.unlock("pass", None).unwrap();
 
         // Set sync_local_path to the vault directory itself
         let settings = Settings {
@@ -862,8 +860,6 @@ mod tests {
             pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
-        state.lock();
-        state.unlock("pass", None).unwrap();
 
         let settings = Settings {
             sync_local_path: Some("/nonexistent/path/abc123".into()),
@@ -898,8 +894,6 @@ mod tests {
             pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
-        state.lock();
-        state.unlock("pass", None).unwrap();
 
         let settings = Settings {
             sync_local_path: Some(file_path.to_str().unwrap().to_string()),
@@ -926,8 +920,6 @@ mod tests {
             pty: std::sync::Arc::new(std::sync::RwLock::new(crate::pty::PtyManager::default())),
         };
         state.create_vault("pass").unwrap();
-        state.lock();
-        state.unlock("pass", None).unwrap();
 
         // Create a symlink pointing to the vault directory
         let symlink_path = tmp.path().join("sync_link");

@@ -8,7 +8,7 @@ use crate::screens::{
     s5_settings, s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
 };
 use crate::term::frame;
-use crate::ws_client::{PushMsg, WsClient};
+use crate::ws_client::{AgentApproval, OwnerEvent, PushMsg, WsClient};
 
 pub fn run() -> Result<(), iced::Error> {
     // 默认 filter 用 bin 名 "vida"（module_path! 以 bin 名为前缀，
@@ -91,6 +91,14 @@ pub struct VidaApp {
     /// Disabled by unit-test fixtures so tests never overwrite the user's
     /// device-local workspace state.
     ui_state_persistence_enabled: bool,
+    /// Pending Agent writes are daemon-owned business state. The GUI keeps a
+    /// read-only projection plus local panel selection/busy/error state.
+    agent_approvals: Vec<AgentApproval>,
+    selected_agent_approval_id: Option<String>,
+    show_agent_approval_panel: bool,
+    agent_approval_busy_id: Option<String>,
+    agent_approval_notice: Option<String>,
+    agent_approval_notice_is_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +199,21 @@ pub enum AppMessage {
         vault_exists: bool,
     },
 
+    // M5c owner approval UI
+    AgentOwnerEvent(OwnerEvent),
+    AgentApprovalsLoaded(Vec<AgentApproval>),
+    ToggleAgentApprovalPanel,
+    CloseAgentApprovalPanel,
+    SelectAgentApproval(String),
+    ApproveAgentAction(String),
+    DenyAgentAction(String),
+    AgentApprovalHandled {
+        approval_id: String,
+        status: String,
+    },
+    AgentApprovalActionFailed(String),
+    AgentApprovalTick,
+
     // Tab management
     SwitchTab(String), // tab id
     OpenAddHostTab,    // open host picker/add tab
@@ -240,6 +263,7 @@ pub enum AppMessage {
     EditorUserChanged(String),
     EditorPortChanged(String),
     EditorAuthChanged(crate::screens::s4_credential::AuthKindItem),
+    EditorAgentTrustChanged(crate::screens::s4_credential::AgentTrustItem),
     EditorPasswordChanged(String),
     EditorKeyPathChanged(String),
     EditorPickKeyFile,
@@ -340,6 +364,12 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         terminal_reconnect_in_flight: false,
         initial_terminal_open_pending: true,
         ui_state_persistence_enabled: true,
+        agent_approvals: Vec::new(),
+        selected_agent_approval_id: None,
+        show_agent_approval_panel: false,
+        agent_approval_busy_id: None,
+        agent_approval_notice: None,
+        agent_approval_notice_is_error: false,
     };
     restore_persisted_terminal_layout(&mut app, &ui_state);
 
@@ -517,6 +547,65 @@ fn classify_ssh_failure(i18n: &I18n, output: &str) -> String {
     i18n.tr(key).to_string()
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn parse_agent_approvals(value: serde_json::Value) -> Result<Vec<AgentApproval>, String> {
+    serde_json::from_value(value).map_err(|error| format!("待审批列表格式无效：{error}"))
+}
+
+fn normalize_agent_approval_selection(app: &mut VidaApp) {
+    let selected_exists = app.selected_agent_approval_id.as_ref().is_some_and(|id| {
+        app.agent_approvals
+            .iter()
+            .any(|approval| &approval.approval_id == id)
+    });
+    if !selected_exists {
+        app.selected_agent_approval_id = app
+            .agent_approvals
+            .first()
+            .map(|approval| approval.approval_id.clone());
+    }
+}
+
+fn handle_agent_approval_action(
+    app: &mut VidaApp,
+    approval_id: String,
+    approve: bool,
+) -> Task<AppMessage> {
+    if app.agent_approval_busy_id.is_some() {
+        return Task::none();
+    }
+    app.agent_approval_busy_id = Some(approval_id.clone());
+    app.agent_approval_notice = None;
+    let client = app.ws_client.as_ref().unwrap().clone();
+    Task::perform(
+        async move {
+            let result = if approve {
+                client.approve_agent_action(&approval_id).await
+            } else {
+                client.deny_agent_action(&approval_id).await
+            };
+            match result {
+                Ok(value) => AppMessage::AgentApprovalHandled {
+                    approval_id,
+                    status: value
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(if approve { "approved" } else { "denied" })
+                        .to_string(),
+                },
+                Err(error) => AppMessage::AgentApprovalActionFailed(error.message),
+            }
+        },
+        |message| message,
+    )
+}
+
 /// Close the daemon session owned by a terminal tab. Human input is already
 /// serialized through the client's ordered queue; closing uses the same queue
 /// so no late keystroke can overtake CloseSession.
@@ -690,6 +779,25 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
         return iced::Subscription::batch(subscriptions);
     };
 
+    // One global owner-event stream per WebSocket. It is prepared by
+    // vida-client during connect, so approvals emitted before iced constructs
+    // this subscription stay queued.
+    subscriptions.push(iced::Subscription::run_with(ws.clone(), |ws| {
+        let ws = ws.clone();
+        futures_util::stream::unfold(
+            Some((ws, None::<tokio::sync::mpsc::UnboundedReceiver<OwnerEvent>>)),
+            |state| async move {
+                let (ws, receiver) = state?;
+                let mut receiver = receiver.unwrap_or_else(|| ws.subscribe_owner_events());
+                let event = receiver.recv().await?;
+                Some((
+                    AppMessage::AgentOwnerEvent(event),
+                    Some((ws, Some(receiver))),
+                ))
+            },
+        )
+    }));
+
     for (tab_id, session) in &app.terminal_sessions {
         // identity includes stable tab id, current session id, and WsClient's
         // Arc identity. Reconnect or replacement restarts only the right stream.
@@ -728,6 +836,13 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(500))
                 .map(|_| AppMessage::TerminalCursorBlink),
+        );
+    }
+
+    if !app.agent_approvals.is_empty() {
+        subscriptions.push(
+            iced::time::every(std::time::Duration::from_secs(1))
+                .map(|_| AppMessage::AgentApprovalTick),
         );
     }
 
@@ -818,7 +933,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             app.ws_client = Some(client);
             let client = app.ws_client.as_ref().unwrap().clone();
-            Task::perform(
+            let status_task = Task::perform(
                 async move {
                     match client.vault_status().await {
                         Ok(s) => {
@@ -836,7 +951,24 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     }
                 },
                 |r| r,
-            )
+            );
+            let approval_client = app.ws_client.as_ref().unwrap().clone();
+            let approval_i18n = app.i18n.clone();
+            let approvals_task = Task::perform(
+                async move {
+                    match approval_client.list_agent_approvals().await {
+                        Ok(value) => match parse_agent_approvals(value) {
+                            Ok(approvals) => AppMessage::AgentApprovalsLoaded(approvals),
+                            Err(_) => AppMessage::AgentApprovalActionFailed(
+                                approval_i18n.tr("agent_approval_invalid_data").to_string(),
+                            ),
+                        },
+                        Err(error) => AppMessage::AgentApprovalActionFailed(error.message),
+                    }
+                },
+                |message| message,
+            );
+            Task::batch([status_task, approvals_task])
         }
         AppMessage::WsError(e) => {
             app.terminal_reconnect_in_flight = false;
@@ -909,6 +1041,131 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 );
             }
             Task::none()
+        }
+
+        AppMessage::AgentOwnerEvent(event) => {
+            match event {
+                OwnerEvent::ApprovalRequested { approval } => {
+                    if let Some(existing) = app
+                        .agent_approvals
+                        .iter_mut()
+                        .find(|item| item.approval_id == approval.approval_id)
+                    {
+                        *existing = approval.clone();
+                    } else {
+                        app.agent_approvals.push(approval.clone());
+                        app.agent_approvals.sort_by_key(|item| item.created_at);
+                    }
+                    app.selected_agent_approval_id = Some(approval.approval_id);
+                    app.show_agent_approval_panel = true;
+                    app.agent_approval_notice = None;
+                    app.agent_approval_notice_is_error = false;
+                }
+                OwnerEvent::ApprovalResolved {
+                    approval_id,
+                    status,
+                } => {
+                    app.agent_approvals
+                        .retain(|item| item.approval_id != approval_id);
+                    app.agent_approval_busy_id = None;
+                    app.agent_approval_notice = Some(match status.as_str() {
+                        "approved" => app.i18n.tr("agent_approval_result_approved").to_string(),
+                        "denied" => app.i18n.tr("agent_approval_result_denied").to_string(),
+                        "expired" => app.i18n.tr("agent_approval_result_expired").to_string(),
+                        "cancelled" => app.i18n.tr("agent_approval_result_cancelled").to_string(),
+                        "failed" => app.i18n.tr("agent_approval_result_failed").to_string(),
+                        _ => status.clone(),
+                    });
+                    app.agent_approval_notice_is_error = status == "failed";
+                    normalize_agent_approval_selection(app);
+                }
+            }
+            Task::none()
+        }
+        AppMessage::AgentApprovalsLoaded(mut approvals) => {
+            approvals.sort_by_key(|item| item.created_at);
+            app.agent_approvals = approvals;
+            normalize_agent_approval_selection(app);
+            Task::none()
+        }
+        AppMessage::ToggleAgentApprovalPanel => {
+            app.show_agent_approval_panel = !app.show_agent_approval_panel;
+            normalize_agent_approval_selection(app);
+            Task::none()
+        }
+        AppMessage::CloseAgentApprovalPanel => {
+            app.show_agent_approval_panel = false;
+            Task::none()
+        }
+        AppMessage::SelectAgentApproval(approval_id) => {
+            if app
+                .agent_approvals
+                .iter()
+                .any(|item| item.approval_id == approval_id)
+            {
+                app.selected_agent_approval_id = Some(approval_id);
+                app.agent_approval_notice = None;
+                app.agent_approval_notice_is_error = false;
+            }
+            Task::none()
+        }
+        AppMessage::ApproveAgentAction(approval_id) => {
+            handle_agent_approval_action(app, approval_id, true)
+        }
+        AppMessage::DenyAgentAction(approval_id) => {
+            handle_agent_approval_action(app, approval_id, false)
+        }
+        AppMessage::AgentApprovalHandled {
+            approval_id,
+            status,
+        } => update(
+            app,
+            AppMessage::AgentOwnerEvent(OwnerEvent::ApprovalResolved {
+                approval_id,
+                status,
+            }),
+        ),
+        AppMessage::AgentApprovalActionFailed(error) => {
+            app.agent_approval_busy_id = None;
+            app.agent_approval_notice = Some(error);
+            app.agent_approval_notice_is_error = true;
+            let Some(client) = app.ws_client.as_ref().cloned() else {
+                return Task::none();
+            };
+            Task::perform(
+                async move {
+                    match client.list_agent_approvals().await {
+                        Ok(value) => AppMessage::AgentApprovalsLoaded(
+                            parse_agent_approvals(value).unwrap_or_default(),
+                        ),
+                        Err(_) => AppMessage::AgentApprovalsLoaded(Vec::new()),
+                    }
+                },
+                |message| message,
+            )
+        }
+        AppMessage::AgentApprovalTick => {
+            if !app
+                .agent_approvals
+                .iter()
+                .any(|item| item.expires_at <= unix_now())
+            {
+                return Task::none();
+            }
+            let Some(client) = app.ws_client.as_ref().cloned() else {
+                return Task::none();
+            };
+            Task::perform(
+                async move {
+                    match client.list_agent_approvals().await {
+                        Ok(value) => AppMessage::AgentApprovalsLoaded(
+                            parse_agent_approvals(value).unwrap_or_default(),
+                        ),
+                        Err(error) => AppMessage::AgentApprovalActionFailed(error.message),
+                    }
+                },
+                |message| message,
+            )
         }
 
         // ---- S1: Setup ----
@@ -1224,6 +1481,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     h.color.clone(),
                     h.auth_kind.clone(),
                     h.notes.clone(),
+                    h.agent_trust.clone(),
                 ));
             }
             Task::none()
@@ -1407,6 +1665,12 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
+        AppMessage::EditorAgentTrustChanged(item) => {
+            if let Some(state) = &mut app.editor_state {
+                state.agent_trust = item.value.to_string();
+            }
+            Task::none()
+        }
         AppMessage::EditorKeyPathChanged(value) => {
             if let Some(state) = &mut app.editor_state {
                 state.private_key_path = value;
@@ -1506,6 +1770,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 } else {
                     Some(s.notes.clone())
                 };
+                let agent_trust = s.agent_trust.clone();
                 let auth = if !s.credential_dirty {
                     None
                 } else {
@@ -1529,6 +1794,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     })
                 };
                 let client = app.ws_client.as_ref().unwrap().clone();
+                let i18n = app.i18n.clone();
                 Task::perform(
                     async move {
                         let req = serde_json::json!({
@@ -1547,7 +1813,18 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                             }
                         });
                         match client.send("UpdateHost", req).await {
-                            Ok(_) => AppMessage::EditorSaved,
+                            Ok(host) => {
+                                let Some(host_id) = host.get("id").and_then(|value| value.as_str())
+                                else {
+                                    return AppMessage::WsError(
+                                        i18n.tr("editor_save_missing_host_id").to_string(),
+                                    );
+                                };
+                                match client.set_host_agent_trust(host_id, &agent_trust).await {
+                                    Ok(_) => AppMessage::EditorSaved,
+                                    Err(error) => AppMessage::WsError(error.message),
+                                }
+                            }
                             Err(e) => AppMessage::WsError(e.to_string()),
                         }
                     },
@@ -2771,6 +3048,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 &app.active_tab_id,
                 &app.i18n,
                 app.show_connect_panel,
+                app.agent_approvals.len(),
                 app.sync_state.symbol(),
                 app.sync_state.label(&app.i18n),
             );
@@ -2850,7 +3128,7 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 .width(Length::Fill)
                 .height(Length::Fill);
 
-            if app.show_connect_panel {
+            let main_layer: Element<'_, AppMessage> = if app.show_connect_panel {
                 // Floating quick-connect panel over a single dimmed overlay layer.
                 //
                 // Rendering note: the earlier leak (a vertical strip of the
@@ -2920,7 +3198,9 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                     .into()
             } else {
                 base.into()
-            }
+            };
+
+            with_agent_approval_overlay(app, main_layer)
         }
 
         // Other screens (conflict, etc.): show with tab bar
@@ -2930,16 +3210,73 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                 &app.active_tab_id,
                 &app.i18n,
                 false,
+                app.agent_approvals.len(),
                 app.sync_state.symbol(),
                 app.sync_state.label(&app.i18n),
             );
             let content = app.screen.view(&app.i18n);
-            column![tab_bar, content]
+            let base: Element<'_, AppMessage> = column![tab_bar, content]
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .into()
+                .into();
+            with_agent_approval_overlay(app, base)
         }
     }
+}
+
+fn with_agent_approval_overlay<'a>(
+    app: &'a VidaApp,
+    base: Element<'a, AppMessage>,
+) -> Element<'a, AppMessage> {
+    if !app.show_agent_approval_panel {
+        return base;
+    }
+
+    use iced::widget::{button, container, stack, text};
+    use iced::{Color, Length};
+
+    let base: Element<'a, AppMessage> = container(base)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(crate::ui::app_background)
+        .into();
+    let dim: Element<'a, AppMessage> = container(
+        button(text(""))
+            .on_press(AppMessage::CloseAgentApprovalPanel)
+            .style(button::text)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(|_: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(
+            0.0, 0.0, 0.0, 0.55,
+        ))),
+        ..Default::default()
+    })
+    .into();
+    let panel = crate::screens::agent_approval::view(
+        &app.agent_approvals,
+        app.selected_agent_approval_id.as_deref(),
+        app.agent_approval_busy_id.as_deref(),
+        app.agent_approval_notice.as_deref(),
+        app.agent_approval_notice_is_error,
+        &app.hosts,
+        &app.i18n,
+    );
+    let panel: Element<'a, AppMessage> = container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(24)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into();
+
+    stack![base, dim, panel]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn parse_hosts(val: &serde_json::Value) -> Vec<s3_main::HostItem> {
@@ -2969,6 +3306,11 @@ fn parse_hosts(val: &serde_json::Value) -> Vec<s3_main::HostItem> {
                 color: h.get("color").and_then(|v| v.as_str()).map(String::from),
                 auth_kind: h.get("auth_kind")?.as_str()?.to_string(),
                 notes: h.get("notes").and_then(|v| v.as_str()).map(String::from),
+                agent_trust: h
+                    .get("agent_trust")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("ask")
+                    .to_string(),
             })
         })
         .collect()
@@ -2998,7 +3340,7 @@ mod tests {
     };
     use crate::screens::{s_terminal, s0_connection, s3_main};
     use crate::term::primitive::TerminalAppearance;
-    use crate::ws_client::PushMsg;
+    use crate::ws_client::{AgentApproval, OwnerEvent, PushMsg};
 
     fn tab_key_event(modifiers: iced::keyboard::Modifiers) -> iced::Event {
         use iced::keyboard::{Key, Location, key};
@@ -3094,6 +3436,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owner_approval_event_opens_panel_and_resolution_clears_badge() {
+        let mut app = app_with_two_terminal_tabs();
+        let approval = AgentApproval {
+            approval_id: "approval-1".into(),
+            session_id: "session-a".into(),
+            host_id: None,
+            command: "reboot".into(),
+            reasons: vec!["server restart".into()],
+            matched_rules: vec!["power_control".into()],
+            created_at: 10,
+            expires_at: 130,
+        };
+
+        let _ = update(
+            &mut app,
+            AppMessage::AgentOwnerEvent(OwnerEvent::ApprovalRequested {
+                approval: approval.clone(),
+            }),
+        );
+        assert!(app.show_agent_approval_panel);
+        assert_eq!(app.agent_approvals, vec![approval]);
+        assert_eq!(
+            app.selected_agent_approval_id.as_deref(),
+            Some("approval-1")
+        );
+
+        let _ = update(
+            &mut app,
+            AppMessage::AgentOwnerEvent(OwnerEvent::ApprovalResolved {
+                approval_id: "approval-1".into(),
+                status: "denied".into(),
+            }),
+        );
+        assert!(app.agent_approvals.is_empty());
+        assert!(app.show_agent_approval_panel);
+        assert!(app.agent_approval_notice.is_some());
+    }
+
+    #[test]
+    fn host_parser_defaults_old_entries_to_ask_and_preserves_explicit_trust() {
+        let hosts = super::parse_hosts(&serde_json::json!([
+            {
+                "id": "old", "name": "Old", "host": "127.0.0.1", "user": "root",
+                "port": 22, "tags": [], "auth_kind": "password"
+            },
+            {
+                "id": "trusted", "name": "Trusted", "host": "example.com", "user": "ops",
+                "port": 22, "tags": [], "auth_kind": "key", "agent_trust": "trusted"
+            }
+        ]));
+        assert_eq!(hosts[0].agent_trust, "ask");
+        assert_eq!(hosts[1].agent_trust, "trusted");
+    }
+
     fn host_item(id: &str, name: &str) -> s3_main::HostItem {
         s3_main::HostItem {
             id: id.into(),
@@ -3106,6 +3503,7 @@ mod tests {
             color: None,
             auth_kind: "password".into(),
             notes: None,
+            agent_trust: "ask".into(),
         }
     }
 

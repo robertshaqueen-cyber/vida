@@ -42,6 +42,16 @@ pub enum AuditOutcome {
     RejectedReadonly,
     RejectedUnknownSession,
     Failed,
+    Cancelled,
+}
+
+/// Owner-facing lifecycle event. The full command is included only in the
+/// in-memory requested event; persistent audit entries remain fingerprints.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEvent {
+    ApprovalRequested { approval: PendingApproval },
+    ApprovalResolved { approval_id: String, status: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +86,7 @@ pub struct AgentController {
     pending: HashMap<String, PendingApproval>,
     bindings_path: PathBuf,
     audit_path: PathBuf,
+    events: tokio::sync::broadcast::Sender<AgentEvent>,
 }
 
 impl AgentController {
@@ -106,12 +117,18 @@ impl AgentController {
             }
         }
 
+        let (events, _) = tokio::sync::broadcast::channel(64);
         Ok(Self {
             bindings,
             pending: HashMap::new(),
             bindings_path,
             audit_path,
+            events,
         })
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+        self.events.subscribe()
     }
 
     pub fn register_session(&mut self, session_id: &str, target: SessionTarget) -> Result<()> {
@@ -121,7 +138,21 @@ impl AgentController {
 
     pub fn remove_session(&mut self, session_id: &str) -> Result<()> {
         self.bindings.remove(session_id);
-        self.pending.retain(|_, item| item.session_id != session_id);
+        let removed: Vec<_> = self
+            .pending
+            .values()
+            .filter(|item| item.session_id == session_id)
+            .cloned()
+            .collect();
+        for item in removed {
+            self.pending.remove(&item.approval_id);
+            self.append_audit(AuditEntry::from_pending(
+                &item,
+                AuditOutcome::Cancelled,
+                Some("terminal session closed before approval".into()),
+            ))?;
+            self.notify_resolved(&item.approval_id, "cancelled");
+        }
         self.save_bindings()
     }
 
@@ -193,6 +224,9 @@ impl AgentController {
             ))?;
             self.pending
                 .insert(approval.approval_id.clone(), approval.clone());
+            let _ = self.events.send(AgentEvent::ApprovalRequested {
+                approval: approval.clone(),
+            });
             return Ok(CommandDecision::NeedsApproval(approval));
         }
 
@@ -251,6 +285,7 @@ impl AgentController {
             AuditOutcome::Denied,
             Some("owner denied the command".into()),
         ))?;
+        self.notify_resolved(&item.approval_id, "denied");
         Ok(item)
     }
 
@@ -260,6 +295,10 @@ impl AgentController {
             AuditOutcome::Approved,
             Some("owner approved; terminal dispatch attempted".into()),
         ))
+    }
+
+    pub fn resolve(&self, approval_id: &str, status: &str) {
+        self.notify_resolved(approval_id, status);
     }
 
     pub fn pending(&mut self, now: i64) -> Result<Vec<PendingApproval>> {
@@ -294,8 +333,16 @@ impl AgentController {
                 AuditOutcome::Expired,
                 Some("approval timed out".into()),
             ))?;
+            self.notify_resolved(&item.approval_id, "expired");
         }
         Ok(())
+    }
+
+    fn notify_resolved(&self, approval_id: &str, status: &str) {
+        let _ = self.events.send(AgentEvent::ApprovalResolved {
+            approval_id: approval_id.to_string(),
+            status: status.to_string(),
+        });
     }
 
     fn save_bindings(&self) -> Result<()> {
@@ -443,6 +490,38 @@ mod tests {
         };
         assert_eq!(item.expires_at, 10 + APPROVAL_TTL_SECONDS);
         assert_eq!(controller.pending(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owner_events_cover_request_and_resolution_without_persisting_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut controller = controller(&temp);
+        controller
+            .register_session("session", SessionTarget::Local)
+            .unwrap();
+        let mut events = controller.subscribe_events();
+
+        let CommandDecision::NeedsApproval(item) = controller
+            .evaluate("session", "rm -rf /tmp/approval-event", AgentTrust::Ask, 10)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        let AgentEvent::ApprovalRequested { approval } = events.try_recv().unwrap() else {
+            panic!("expected requested event");
+        };
+        assert_eq!(approval.approval_id, item.approval_id);
+        assert_eq!(approval.command, "rm -rf /tmp/approval-event");
+
+        controller.deny(&item.approval_id, 11).unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            AgentEvent::ApprovalResolved { approval_id, status }
+                if approval_id == item.approval_id && status == "denied"
+        ));
+
+        let audit = std::fs::read_to_string(temp.path().join("audit.jsonl")).unwrap();
+        assert!(!audit.contains("approval-event"));
     }
 
     #[test]

@@ -1103,3 +1103,19 @@ session 映射一律拒绝。v6→v7 迁移把全部现有主机设为 `ask`，�
 并明确 `trusted` 的风险。完整命令只在待审批内存中存在；持久 JSONL 审计使用字节长度和
 SHA-256 指纹关联事件，避免任何未识别的口令或私钥内容落盘。策略允许/所有者批准的审计先于
 PTY 写入持久化，审计写失败时命令不得发送。
+
+### M5c GUI 实时审批与人工接管
+
+审批不是 GUI 轮询产生的本地推测。daemon 在创建、批准、拒绝、过期或会话关闭时通过
+owner-only WebSocket 旁路事件广播状态；`vida-client` 在认证成功时预先建立全局事件接收器，
+避免 iced 订阅尚未构造时丢失首条通知。GUI 重连后还会主动调用 `ListAgentApprovals` 补偿断线
+窗口，因此实时事件与完整列表共同构成恢复路径。
+
+审批面板展示完整命令、真实 session/host、内置规则的本地化说明和 daemon 到期时间。多条命令
+按创建时间排队，用户可以关闭面板稍后处理，顶栏数量仍然可见；批准仅对当前 approval id
+生效，不把主机永久改为 trusted。完整命令只存在于 daemon/客户端的待审批内存和临时 UI，
+持久审计仍只保存长度与 SHA-256。
+
+主机的 readonly/ask/trusted 在现有编辑页使用共享 `picker` 样式配置，且明确说明只影响 Agent
+协议。人的 `SessionInput`、IME 与 `PasteSession` 不进入这个策略层。GUI 保存主机资料后通过
+owner-only `SetHostAgentTrust` 更新权限；Agent 身份既不能修改权限，也不能批准自己的命令。

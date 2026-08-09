@@ -182,6 +182,33 @@ macOS、1920×1080、scale factor=1。使用隔离临时配置目录启动 relea
 只含命令字节数和 SHA-256，不含两条测试命令明文；随后关闭会话、停止 daemon 并删除隔离
 临时目录。
 
+### M5c GUI 实时审批与人工接管
+
+- daemon 为所有者连接广播 approval requested/resolved 事件；Agent 连接只能消费自己的请求
+  响应，不能收到所有者审批控制面。
+- `vida-client` 预注册 owner event channel，保证事件先于 GUI Subscription 到达时仍在队列中；
+  GUI 重连同时读取完整 pending 列表，补偿断线期间事件。
+- GUI 使用共享视觉 token 显示多审批队列、命令详情、规则原因、倒计时和单次批准/拒绝；顶栏
+  数量入口允许稍后处理。主机编辑页复用现有 picker 配置 readonly/ask/trusted。
+- 自动测试覆盖 request/resolved 推送、先事件后订阅、owner-only WebSocket、GUI 队列状态和
+  旧摘要缺字段时安全回落为 ask。可见交互由 README「M5c GUI 实时审批与主机权限手动验收」
+  交给所有者实际点击确认。
+
+#### M5c release 内存实测（2026-08-10）
+
+macOS、1920×1080、scale factor=1。使用隔离临时配置目录启动最终 release GUI，在 daemon
+不可达的稳定连接提示页等待 4 秒后测量；同时只读测量已运行且加载 M5 Agent 控制面的 release
+daemon。审批面板本身按需构造，不创建后台轮询线程；有待审批项时只增加一个每秒 tick。
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| release GUI，隔离配置、稳定连接提示页 | **35.9M** |
+| release daemon，Agent 控制面已加载 | **6912K** |
+
+两项都来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS。GUI 启动期峰值
+230.8M 来自既有 wgpu/IOSurface 初始化回收前分配，不作为稳定占用；daemon 峰值包含既有
+scrypt 解锁过程，同样不作为稳定占用。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |
