@@ -1079,6 +1079,10 @@ GUI、CLI 与 MCP 都是 daemon 的客户端，不允许各自复制 token/端�
 正式命令行使用独立可执行文件名 `vidactl`；`vida` 继续代表原生 GUI，`vida-mcp` 保留给
 MCP stdio 入口。开发期 `vida-term-test` 仍是底层终端协议探针，不作为产品 CLI 发布。
 
+`vidactl` 的人类可读状态、标签和本地错误跟随 GUI 保存在设备配置中的语言选择；选择
+`system` 时两者使用同一套系统语言检测。脚本接口不参与本地化：`--json` 的字段名、
+envelope、枚举值和退出码保持固定，`session screen` 返回的远端终端文本也保持原样。
+
 第一个检查点只提供状态、主机摘要、会话清单和当前屏幕读取。即使 daemon 已经存在
 `SessionInput`，也不直接把它包装成产品命令：在策略、审批和审计落地前暴露写入会形成绕过
 安全模型的永久接口。后续 `keys_send/exec` 与 MCP 工具必须共同经过同一策略入口。

@@ -240,13 +240,14 @@ cargo test --workspace
 
 1. daemon 运行时执行 `vidactl doctor` → 预期显示“可连接、认证成功”、实际配置目录和
    金库状态；不会要求或显示金库口令。
-2. 执行 `vidactl status` 以及 `vidactl --json status` → 预期前者是适合人阅读的中文，
-   后者为 `{"ok":true,"data":...}`，且进程退出码为 0。
+2. 在设置中将界面语言切换为 English，再执行 `vidactl status` → 预期人类可读输出为英文；
+   切回中文后预期输出为中文。执行 `vidactl --json status` → 两种语言下都必须保持
+   `{"ok":true,"data":...}` 的相同字段结构，且进程退出码为 0。
 3. 金库已解锁时执行 `vidactl host list` → 预期只显示主机摘要，不出现保存的密码、
    私钥内容或私钥口令；`vidactl host show <完整 ID 或唯一名称>` 返回对应主机。
 4. 同时打开本地和 SSH 终端后执行 `vidactl session list` → 预期列出与 GUI 相同的
    session id、尺寸和进程；执行 `vidactl session screen <session-id>` 显示当前屏幕，
-   但不会发送按键或改变终端状态。
+   但不会发送按键或改变终端状态，远端输出不会因 Vida 的界面语言而被翻译。
 5. 停止 daemon 后执行 `vidactl doctor` → 预期显示“daemon 可能尚未启动或正在重启”的
    人话提示并以退出码 10 结束；加 `--json` 时仍输出合法错误 envelope。
 6. 保持 GUI 打开并重复上述只读命令 → 预期 GUI 的连接、标签、终端内容和输入均不受影响。

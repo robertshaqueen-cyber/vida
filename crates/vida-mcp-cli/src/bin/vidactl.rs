@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vida_client::{DaemonError, WsClient};
+use vida_core::i18n::I18n;
 
 const EXIT_CONNECTION: u8 = 10;
 const EXIT_DAEMON: u8 = 11;
@@ -125,22 +126,20 @@ struct CliError {
 }
 
 impl CliError {
-    fn connection(_error: anyhow::Error) -> Self {
+    fn connection(_error: anyhow::Error, i18n: &I18n) -> Self {
         Self {
             code: EXIT_CONNECTION,
             kind: "connection_error",
-            message:
-                "无法连接到 Vida daemon。它可能尚未启动或正在重启；请先启动 vida-daemon，然后重试。"
-                    .to_string(),
+            message: i18n.tr("cli_error_connection").to_string(),
             category: None,
         }
     }
 
-    fn data(error: anyhow::Error) -> Self {
+    fn data(error: anyhow::Error, i18n: &I18n) -> Self {
         Self {
             code: EXIT_DATA,
             kind: "invalid_daemon_response",
-            message: format!("daemon 返回了无法识别的数据：{error:#}"),
+            message: i18n.trf("cli_error_invalid_data", &[&format!("{error:#}")]),
             category: None,
         }
     }
@@ -169,76 +168,90 @@ impl From<DaemonError> for CliError {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    match execute(&cli).await {
+    let i18n = I18n::new(vida_core::i18n::detect_lang());
+    match execute(&cli, &i18n).await {
         Ok(output) => {
-            print_success(cli.json, output);
+            print_success(cli.json, output, &i18n);
             ExitCode::SUCCESS
         }
         Err(error) => {
-            print_error(cli.json, &error);
+            print_error(cli.json, &error, &i18n);
             ExitCode::from(error.code)
         }
     }
 }
 
-async fn execute(cli: &Cli) -> std::result::Result<Output, CliError> {
-    let client = WsClient::connect().await.map_err(CliError::connection)?;
+async fn execute(cli: &Cli, i18n: &I18n) -> std::result::Result<Output, CliError> {
+    let client = WsClient::connect()
+        .await
+        .map_err(|error| CliError::connection(error, i18n))?;
 
     match &cli.command {
         Command::Doctor => {
-            let status = typed_status(&client).await?;
-            let config_dir = vida_core::config::config_dir().map_err(CliError::connection)?;
+            let status = typed_status(&client, i18n).await?;
+            let config_dir = vida_core::config::config_dir()
+                .map_err(|error| CliError::connection(error, i18n))?;
             Ok(Output::Doctor {
                 config_dir: config_dir.display().to_string(),
                 status,
             })
         }
-        Command::Status => Ok(Output::Status(typed_status(&client).await?)),
+        Command::Status => Ok(Output::Status(typed_status(&client, i18n).await?)),
         Command::Host { command } => match command {
-            HostCommand::List => Ok(Output::Hosts(typed_hosts(&client).await?)),
+            HostCommand::List => Ok(Output::Hosts(typed_hosts(&client, i18n).await?)),
             HostCommand::Show { host } => {
-                let hosts = typed_hosts(&client).await?;
-                let selected = select_host(hosts, host)?;
+                let hosts = typed_hosts(&client, i18n).await?;
+                let selected = select_host(hosts, host, i18n)?;
                 Ok(Output::Host(selected))
             }
         },
         Command::Session { command } => match command {
-            SessionCommand::List => Ok(Output::Sessions(typed_sessions(&client).await?)),
+            SessionCommand::List => Ok(Output::Sessions(typed_sessions(&client, i18n).await?)),
             SessionCommand::Screen { session_id } => {
                 let value = client.read_screen(session_id).await?;
                 let screen = serde_json::from_value(value)
                     .context("ReadScreen 字段不完整")
-                    .map_err(CliError::data)?;
+                    .map_err(|error| CliError::data(error, i18n))?;
                 Ok(Output::Screen(screen))
             }
         },
     }
 }
 
-async fn typed_status(client: &WsClient) -> std::result::Result<VaultStatus, CliError> {
+async fn typed_status(
+    client: &WsClient,
+    i18n: &I18n,
+) -> std::result::Result<VaultStatus, CliError> {
     let value = client.vault_status().await?;
     serde_json::from_value(value)
         .context("VaultStatus 字段不完整")
-        .map_err(CliError::data)
+        .map_err(|error| CliError::data(error, i18n))
 }
 
-async fn typed_hosts(client: &WsClient) -> std::result::Result<Vec<HostSummary>, CliError> {
+async fn typed_hosts(
+    client: &WsClient,
+    i18n: &I18n,
+) -> std::result::Result<Vec<HostSummary>, CliError> {
     let value = client.list_hosts().await?;
     serde_json::from_value(value)
         .context("ListHosts 字段不完整")
-        .map_err(CliError::data)
+        .map_err(|error| CliError::data(error, i18n))
 }
 
-async fn typed_sessions(client: &WsClient) -> std::result::Result<Vec<SessionInfo>, CliError> {
+async fn typed_sessions(
+    client: &WsClient,
+    i18n: &I18n,
+) -> std::result::Result<Vec<SessionInfo>, CliError> {
     let value = client.list_sessions().await?;
     serde_json::from_value(value)
         .context("ListSessions 字段不完整")
-        .map_err(CliError::data)
+        .map_err(|error| CliError::data(error, i18n))
 }
 
 fn select_host(
     hosts: Vec<HostSummary>,
     selector: &str,
+    i18n: &I18n,
 ) -> std::result::Result<HostSummary, CliError> {
     if let Some(host) = hosts.iter().find(|host| host.id == selector) {
         return Ok(host.clone());
@@ -249,14 +262,14 @@ fn select_host(
         return Err(CliError::local(
             EXIT_NOT_FOUND,
             "host_not_found",
-            format!("没有找到主机“{selector}”。请先运行 vidactl host list。"),
+            i18n.trf("cli_error_host_not_found", &[selector]),
         ));
     };
     if matches.next().is_some() {
         return Err(CliError::local(
             EXIT_AMBIGUOUS,
             "host_ambiguous",
-            format!("主机名“{selector}”不唯一，请改用完整主机 ID。"),
+            i18n.trf("cli_error_host_ambiguous", &[selector]),
         ));
     }
     Ok(first)
@@ -290,103 +303,151 @@ impl Output {
         }
     }
 
-    fn print_human(&self) {
+    fn human_text(&self, i18n: &I18n) -> String {
         match self {
             Self::Doctor { config_dir, status } => {
-                println!("Vida daemon：可连接、认证成功");
-                println!("配置目录：{config_dir}");
-                println!(
-                    "金库：{}（{} 台主机）",
-                    if !status.vault_exists {
-                        "尚未创建"
-                    } else if status.locked {
-                        "已锁定"
-                    } else {
-                        "已解锁"
-                    },
-                    status.host_count
-                );
+                let count = status.host_count.to_string();
+                format!(
+                    "{}\n{}\n{}\n",
+                    i18n.tr("cli_doctor_daemon_ok"),
+                    i18n.trf("cli_doctor_config_dir", &[config_dir]),
+                    i18n.trf(
+                        "cli_doctor_vault",
+                        &[vault_state(status, i18n), count.as_str()]
+                    )
+                )
             }
             Self::Status(status) => {
-                println!("金库存在：{}", yes_no(status.vault_exists));
-                println!(
-                    "锁定状态：{}",
-                    if status.locked {
-                        "已锁定"
-                    } else {
-                        "已解锁"
-                    }
-                );
-                println!("主机数量：{}", status.host_count);
-                println!("修订版本：{}", status.revision);
-                println!("设备 ID：{}", status.device_id);
+                format!(
+                    "{}\n{}\n{}\n{}\n{}\n",
+                    i18n.trf(
+                        "cli_status_vault_exists",
+                        &[yes_no(status.vault_exists, i18n)]
+                    ),
+                    i18n.trf(
+                        "cli_status_lock_state",
+                        &[if status.locked {
+                            i18n.tr("cli_vault_locked")
+                        } else {
+                            i18n.tr("cli_vault_unlocked")
+                        }]
+                    ),
+                    i18n.trf("cli_status_host_count", &[&status.host_count.to_string()]),
+                    i18n.trf("cli_status_revision", &[&status.revision.to_string()]),
+                    i18n.trf("cli_status_device_id", &[&status.device_id]),
+                )
             }
             Self::Hosts(hosts) => {
                 if hosts.is_empty() {
-                    println!("没有已保存的主机。");
+                    format!("{}\n", i18n.tr("cli_hosts_empty"))
                 } else {
-                    for host in hosts {
-                        println!(
-                            "{}\t{}@{}:{}\t{}\t{}",
-                            host.id, host.user, host.host, host.port, host.auth_kind, host.name
-                        );
-                    }
+                    hosts
+                        .iter()
+                        .map(|host| {
+                            format!(
+                                "{}\t{}@{}:{}\t{}\t{}",
+                                host.id,
+                                host.user,
+                                host.host,
+                                host.port,
+                                auth_label(&host.auth_kind, i18n),
+                                host.name
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n"
                 }
             }
-            Self::Host(host) => {
-                println!("名称：{}", host.name);
-                println!("ID：{}", host.id);
-                println!("地址：{}@{}:{}", host.user, host.host, host.port);
-                println!("认证：{}", host.auth_kind);
-                println!("分组：{}", host.group.as_deref().unwrap_or("—"));
-                println!(
-                    "标签：{}",
-                    if host.tags.is_empty() {
+            Self::Host(host) => format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                i18n.trf("cli_host_name", &[&host.name]),
+                i18n.trf("cli_host_id", &[&host.id]),
+                i18n.trf(
+                    "cli_host_address",
+                    &[&host.user, &host.host, &host.port.to_string()]
+                ),
+                i18n.trf("cli_host_auth", &[auth_label(&host.auth_kind, i18n)]),
+                i18n.trf("cli_host_group", &[host.group.as_deref().unwrap_or("—")]),
+                i18n.trf(
+                    "cli_host_tags",
+                    &[&if host.tags.is_empty() {
                         "—".to_string()
                     } else {
                         host.tags.join(", ")
-                    }
-                );
-                println!("备注：{}", host.notes.as_deref().unwrap_or("—"));
-            }
+                    }]
+                ),
+                i18n.trf("cli_host_notes", &[host.notes.as_deref().unwrap_or("—")]),
+            ),
             Self::Sessions(sessions) => {
                 if sessions.is_empty() {
-                    println!("没有活动终端会话。");
+                    format!("{}\n", i18n.tr("cli_sessions_empty"))
                 } else {
-                    for session in sessions {
-                        println!(
-                            "{}\t{}×{}\t{}\t{}",
-                            session.session_id,
-                            session.cols,
-                            session.rows,
-                            if session.alive { "alive" } else { "closed" },
-                            session.foreground_process.as_deref().unwrap_or("—")
-                        );
-                    }
+                    sessions
+                        .iter()
+                        .map(|session| {
+                            format!(
+                                "{}\t{}×{}\t{}\t{}",
+                                session.session_id,
+                                session.cols,
+                                session.rows,
+                                if session.alive {
+                                    i18n.tr("cli_session_alive")
+                                } else {
+                                    i18n.tr("cli_session_closed")
+                                },
+                                session.foreground_process.as_deref().unwrap_or("—")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n"
                 }
             }
-            Self::Screen(screen) => print!("{}", screen.lines.join("\n")),
+            Self::Screen(screen) => screen.lines.join("\n"),
         }
     }
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "是" } else { "否" }
-}
-
-fn print_success(as_json: bool, output: Output) {
-    if as_json {
-        println!("{}", success_envelope(&output));
+fn vault_state<'a>(status: &VaultStatus, i18n: &'a I18n) -> &'a str {
+    if !status.vault_exists {
+        i18n.tr("cli_vault_missing")
+    } else if status.locked {
+        i18n.tr("cli_vault_locked")
     } else {
-        output.print_human();
+        i18n.tr("cli_vault_unlocked")
     }
 }
 
-fn print_error(as_json: bool, error: &CliError) {
+fn yes_no(value: bool, i18n: &I18n) -> &'static str {
+    if value {
+        i18n.tr("cli_yes")
+    } else {
+        i18n.tr("cli_no")
+    }
+}
+
+fn auth_label<'a>(kind: &'a str, i18n: &'a I18n) -> &'a str {
+    match kind {
+        "password" => i18n.tr("editor_auth_password"),
+        "key" => i18n.tr("editor_auth_key_file"),
+        _ => kind,
+    }
+}
+
+fn print_success(as_json: bool, output: Output, i18n: &I18n) {
+    if as_json {
+        println!("{}", success_envelope(&output));
+    } else {
+        print!("{}", output.human_text(i18n));
+    }
+}
+
+fn print_error(as_json: bool, error: &CliError, i18n: &I18n) {
     if as_json {
         println!("{}", error_envelope(error));
     } else {
-        eprintln!("错误：{}", error.message);
+        eprintln!("{}", i18n.trf("cli_error_prefix", &[&error.message]));
     }
 }
 
@@ -409,6 +470,11 @@ fn error_envelope(error: &CliError) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vida_core::i18n::Lang;
+
+    fn zh() -> I18n {
+        I18n::new(Lang::ZhCn)
+    }
 
     fn host(id: &str, name: &str) -> HostSummary {
         HostSummary {
@@ -427,22 +493,30 @@ mod tests {
 
     #[test]
     fn host_selector_prefers_exact_id() {
-        let selected = select_host(vec![host("id-1", "same"), host("same", "other")], "same")
-            .expect("exact id");
+        let selected = select_host(
+            vec![host("id-1", "same"), host("same", "other")],
+            "same",
+            &zh(),
+        )
+        .expect("exact id");
         assert_eq!(selected.id, "same");
     }
 
     #[test]
     fn duplicate_host_name_is_not_silently_selected() {
-        let error = select_host(vec![host("id-1", "same"), host("id-2", "same")], "same")
-            .expect_err("ambiguous name");
+        let error = select_host(
+            vec![host("id-1", "same"), host("id-2", "same")],
+            "same",
+            &zh(),
+        )
+        .expect_err("ambiguous name");
         assert_eq!(error.code, EXIT_AMBIGUOUS);
         assert_eq!(error.kind, "host_ambiguous");
     }
 
     #[test]
     fn missing_host_has_stable_error_code() {
-        let error = select_host(vec![], "missing").expect_err("missing host");
+        let error = select_host(vec![], "missing", &zh()).expect_err("missing host");
         assert_eq!(error.code, EXIT_NOT_FOUND);
         assert_eq!(error.kind, "host_not_found");
     }
@@ -464,6 +538,34 @@ mod tests {
                     "exit_code": EXIT_NOT_FOUND,
                 }
             })
+        );
+    }
+
+    #[test]
+    fn human_output_follows_selected_language() {
+        let output = Output::Status(VaultStatus {
+            locked: false,
+            host_count: 2,
+            revision: 9,
+            device_id: "device-1".into(),
+            vault_exists: true,
+        });
+        let english = output.human_text(&I18n::new(Lang::En));
+        assert!(english.contains("Vault exists: Yes"));
+        assert!(english.contains("Lock state: Unlocked"));
+        assert!(!english.contains("金库"));
+    }
+
+    #[test]
+    fn screen_human_output_is_not_translated() {
+        let output = Output::Screen(ScreenData {
+            lines: vec!["remote 中文 output".into()],
+            wide_cols: vec![],
+            cursor: CursorPos { row: 0, col: 0 },
+        });
+        assert_eq!(
+            output.human_text(&I18n::new(Lang::En)),
+            "remote 中文 output"
         );
     }
 }
