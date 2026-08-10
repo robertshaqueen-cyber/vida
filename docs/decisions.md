@@ -1159,3 +1159,18 @@ daemon 只校验、规范化并审计草稿，审计保存长度与 SHA-256 而�
 owner 事件把非秘密字段送到 GUI。它不调用 `UpdateHost`，因此不会直接修改金库。GUI 复用现有
 S4 主机编辑器，认证方式、密码/私钥、Agent 信任策略和最终保存均保持人的控制；若人正在编辑，
 草稿进入 `VidaApp` 队列，当前输入不会被 Agent 覆盖。金库锁定时 daemon 直接拒绝准备请求。
+
+### M9 主机运行档案复用现有加密备注
+
+主机运行档案复用 `HostEntry.notes`，不另建明文文件，也不增加新的金库字段。因此档案继续随
+`vault.age` 加密、同步、备份和恢复，且本里程碑不需要提升金库版本。正文使用 Markdown 二级
+标题分节；append 只扩展一个小节，replace 只替换一个小节正文，不重写其他内容。
+
+Agent 只获得 `AgentReadHostNotes` 与结构化 `AgentUpdateHostNotes`，不能调用通用 `UpdateHost`。
+更新请求拒绝未知字段，正文和小节在 daemon 统一验证；持久审计只保存长度与 SHA-256，owner
+事件只携带 host id，GUI 收到后重新读取无凭据主机摘要并通过 `set_hosts()` 更新。档案读取和
+普通 append 对 readonly 主机仍可用，因为它们不进入 shell；replace 的工具说明要求人明确提出。
+
+MCP 为每个已配置主机列出 `vida://host/<host-id>/notes` resource，并同时提供显式 notes 工具。
+资源用于新对话恢复上下文，工具用于确定性更新。写入响应不确定时不得自动重试，Agent 应先
+重新读取档案以判断第一次更新是否已经生效。

@@ -10,7 +10,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use vida_client::{DaemonError, WsClient};
+use vida_client::{
+    AgentHostNotesDocument, AgentHostNotesUpdate, AgentNotesUpdateMode, DaemonError, WsClient,
+};
 use vida_core::i18n::I18n;
 
 const EXIT_CONNECTION: u8 = 10;
@@ -76,6 +78,29 @@ enum HostCommand {
     Show { host: String },
     /// 设置 Agent 写入权限；人的终端输入不受影响。
     Trust { host: String, trust: TrustArg },
+    /// 读取或维护加密金库中的主机运行档案；不要记录凭据或临时终端输出。
+    Notes {
+        #[command(subcommand)]
+        command: HostNotesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HostNotesCommand {
+    /// 读取完整 Markdown 主机档案，内容原样输出且不翻译。
+    Read { host: String },
+    /// 向指定二级标题追加 Markdown；普通变更记录使用此命令。
+    Append {
+        host: String,
+        section: String,
+        text: String,
+    },
+    /// 替换指定二级标题正文；仅用于明确纠正已有内容。
+    Replace {
+        host: String,
+        section: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -244,6 +269,8 @@ async fn execute(cli: &Cli, i18n: &I18n) -> std::result::Result<Output, CliError
         &cli.command,
         Command::Session {
             command: SessionCommand::Exec { .. }
+        } | Command::Host {
+            command: HostCommand::Notes { .. }
         }
     );
     let client = if agent_role {
@@ -281,6 +308,44 @@ async fn execute(cli: &Cli, i18n: &I18n) -> std::result::Result<Output, CliError
                     host: selected.name,
                     result,
                 })
+            }
+            HostCommand::Notes { command } => {
+                let selector = match command {
+                    HostNotesCommand::Read { host }
+                    | HostNotesCommand::Append { host, .. }
+                    | HostNotesCommand::Replace { host, .. } => host,
+                };
+                let hosts = typed_hosts(&client, i18n).await?;
+                let selected = select_host(hosts, selector, i18n)?;
+                let value = match command {
+                    HostNotesCommand::Read { .. } => {
+                        client.agent_read_host_notes(&selected.id).await?
+                    }
+                    HostNotesCommand::Append { section, text, .. } => {
+                        client
+                            .agent_update_host_notes(&AgentHostNotesUpdate {
+                                host_id: selected.id,
+                                section: section.clone(),
+                                text: text.clone(),
+                                mode: AgentNotesUpdateMode::Append,
+                            })
+                            .await?
+                    }
+                    HostNotesCommand::Replace { section, text, .. } => {
+                        client
+                            .agent_update_host_notes(&AgentHostNotesUpdate {
+                                host_id: selected.id,
+                                section: section.clone(),
+                                text: text.clone(),
+                                mode: AgentNotesUpdateMode::Replace,
+                            })
+                            .await?
+                    }
+                };
+                let document = serde_json::from_value(value)
+                    .context("Host notes 字段不完整")
+                    .map_err(|error| CliError::data(error, i18n))?;
+                Ok(Output::HostNotes(document))
             }
         },
         Command::Session { command } => match command {
@@ -388,6 +453,7 @@ enum Output {
         host: String,
         result: Value,
     },
+    HostNotes(AgentHostNotesDocument),
     AgentExec(Value),
     Approvals(Value),
     ApprovalAction(Value),
@@ -412,6 +478,7 @@ impl Output {
             | Self::Approvals(result)
             | Self::ApprovalAction(result)
             | Self::Audit(result) => result.clone(),
+            Self::HostNotes(document) => json!(document),
         }
     }
 
@@ -503,6 +570,7 @@ impl Output {
                 i18n.trf("cli_host_notes", &[host.notes.as_deref().unwrap_or("—")]),
                 i18n.trf("cli_host_agent_trust", &[&host.agent_trust]),
             ),
+            Self::HostNotes(document) => document.markdown.clone(),
             Self::Sessions(sessions) => {
                 if sessions.is_empty() {
                     format!("{}\n", i18n.tr("cli_sessions_empty"))

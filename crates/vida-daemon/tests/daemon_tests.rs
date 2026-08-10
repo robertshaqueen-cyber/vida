@@ -1740,6 +1740,137 @@ async fn agent_host_draft_requires_unlocked_vault() {
     .await;
     assert_eq!(response["type"], "Error");
     assert!(response["message"].as_str().unwrap().contains("解锁"));
+
+    let notes = send_recv(
+        &mut agent,
+        &mut agent_reader,
+        r#"{"method":"AgentReadHostNotes","params":{"host_id":"host-1"},"id":3}"#,
+    )
+    .await;
+    assert_eq!(notes["type"], "Error");
+    assert!(notes["message"].as_str().unwrap().contains("锁定"));
+}
+
+#[tokio::test]
+async fn agent_host_notes_are_sectioned_encrypted_and_owner_visible() {
+    use sha2::{Digest, Sha256};
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut owner, mut owner_reader) = connect(addr).await;
+    let owner_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"owner"}},"id":1}}"#,
+        token
+    );
+    assert_eq!(
+        send_recv(&mut owner, &mut owner_reader, &owner_auth).await["type"],
+        "Ok"
+    );
+    assert_eq!(
+        send_recv(
+            &mut owner,
+            &mut owner_reader,
+            r#"{"method":"CreateVault","params":{"passphrase":"test-passphrase"},"id":2}"#,
+        )
+        .await["type"],
+        "Ok"
+    );
+    let created = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"UpdateHost","params":{"host":{"id":null,"name":"Notes Host","host":"notes.example","user":"deploy","port":22,"tags":[],"group":null,"color":null,"password":"credential-must-not-leak","notes":null}},"id":3}"#,
+    )
+    .await;
+    let host_id = created["result"]["id"].as_str().unwrap().to_string();
+
+    let agent_token = hex::encode(Sha256::digest(format!("vida-agent:{token}").as_bytes()));
+    let (mut agent, mut agent_reader) = connect(addr).await;
+    let agent_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"agent"}},"id":1}}"#,
+        agent_token
+    );
+    assert_eq!(
+        send_recv(&mut agent, &mut agent_reader, &agent_auth).await["result"]["role"],
+        "agent"
+    );
+
+    let read =
+        format!(r#"{{"method":"AgentReadHostNotes","params":{{"host_id":"{host_id}"}},"id":2}}"#);
+    let initial = send_recv(&mut agent, &mut agent_reader, &read).await;
+    assert_eq!(initial["result"]["host_name"], "Notes Host");
+    assert!(
+        initial["result"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("## Change log")
+    );
+    assert!(!initial.to_string().contains("credential-must-not-leak"));
+
+    let append = format!(
+        r#"{{"method":"AgentUpdateHostNotes","params":{{"update":{{"host_id":"{host_id}","section":"Change log","text":"Installed htop","mode":"append"}}}},"id":3}}"#
+    );
+    let updated = send_recv(&mut agent, &mut agent_reader, &append).await;
+    assert!(
+        updated["result"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("## Change log\nInstalled htop")
+    );
+    let event = recv_text(&mut owner_reader).await;
+    assert_eq!(event["data"]["kind"], "host_notes_updated");
+    assert_eq!(event["data"]["host_id"], host_id);
+
+    let replace = format!(
+        r#"{{"method":"AgentUpdateHostNotes","params":{{"update":{{"host_id":"{host_id}","section":"Change log","text":"Installed btop","mode":"replace"}}}},"id":4}}"#
+    );
+    let replaced = send_recv(&mut agent, &mut agent_reader, &replace).await;
+    assert!(
+        replaced["result"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("## Change log\nInstalled btop")
+    );
+    assert!(!replaced.to_string().contains("Installed htop"));
+    let _ = recv_text(&mut owner_reader).await;
+
+    let hosts = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"ListHosts","id":4}"#,
+    )
+    .await;
+    assert!(
+        hosts["result"][0]["notes"]
+            .as_str()
+            .unwrap()
+            .contains("Installed btop")
+    );
+
+    let audit = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"ReadAgentAudit","params":{"limit":10},"id":5}"#,
+    )
+    .await;
+    let audit_text = audit.to_string();
+    assert!(audit_text.contains("notes_append"));
+    assert!(audit_text.contains("notes_replace"));
+    assert!(!audit_text.contains("Installed htop"));
+    assert!(!audit_text.contains("Installed btop"));
+    assert!(!audit_text.contains("credential-must-not-leak"));
+
+    let credential_injection = format!(
+        r#"{{"method":"AgentUpdateHostNotes","params":{{"update":{{"host_id":"{host_id}","section":"Change log","text":"safe","mode":"append","password":"notes-secret"}}}},"id":7}}"#
+    );
+    let rejected = send_recv(&mut agent, &mut agent_reader, &credential_injection).await;
+    assert_eq!(rejected["type"], "Error");
+    assert!(!rejected.to_string().contains("notes-secret"));
+
+    let owner_attempt =
+        format!(r#"{{"method":"AgentReadHostNotes","params":{{"host_id":"{host_id}"}},"id":6}}"#);
+    assert_eq!(
+        send_recv(&mut owner, &mut owner_reader, &owner_attempt).await["type"],
+        "Error"
+    );
 }
 
 /// 打开会话 → 输入 → 读屏幕 → resize → 列出 → 关闭。

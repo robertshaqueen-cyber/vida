@@ -7,7 +7,10 @@ use vida_core::config;
 use vida_core::sync::{LocalPathBackend, SyncCoordinator, SyncResult};
 use vida_core::vault::{AuthMethod, Settings, Vault};
 
-use crate::protocol::{ConflictChoice, HostAuthRequest, HostRequest, HostSummary, VaultStatusInfo};
+use crate::protocol::{
+    AgentHostNotesDocument, AgentNotesUpdateMode, ConflictChoice, HostAuthRequest, HostRequest,
+    HostSummary, VaultStatusInfo,
+};
 
 // ---------------------------------------------------------------------------
 // DaemonState — shared across all WebSocket connections
@@ -396,6 +399,51 @@ impl DaemonState {
         Ok(())
     }
 
+    pub fn read_host_notes(&self, host_id: &str) -> Result<AgentHostNotesDocument> {
+        let vault = self.ensure_unlocked()?;
+        let host = vault
+            .hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .context(self.i18n.tr("daemon_host_not_found"))?;
+        Ok(host_notes_document(host, vault.revision))
+    }
+
+    pub fn update_host_notes(
+        &mut self,
+        host_id: &str,
+        section: &str,
+        text: &str,
+        mode: AgentNotesUpdateMode,
+    ) -> Result<AgentHostNotesDocument> {
+        let passphrase = self.ensure_passphrase()?.to_string();
+        let vault_path = self.vault_path.clone();
+        let i18n = self.i18n.clone();
+        let vault = self.ensure_unlocked_mut()?;
+        let host = vault
+            .hosts
+            .iter_mut()
+            .find(|host| host.id == host_id)
+            .context(i18n.tr("daemon_host_not_found"))?;
+        let current = host
+            .notes
+            .as_deref()
+            .filter(|notes| !notes.trim().is_empty())
+            .unwrap_or(vida_core::host::DEFAULT_NOTES_MARKDOWN);
+        host.notes = Some(vida_core::host::update_notes_section(
+            current,
+            section,
+            text,
+            matches!(mode, AgentNotesUpdateMode::Replace),
+        ));
+        vault.modified_at = chrono::Utc::now().timestamp();
+        vault.revision += 1;
+        let document = host_notes_document(host, vault.revision);
+        let encrypted = vida_core::vault::encrypt(vault, &passphrase)?;
+        vida_core::persist::write_atomic(&vault_path, &encrypted)?;
+        Ok(document)
+    }
+
     pub fn update_host(&mut self, req: HostRequest) -> Result<HostSummary> {
         let passphrase = self.ensure_passphrase()?.to_string();
         let vault_path = self.vault_path.clone();
@@ -673,6 +721,36 @@ impl DaemonState {
             _ => anyhow::bail!("{}", self.i18n.trf("daemon_unknown_action", &[action])),
         }
         Ok(())
+    }
+}
+
+fn host_notes_document(
+    host: &vida_core::vault::HostEntry,
+    revision: u64,
+) -> AgentHostNotesDocument {
+    let auth_kind = match host.auth {
+        AuthMethod::Password { .. } => "password",
+        AuthMethod::Key { .. } => "key",
+        AuthMethod::KeyInline { .. } => "key_inline",
+    };
+    let mut markdown = format!(
+        "# {}\n\n- Target: {}@{}:{}\n- Authentication: {}\n\n",
+        host.name, host.user, host.host, host.port, auth_kind
+    );
+    let notes = host.notes.as_deref().unwrap_or_default();
+    if notes.trim().is_empty() {
+        markdown.push_str(vida_core::host::DEFAULT_NOTES_MARKDOWN);
+    } else {
+        markdown.push_str(notes);
+        if !markdown.ends_with('\n') {
+            markdown.push('\n');
+        }
+    }
+    AgentHostNotesDocument {
+        host_id: host.id.clone(),
+        host_name: host.name.clone(),
+        revision,
+        markdown,
     }
 }
 

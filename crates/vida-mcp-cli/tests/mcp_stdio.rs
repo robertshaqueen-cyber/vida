@@ -59,6 +59,7 @@ async fn stdio_lifecycle_lists_only_reviewed_tools_without_daemon() {
     assert_eq!(initialized["id"], 1);
     assert_eq!(initialized["result"]["serverInfo"]["name"], "vida-mcp");
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
+    assert!(initialized["result"]["capabilities"]["resources"].is_object());
 
     write_message(
         &mut stdin,
@@ -84,6 +85,9 @@ async fn stdio_lifecycle_lists_only_reviewed_tools_without_daemon() {
             "exec",
             "host_list",
             "host_prepare",
+            "notes_append",
+            "notes_read",
+            "notes_replace",
             "screen_read",
             "session_list",
             "session_open",

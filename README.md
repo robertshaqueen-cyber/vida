@@ -25,6 +25,8 @@ vida 解决两个问题：
 daemon 内部使用，新会话会自动出现在 GUI，方便人类观察和接管。
 **Agent 主机草稿（M8）**允许 MCP 把不含凭据的新 SSH 主机资料送入现有 GUI 编辑器；
 认证方式、凭据、信任策略和最终保存仍由人确认。
+**主机运行档案（M9）**把每台主机的 Markdown 运维上下文保存在加密金库中；Agent 可读取、
+按小节追加或在明确要求时替换，并可通过 MCP resource 在新对话中重新获得上下文。
 
 ## 截图
 
@@ -63,6 +65,8 @@ daemon 内部使用，新会话会自动出现在 GUI，方便人类观察和接
   从解锁金库内部取用凭据，重复请求复用活动会话，并把新 SSH 终端实时加入 GUI 标签和审计
 - 📝 **Agent 主机草稿（M8）**：`host_prepare` 只接受名称、地址、用户、端口、标签等非秘密
   元数据；GUI 复用统一主机编辑器预填内容，密码、私钥和保存操作始终由人完成
+- 📚 **主机运行档案（M9）**：`notes_read`、`notes_append`、`notes_replace` 按 Markdown 二级
+  标题维护加密备注；每台主机同时注册为 `vida://host/<id>/notes` MCP resource
 
 规划中：
 
@@ -165,7 +169,14 @@ cargo test --workspace
 其他支持本地 stdio MCP 的客户端使用同一个配置语义：服务名为 `vida`，`command` 指向
 `target/release/vida-mcp` 的绝对路径，不需要参数。`vida-daemon` 与 GUI 仍按平常方式运行；
 MCP 服务端本身不会读取口令或私钥。当前工具固定为 `vida_status`、`host_list`、
-`host_prepare`、`session_list`、`session_open`、`screen_read`、`exec`。
+`host_prepare`、`notes_read`、`notes_append`、`notes_replace`、`session_list`、`session_open`、
+`screen_read`、`exec`。
+
+建议放进 Agent 项目指令：
+
+> 对 Vida 中某台主机执行会改变服务器状态的操作前，先读取该主机的 notes resource；完成后
+> 必须调用 `notes_append`，把实际变更和必要的后续注意事项记录到合适的小节。不要记录密码、
+> 私钥、口令、完整命令输出或未经验证的计划。
 
 > 没有安装 age/expect 时，`age_cli_interop` 测试会**失败**（而不是跳过）——
 > 这是有意为之：该测试是设计铁律「金库必须可用标准 age CLI 解密」的唯一验证。
@@ -390,6 +401,27 @@ MCP 服务端本身不会读取口令或私钥。当前工具固定为 `vida_sta
 6. 手工打开新增/编辑主机页面并先输入一段未保存内容，再让 Agent 准备另一草稿 → 预期当前
    人工输入不被覆盖；完成、取消或点击标签关闭当前编辑后，排队的 Agent 草稿才自动打开。
 7. 锁定金库后调用 `host_prepare` → 预期明确提示先在 GUI 解锁，不打开空表单、不写入金库。
+
+## M9 主机运行档案手动验收
+
+请构建 release 版 daemon、GUI、`vidactl` 和 `vida-mcp`，保持金库解锁并刷新 Vida MCP。
+使用测试主机，档案内容不要写入任何口令、私钥或敏感终端输出。
+
+1. 查看 Vida MCP → 预期新增 `notes_read`、`notes_append`、`notes_replace`，并支持
+   `resources/list`；每台已配置主机都有 `vida://host/<host-id>/notes` Markdown resource。
+2. 让 Agent“先读取搬瓦工东京的运行档案，不要登录服务器” → 预期返回主机标题、非敏感连接
+   摘要和默认小节；不会打开 SSH，不会显示密码、私钥路径、私钥内容或口令。
+3. 让 Agent“在 Change log 追加 Installed htop for M9 acceptance” → 预期工具返回更新后的
+   Markdown；GUI 主机详情的备注随 owner 事件刷新。执行
+   `vidactl host notes read 搬瓦工东京` 也能看到同一条内容。
+4. 再向同一小节追加第二条 → 预期第一条仍保留，第二条位于同一 `## Change log` 下；其他
+   小节不丢失。新开一个 Agent 对话询问这台主机做过什么 → 预期无需 SSH 即可从 resource 回答。
+5. 明确要求 Agent 用 `notes_replace` 把一个测试小节改成新正文 → 预期只替换该小节，其他小节
+   保持不变。普通变更记录不得自行选择 replace。
+6. 执行 `vidactl audit --host-id <host-id>` → 预期有 `notes_append`/`notes_replace` 记录，但
+   `audit.jsonl` 不含档案正文。锁定金库后读取或写入 → 预期明确提示先解锁。
+7. 尝试在更新请求中夹带 `password`、私钥或未知字段（自动测试已覆盖）→ 预期 daemon 拒绝，
+   错误响应、MCP stdout、owner 事件和审计都不回显该值。
 
 ## UI 基础框架手动验收
 

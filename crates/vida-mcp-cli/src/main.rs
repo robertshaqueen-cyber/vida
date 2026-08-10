@@ -1,7 +1,12 @@
 use rmcp::{
-    Json, ServerHandler, ServiceExt,
+    ErrorData, Json, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        Implementation, ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+        ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -9,9 +14,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use vida_client::{AgentHostDraft, WsClient};
+use vida_client::{
+    AgentHostDraft, AgentHostNotesDocument, AgentHostNotesUpdate, AgentNotesUpdateMode, WsClient,
+};
 
-const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Use host_list followed by session_open only when the human asks you to connect a configured SSH host; Vida resolves its credential internally and opens the terminal in the GUI. Use host_prepare only when the human asks you to add a new SSH profile: it fills non-secret fields in Vida's normal editor, while the human must choose authentication and save. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
+const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Use host_list followed by session_open only when the human asks you to connect a configured SSH host; Vida resolves its credential internally and opens the terminal in the GUI. Use host_prepare only when the human asks you to add a new SSH profile: it fills non-secret fields in Vida's normal editor, while the human must choose authentication and save. Each configured host exposes an encrypted-vault-backed Markdown notes resource at vida://host/<host_id>/notes. Read it before making host-specific changes, and call notes_append after completing a change so a future conversation has durable context. Use notes_replace only when the human explicitly asks to replace one section. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
 
 #[derive(Clone)]
 struct VidaMcp {
@@ -97,6 +104,19 @@ impl VidaMcp {
         }
     }
 
+    async fn notes_update_request(&self, update: &AgentHostNotesUpdate) -> Result<Value, String> {
+        let client = self.connect().await?;
+        match client.agent_update_host_notes(update).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.invalidate_client().await;
+                Err(format!(
+                    "The host notes result could not be confirmed, so Vida did not retry it. Read the host notes again before deciding whether another update is needed. The vault may also be locked. Details: {error}"
+                ))
+            }
+        }
+    }
+
     /// Opening by host ID is daemon-idempotent: if the first response is lost,
     /// retrying returns the already-alive matching session instead of creating
     /// another SSH login.
@@ -126,6 +146,7 @@ enum ReadRequest {
     Hosts,
     Sessions,
     Screen(String),
+    Notes(String),
 }
 
 impl ReadRequest {
@@ -135,6 +156,7 @@ impl ReadRequest {
             Self::Hosts => client.list_hosts().await,
             Self::Sessions => client.list_sessions().await,
             Self::Screen(session_id) => client.read_screen(session_id).await,
+            Self::Notes(host_id) => client.agent_read_host_notes(host_id).await,
         }
     }
 }
@@ -196,6 +218,30 @@ struct HostPrepareOutput {
     /// Always awaiting_human: the vault has not been modified yet.
     status: String,
     next_action: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NotesReadInput {
+    /// Exact configured host ID returned by host_list.
+    host_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct NotesOutput {
+    host_id: String,
+    host_name: String,
+    revision: u64,
+    markdown: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NotesUpdateInput {
+    /// Exact configured host ID returned by host_list.
+    host_id: String,
+    /// Exact level-two Markdown section title, without the leading ##.
+    section: String,
+    /// Markdown content to append or use as the replacement section body.
+    text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -396,6 +442,41 @@ impl VidaMcp {
     }
 
     #[tool(
+        name = "notes_read",
+        description = "Use after host_list to read the durable Markdown operations record for one configured host, especially before making host-specific changes or answering what is installed/configured. Do not use for live terminal output, credentials, or unconfigured hosts; use screen_read for the current terminal screen."
+    )]
+    async fn notes_read(
+        &self,
+        Parameters(input): Parameters<NotesReadInput>,
+    ) -> Result<Json<NotesOutput>, String> {
+        let value = self.read_request(ReadRequest::Notes(input.host_id)).await?;
+        Ok(Json(decode(value, "host notes")?))
+    }
+
+    #[tool(
+        name = "notes_append",
+        description = "Use after completing a change to a configured host to append concise durable Markdown under one named section, so future conversations know what changed. Also use when the human explicitly asks you to record operational context. Do not use for credentials, command transcripts, temporary observations, speculative plans, or replacing existing history; use notes_replace only for an explicitly requested correction."
+    )]
+    async fn notes_append(
+        &self,
+        Parameters(input): Parameters<NotesUpdateInput>,
+    ) -> Result<Json<NotesOutput>, String> {
+        self.update_notes(input, AgentNotesUpdateMode::Append).await
+    }
+
+    #[tool(
+        name = "notes_replace",
+        description = "Use only when the human explicitly asks you to correct or replace one existing host-notes section. The named section body is replaced while all other Markdown sections are preserved. Do not use for ordinary change logging, credentials, whole-document rewrites, live terminal output, or silent cleanup; use notes_append for normal durable updates."
+    )]
+    async fn notes_replace(
+        &self,
+        Parameters(input): Parameters<NotesUpdateInput>,
+    ) -> Result<Json<NotesOutput>, String> {
+        self.update_notes(input, AgentNotesUpdateMode::Replace)
+            .await
+    }
+
+    #[tool(
         name = "session_list",
         description = "Use before screen_read or exec to identify the intended visible local or SSH terminal by title, host, target kind, and session_id. Do not guess a session ID or use host_list as a substitute; configured hosts are not necessarily active terminal sessions."
     )]
@@ -483,14 +564,90 @@ impl VidaMcp {
         let value = self.exec_request(&input.session_id, &input.command).await?;
         Ok(Json(decode_exec_output(input.session_id, value)))
     }
+
+    async fn update_notes(
+        &self,
+        input: NotesUpdateInput,
+        mode: AgentNotesUpdateMode,
+    ) -> Result<Json<NotesOutput>, String> {
+        let update = AgentHostNotesUpdate {
+            host_id: input.host_id,
+            section: input.section,
+            text: input.text,
+            mode,
+        };
+        let value = self.notes_update_request(&update).await?;
+        Ok(Json(decode(value, "host notes update")?))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for VidaMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("vida-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(SERVER_INSTRUCTIONS)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_resources()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(Implementation::new("vida-mcp", env!("CARGO_PKG_VERSION")))
+        .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let value = self
+            .read_request(ReadRequest::Hosts)
+            .await
+            .map_err(|error| ErrorData::internal_error(error, None))?;
+        let hosts: Vec<HostOutput> = decode(value, "host resources")
+            .map_err(|error| ErrorData::internal_error(error, None))?;
+        let resources = hosts
+            .into_iter()
+            .map(|host| {
+                Resource::new(
+                    format!("vida://host/{}/notes", host.id),
+                    format!("{} operations notes", host.name),
+                )
+                .with_title(format!("{} · Operations notes", host.name))
+                .with_description(
+                    "Encrypted-vault-backed Markdown context for this configured Vida host. Read before host-specific work; update through notes_append or notes_replace.",
+                )
+                .with_mime_type("text/markdown")
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let host_id = request
+            .uri
+            .strip_prefix("vida://host/")
+            .and_then(|rest| rest.strip_suffix("/notes"))
+            .filter(|host_id| !host_id.is_empty() && !host_id.contains('/'))
+            .ok_or_else(|| {
+                ErrorData::resource_not_found(
+                    "Vida host notes resource not found; call resources/list for a current URI",
+                    None,
+                )
+            })?;
+        let value = self
+            .read_request(ReadRequest::Notes(host_id.to_string()))
+            .await
+            .map_err(|error| ErrorData::internal_error(error, None))?;
+        let document: AgentHostNotesDocument = decode(value, "host notes resource")
+            .map_err(|error| ErrorData::internal_error(error, None))?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(document.markdown, request.uri).with_mime_type("text/markdown"),
+        ])
+        .into())
     }
 }
 
@@ -507,7 +664,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_only_the_seven_reviewed_tools() {
+    fn exposes_only_the_ten_reviewed_tools() {
         let server = VidaMcp::new();
         let mut names = server
             .tool_router
@@ -522,6 +679,9 @@ mod tests {
                 "exec",
                 "host_list",
                 "host_prepare",
+                "notes_append",
+                "notes_read",
+                "notes_replace",
                 "screen_read",
                 "session_list",
                 "session_open",

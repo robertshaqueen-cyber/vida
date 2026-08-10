@@ -70,6 +70,9 @@ pub enum AgentEvent {
         draft_id: String,
         draft: AgentHostDraft,
     },
+    HostNotesUpdated {
+        host_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +352,38 @@ impl AgentController {
             draft,
         });
         Ok(draft_id)
+    }
+
+    pub fn audit_host_notes_update(
+        &self,
+        host_id: &str,
+        section: &str,
+        text: &str,
+        mode: &str,
+    ) -> Result<()> {
+        let input = serde_json::json!({
+            "section": section,
+            "text": text,
+            "mode": mode,
+        });
+        self.append_audit(AuditEntry {
+            timestamp: chrono::Utc::now().timestamp(),
+            session_id: String::new(),
+            host_id: Some(host_id.to_string()),
+            tool: format!("notes_{mode}"),
+            input: redact_for_audit(&input.to_string()),
+            matched_rules: Vec::new(),
+            approval_id: None,
+            outcome: AuditOutcome::Allowed,
+            result_summary: Some("encrypted host notes update accepted".into()),
+        })?;
+        Ok(())
+    }
+
+    pub fn notify_host_notes_updated(&self, host_id: &str) {
+        let _ = self.events.send(AgentEvent::HostNotesUpdated {
+            host_id: host_id.to_string(),
+        });
     }
 
     pub fn take_for_approval(&mut self, approval_id: &str, now: i64) -> Result<PendingApproval> {

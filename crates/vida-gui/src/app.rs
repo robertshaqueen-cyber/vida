@@ -1161,6 +1161,20 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     app.pending_agent_host_drafts.push_back(draft);
                     open_next_agent_host_draft(app);
                 }
+                OwnerEvent::HostNotesUpdated { host_id: _ } => {
+                    let Some(client) = app.ws_client.as_ref().cloned() else {
+                        return Task::none();
+                    };
+                    return Task::perform(
+                        async move {
+                            match client.list_hosts().await {
+                                Ok(hosts) => AppMessage::HostsLoaded(parse_hosts(&hosts)),
+                                Err(error) => AppMessage::WsError(error.to_string()),
+                            }
+                        },
+                        |message| message,
+                    );
+                }
             }
             Task::none()
         }

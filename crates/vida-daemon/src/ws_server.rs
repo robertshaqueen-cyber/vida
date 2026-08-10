@@ -589,6 +589,8 @@ async fn handle_request(
         Request::AgentExec { .. }
             | Request::AgentOpenSshSession { .. }
             | Request::AgentPrepareHost { .. }
+            | Request::AgentReadHostNotes { .. }
+            | Request::AgentUpdateHostNotes { .. }
             | Request::ListAgentApprovals
             | Request::ApproveAgentAction { .. }
             | Request::DenyAgentAction { .. }
@@ -690,6 +692,8 @@ async fn handle_request(
         Request::AgentExec { .. }
         | Request::AgentOpenSshSession { .. }
         | Request::AgentPrepareHost { .. }
+        | Request::AgentReadHostNotes { .. }
+        | Request::AgentUpdateHostNotes { .. }
         | Request::ListAgentApprovals
         | Request::ApproveAgentAction { .. }
         | Request::DenyAgentAction { .. }
@@ -764,12 +768,16 @@ fn request_allowed_for_role(request: &Request, role: ClientRole) -> bool {
             Request::AgentExec { .. }
                 | Request::AgentOpenSshSession { .. }
                 | Request::AgentPrepareHost { .. }
+                | Request::AgentReadHostNotes { .. }
+                | Request::AgentUpdateHostNotes { .. }
         ),
         ClientRole::Agent => matches!(
             request,
             Request::AgentExec { .. }
                 | Request::AgentOpenSshSession { .. }
                 | Request::AgentPrepareHost { .. }
+                | Request::AgentReadHostNotes { .. }
+                | Request::AgentUpdateHostNotes { .. }
                 | Request::VaultStatus
                 | Request::ListHosts
                 | Request::Pty(PtyRequest::ListSessions)
@@ -839,6 +847,54 @@ async fn handle_agent_request(
 ) -> Result<serde_json::Value> {
     let now = chrono::Utc::now().timestamp();
     match request {
+        Request::AgentReadHostNotes { host_id } => {
+            validate_agent_host_id(&host_id, "读取主机档案")?;
+            let document = state.lock().await.read_host_notes(&host_id)?;
+            Ok(serde_json::to_value(document)?)
+        }
+        Request::AgentUpdateHostNotes { mut update } => {
+            validate_agent_host_id(&update.host_id, "更新主机档案")?;
+            update.section = update.section.trim().to_string();
+            if update.section.is_empty()
+                || update.section.chars().count() > 128
+                || update.section.chars().any(char::is_control)
+                || update.section.starts_with('#')
+            {
+                anyhow::bail!(
+                    "主机档案的小节名称无效；请使用 1–128 个普通字符且不要包含 Markdown 标题符号"
+                );
+            }
+            if update.text.trim().is_empty()
+                || update.text.len() > 65_536
+                || update.text.contains('\0')
+            {
+                anyhow::bail!("主机档案内容不能为空、不能包含 NUL，且最多为 65536 字节");
+            }
+            let mode = match update.mode {
+                crate::protocol::AgentNotesUpdateMode::Append => "append",
+                crate::protocol::AgentNotesUpdateMode::Replace => "replace",
+            };
+            // Confirm the unlocked host exists before recording an accepted
+            // write request; the actual encrypted mutation remains below.
+            state.lock().await.read_host_notes(&update.host_id)?;
+            agent.lock().await.audit_host_notes_update(
+                &update.host_id,
+                &update.section,
+                &update.text,
+                mode,
+            )?;
+            let document = state.lock().await.update_host_notes(
+                &update.host_id,
+                &update.section,
+                &update.text,
+                update.mode,
+            )?;
+            agent
+                .lock()
+                .await
+                .notify_host_notes_updated(&update.host_id);
+            Ok(serde_json::to_value(document)?)
+        }
         Request::AgentPrepareHost { draft } => {
             {
                 let state = state.lock().await;
@@ -1050,6 +1106,13 @@ async fn handle_agent_request(
         }
         _ => unreachable!("only Agent requests reach handle_agent_request"),
     }
+}
+
+fn validate_agent_host_id(host_id: &str, action: &str) -> Result<()> {
+    if host_id.is_empty() || host_id.len() > 256 || host_id.chars().any(char::is_whitespace) {
+        anyhow::bail!("Agent {action}时必须提供 host_list 返回的有效主机 ID");
+    }
+    Ok(())
 }
 
 fn ssh_auth_from_vault(auth: vida_core::vault::AuthMethod) -> crate::pty::SshAuth {

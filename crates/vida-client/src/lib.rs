@@ -98,6 +98,29 @@ pub struct AgentHostDraft {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNotesUpdateMode {
+    Append,
+    Replace,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AgentHostNotesUpdate {
+    pub host_id: String,
+    pub section: String,
+    pub text: String,
+    pub mode: AgentNotesUpdateMode,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AgentHostNotesDocument {
+    pub host_id: String,
+    pub host_name: String,
+    pub revision: u64,
+    pub markdown: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerEvent {
@@ -118,6 +141,9 @@ pub enum OwnerEvent {
     HostDraftPrepared {
         draft_id: String,
         draft: AgentHostDraft,
+    },
+    HostNotesUpdated {
+        host_id: String,
     },
 }
 
@@ -541,6 +567,25 @@ impl WsClient {
             .await
     }
 
+    pub async fn agent_read_host_notes(&self, host_id: &str) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "AgentReadHostNotes",
+            serde_json::json!({"host_id": host_id}),
+        )
+        .await
+    }
+
+    pub async fn agent_update_host_notes(
+        &self,
+        update: &AgentHostNotesUpdate,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "AgentUpdateHostNotes",
+            serde_json::json!({"update": update}),
+        )
+        .await
+    }
+
     pub async fn list_agent_approvals(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("ListAgentApprovals").await
     }
@@ -890,6 +935,33 @@ mod tests {
         ));
         assert!(!wire.contains("password"));
         assert!(!wire.contains("private_key"));
+    }
+
+    #[test]
+    fn host_notes_update_event_identifies_only_the_changed_host() {
+        let (tx, _request_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
+        let client = WsClient {
+            tx,
+            push_registry: registry.clone(),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        {
+            let mut state = registry.lock().unwrap();
+            state.owner_event_sender = Some(sender);
+            state.prepared_owner_event_receiver = Some(receiver);
+        }
+
+        let wire = r#"{"type":"Event","event":"agent_approval","data":{"kind":"host_notes_updated","host_id":"host-1"}}"#;
+        forward_text_push(wire, &registry);
+
+        let mut receiver = client.subscribe_owner_events();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            OwnerEvent::HostNotesUpdated { host_id } if host_id == "host-1"
+        ));
+        assert!(!wire.contains("markdown"));
+        assert!(!wire.contains("credential"));
     }
 
     #[tokio::test]

@@ -20,6 +20,30 @@ pub struct AgentHostDraft {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNotesUpdateMode {
+    Append,
+    Replace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHostNotesUpdate {
+    pub host_id: String,
+    pub section: String,
+    pub text: String,
+    pub mode: AgentNotesUpdateMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHostNotesDocument {
+    pub host_id: String,
+    pub host_name: String,
+    pub revision: u64,
+    pub markdown: String,
+}
+
 // ---------------------------------------------------------------------------
 // Request — GUI → Daemon
 // ---------------------------------------------------------------------------
@@ -116,6 +140,12 @@ pub enum Request {
     /// add-host editor. This request never writes the vault by itself.
     AgentPrepareHost {
         draft: AgentHostDraft,
+    },
+    AgentReadHostNotes {
+        host_id: String,
+    },
+    AgentUpdateHostNotes {
+        update: AgentHostNotesUpdate,
     },
     ListAgentApprovals,
     ApproveAgentAction {

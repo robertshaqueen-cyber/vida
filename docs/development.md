@@ -285,6 +285,32 @@ macOS、同机显示器 scale factor=1（两个进程均无窗口，scale factor
 两项均来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次 peak 分别为
 2736K 和 3984K。测量只读取隔离空金库状态，没有创建主机、凭据或终端会话。
 
+### M9 主机运行档案
+
+- `HostEntry.notes` 作为加密 Markdown 正文，不增加 Vault 字段；`update_notes_section` 精确定位
+  二级标题，append/replace 均保留无关小节。
+- daemon 新增 Agent-only 档案读写协议。写入前验证主机、标题和 64 KiB 正文上限，拒绝未知
+  字段；正文只以长度与 SHA-256 进入审计。owner 事件不携带正文，GUI 收到后重新加载主机并
+  走 `set_hosts()`，不会产生业务数据分层漂移。
+- `vida-mcp` 增加三个带输入/输出 Schema 的 notes 工具和动态主机 resources；`vidactl host
+  notes read|append|replace` 复用同一 `vida-client` 路径。读取可安全重连重试，写入结果不确定
+  时不重试，避免重复追加。
+
+#### M9 release 内存实测（2026-08-10）
+
+macOS、同机显示器 scale factor=1（两个进程均无窗口）。使用隔离临时配置启动最终 release
+daemon 和 `vida-mcp`；MCP 完成 initialize、加载十个工具与 resources capability，调用
+`vida_status` 建立 Agent WebSocket，并实际进入 `resources/list` 的锁库错误路径：
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| `vida-mcp`，十工具及 resources 已加载、Agent 已连接 | **3344K** |
+| release daemon，隔离空配置、Agent 已连接 | **4656K** |
+
+两项均来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次 peak 分别为
+3360K 和 4656K。隔离配置没有主机、凭据或终端会话，resource 请求因金库不存在而按预期返回
+明确锁库错误，没有修改用户配置。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |
