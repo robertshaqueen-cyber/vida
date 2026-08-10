@@ -588,6 +588,7 @@ async fn handle_request(
         &request,
         Request::AgentExec { .. }
             | Request::AgentOpenSshSession { .. }
+            | Request::AgentPrepareHost { .. }
             | Request::ListAgentApprovals
             | Request::ApproveAgentAction { .. }
             | Request::DenyAgentAction { .. }
@@ -688,6 +689,7 @@ async fn handle_request(
 
         Request::AgentExec { .. }
         | Request::AgentOpenSshSession { .. }
+        | Request::AgentPrepareHost { .. }
         | Request::ListAgentApprovals
         | Request::ApproveAgentAction { .. }
         | Request::DenyAgentAction { .. }
@@ -759,12 +761,15 @@ fn request_allowed_for_role(request: &Request, role: ClientRole) -> bool {
     match role {
         ClientRole::Owner => !matches!(
             request,
-            Request::AgentExec { .. } | Request::AgentOpenSshSession { .. }
+            Request::AgentExec { .. }
+                | Request::AgentOpenSshSession { .. }
+                | Request::AgentPrepareHost { .. }
         ),
         ClientRole::Agent => matches!(
             request,
             Request::AgentExec { .. }
                 | Request::AgentOpenSshSession { .. }
+                | Request::AgentPrepareHost { .. }
                 | Request::VaultStatus
                 | Request::ListHosts
                 | Request::Pty(PtyRequest::ListSessions)
@@ -776,6 +781,57 @@ fn request_allowed_for_role(request: &Request, role: ClientRole) -> bool {
     }
 }
 
+fn normalize_agent_host_draft(
+    mut draft: crate::protocol::AgentHostDraft,
+) -> Result<crate::protocol::AgentHostDraft> {
+    fn required(value: String, label: &str, max_chars: usize) -> Result<String> {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            anyhow::bail!("Agent 主机草稿缺少{label}");
+        }
+        if value.chars().count() > max_chars || value.chars().any(char::is_control) {
+            anyhow::bail!("Agent 主机草稿的{label}格式无效或过长");
+        }
+        Ok(value)
+    }
+    fn optional(value: Option<String>, label: &str, max_chars: usize) -> Result<Option<String>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        required(value, label, max_chars).map(Some)
+    }
+
+    draft.name = required(draft.name, "主机名称", 128)?;
+    draft.host = required(draft.host, "主机地址", 255)?;
+    if draft.host.chars().any(char::is_whitespace) {
+        anyhow::bail!("Agent 主机草稿的主机地址不能包含空格");
+    }
+    draft.user = required(draft.user, "用户名", 128)?;
+    if draft.user.chars().any(char::is_whitespace) {
+        anyhow::bail!("Agent 主机草稿的用户名不能包含空格");
+    }
+    if draft.port == 0 {
+        anyhow::bail!("Agent 主机草稿的 SSH 端口必须为 1–65535");
+    }
+    if draft.tags.len() > 20 {
+        anyhow::bail!("Agent 主机草稿最多包含 20 个标签");
+    }
+    let mut tags = Vec::with_capacity(draft.tags.len());
+    for tag in draft.tags {
+        let tag = required(tag, "标签", 64)?;
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    draft.tags = tags;
+    draft.group = optional(draft.group.take(), "分组", 128)?;
+    draft.notes = optional(draft.notes.take(), "备注", 4096)?;
+    Ok(draft)
+}
+
 async fn handle_agent_request(
     request: Request,
     state: &Arc<Mutex<DaemonState>>,
@@ -783,6 +839,20 @@ async fn handle_agent_request(
 ) -> Result<serde_json::Value> {
     let now = chrono::Utc::now().timestamp();
     match request {
+        Request::AgentPrepareHost { draft } => {
+            {
+                let state = state.lock().await;
+                if state.vault_status().locked {
+                    anyhow::bail!("金库已锁定，无法准备主机配置；请先在 Vida GUI 解锁后重试");
+                }
+            }
+            let draft = normalize_agent_host_draft(draft)?;
+            let draft_id = agent.lock().await.prepare_host_draft(draft)?;
+            Ok(serde_json::json!({
+                "draft_id": draft_id,
+                "status": "awaiting_human",
+            }))
+        }
         Request::AgentOpenSshSession { host_id } => {
             if host_id.is_empty() || host_id.len() > 256 {
                 anyhow::bail!("Agent 打开 SSH 时必须提供有效的主机 ID");

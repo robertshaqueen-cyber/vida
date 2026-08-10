@@ -259,6 +259,32 @@ macOS、同机显示器 scale factor=1（两个被测进程均无窗口，scale 
 两项均来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次 peak 分别为
 2864K 和 4224K。测量只读取空金库状态，没有创建主机、会话或修改用户配置。
 
+### M8 Agent 准备 SSH 主机草稿
+
+- daemon 新增 Agent-only `AgentPrepareHost`，请求结构不含任何认证材料并拒绝未知字段；名称、
+  地址、用户名、端口、标签、分组和备注在 daemon 侧统一校验与规范化。
+- 请求只产生无凭据审计和 owner 事件，不调用 `UpdateHost`、不写金库。审计输入只保留长度和
+  SHA-256，不额外明文保存主机地址、名称或备注。
+- GUI 复用 S4 现有新增主机编辑器和共享视觉样式；认证、凭据和 Agent 权限使用人的安全默认值。
+  人正在编辑时草稿排队，完成或取消后再打开，Agent 永不覆盖人的输入。
+- MCP `host_prepare` 明确返回 `awaiting_human`，不把草稿表述为已创建；写入响应不确定时不自动
+  重试。自动测试覆盖角色隔离、锁库拒绝、未知凭据字段拒绝、不写金库、owner 事件、审计脱敏、
+  GUI 人类输入优先以及固定七工具 Schema。所有者手动验收见 README 对应清单。
+
+#### M8 release 内存实测（2026-08-10）
+
+macOS、同机显示器 scale factor=1（两个进程均无窗口，scale factor 不参与其内存分配）。使用
+隔离临时配置启动最终 release daemon 和 `vida-mcp`；MCP 完成 initialize、加载包含
+`host_prepare` 的七工具 Schema，并通过 `vida_status` 建立 Agent WebSocket 连接：
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| `vida-mcp`，七工具已加载、Agent 连接已建立 | **2720K** |
+| release daemon，空金库、Agent 连接已建立 | **3920K** |
+
+两项均来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次 peak 分别为
+2736K 和 3984K。测量只读取隔离空金库状态，没有创建主机、凭据或终端会话。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |

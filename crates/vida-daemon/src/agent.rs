@@ -10,6 +10,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use vida_core::agent_policy::{AgentTrust, DangerMatch, analyze_command, redact_for_audit};
 
+use crate::protocol::AgentHostDraft;
+
 pub const APPROVAL_TTL_SECONDS: i64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +65,10 @@ pub enum AgentEvent {
         host_name: String,
         cols: u16,
         rows: u16,
+    },
+    HostDraftPrepared {
+        draft_id: String,
+        draft: AgentHostDraft,
     },
 }
 
@@ -319,6 +325,30 @@ impl AgentController {
             cols,
             rows,
         });
+    }
+
+    /// Audit and notify an owner about non-secret host metadata. The serialized
+    /// draft is hashed before persistence so addresses, names and notes do not
+    /// become an additional plaintext inventory in audit.jsonl.
+    pub fn prepare_host_draft(&self, draft: AgentHostDraft) -> Result<String> {
+        let draft_id = uuid::Uuid::new_v4().to_string();
+        let audit_input = serde_json::to_string(&draft).context("Failed to encode host draft")?;
+        self.append_audit(AuditEntry {
+            timestamp: chrono::Utc::now().timestamp(),
+            session_id: String::new(),
+            host_id: None,
+            tool: "host_prepare".into(),
+            input: redact_for_audit(&audit_input),
+            matched_rules: Vec::new(),
+            approval_id: None,
+            outcome: AuditOutcome::Allowed,
+            result_summary: Some("owner add-host editor requested".into()),
+        })?;
+        let _ = self.events.send(AgentEvent::HostDraftPrepared {
+            draft_id: draft_id.clone(),
+            draft,
+        });
+        Ok(draft_id)
     }
 
     pub fn take_for_approval(&mut self, approval_id: &str, now: i64) -> Result<PendingApproval> {

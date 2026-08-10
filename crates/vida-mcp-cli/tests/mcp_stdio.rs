@@ -83,6 +83,7 @@ async fn stdio_lifecycle_lists_only_reviewed_tools_without_daemon() {
         [
             "exec",
             "host_list",
+            "host_prepare",
             "screen_read",
             "session_list",
             "session_open",

@@ -9,9 +9,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use vida_client::WsClient;
+use vida_client::{AgentHostDraft, WsClient};
 
-const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Use host_list followed by session_open only when the human asks you to connect a configured SSH host; Vida resolves its credential internally and opens the terminal in the GUI. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
+const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Use host_list followed by session_open only when the human asks you to connect a configured SSH host; Vida resolves its credential internally and opens the terminal in the GUI. Use host_prepare only when the human asks you to add a new SSH profile: it fills non-secret fields in Vida's normal editor, while the human must choose authentication and save. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
 
 #[derive(Clone)]
 struct VidaMcp {
@@ -77,6 +77,21 @@ impl VidaMcp {
                 self.invalidate_client().await;
                 Err(format!(
                     "The command result could not be confirmed, so Vida did not retry it. Inspect the target with screen_read and check the Vida GUI approval/audit state before deciding whether to submit a new command. Details: {error}"
+                ))
+            }
+        }
+    }
+
+    /// Host preparation is a human-visible write request. Do not retry an
+    /// uncertain response because the GUI may already contain the draft.
+    async fn host_prepare_request(&self, draft: &AgentHostDraft) -> Result<Value, String> {
+        let client = self.connect().await?;
+        match client.agent_prepare_host(draft).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.invalidate_client().await;
+                Err(format!(
+                    "The host draft result could not be confirmed, so Vida did not retry it. Check whether the add-host editor already opened in the Vida GUI before submitting another draft. The vault may also be locked. Details: {error}"
                 ))
             }
         }
@@ -149,6 +164,38 @@ struct HostOutput {
     group: Option<String>,
     auth_kind: String,
     agent_trust: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct HostPrepareInput {
+    /// Human-readable profile name shown in Vida.
+    name: String,
+    /// SSH hostname or IP address. Credentials are not accepted here.
+    host: String,
+    /// SSH username.
+    user: String,
+    #[serde(default = "default_ssh_port")]
+    #[schemars(default = "default_ssh_port")]
+    #[schemars(range(min = 1))]
+    port: u16,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct HostPrepareOutput {
+    draft_id: String,
+    /// Always awaiting_human: the vault has not been modified yet.
+    status: String,
+    next_action: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -317,6 +364,38 @@ impl VidaMcp {
     }
 
     #[tool(
+        name = "host_prepare",
+        description = "Use only when the human asks you to add a new SSH host and has the Vida GUI open. Provide non-secret profile metadata; Vida opens its normal add-host editor so the human can select authentication, review every field, and save. Do not use for passwords, private keys, passphrases, trust-policy changes, unattended host creation, edits to existing hosts, or speculative inventory building."
+    )]
+    async fn host_prepare(
+        &self,
+        Parameters(input): Parameters<HostPrepareInput>,
+    ) -> Result<Json<HostPrepareOutput>, String> {
+        let draft = AgentHostDraft {
+            name: input.name,
+            host: input.host,
+            user: input.user,
+            port: input.port,
+            tags: input.tags,
+            group: input.group,
+            notes: input.notes,
+        };
+        let value = self.host_prepare_request(&draft).await?;
+        #[derive(Deserialize)]
+        struct RawHostPrepareOutput {
+            draft_id: String,
+            status: String,
+        }
+        let raw: RawHostPrepareOutput = decode(value, "host prepare")?;
+        Ok(Json(HostPrepareOutput {
+            draft_id: raw.draft_id,
+            status: raw.status,
+            next_action: "Ask the human to review the prefilled Vida add-host editor, choose authentication, and click Save. The host does not exist until the human saves it."
+                .into(),
+        }))
+    }
+
+    #[tool(
         name = "session_list",
         description = "Use before screen_read or exec to identify the intended visible local or SSH terminal by title, host, target kind, and session_id. Do not guess a session ID or use host_list as a substitute; configured hosts are not necessarily active terminal sessions."
     )]
@@ -428,7 +507,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_only_the_six_reviewed_tools() {
+    fn exposes_only_the_seven_reviewed_tools() {
         let server = VidaMcp::new();
         let mut names = server
             .tool_router
@@ -442,6 +521,7 @@ mod tests {
             [
                 "exec",
                 "host_list",
+                "host_prepare",
                 "screen_read",
                 "session_list",
                 "session_open",

@@ -3,6 +3,23 @@ use vida_core::agent_policy::AgentTrust;
 use vida_core::sync::ConflictFile;
 use vida_core::vault::Settings;
 
+/// Non-secret SSH profile fields an Agent may prepare for human review.
+/// Authentication material and Agent trust are deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHostDraft {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Request — GUI → Daemon
 // ---------------------------------------------------------------------------
@@ -94,6 +111,11 @@ pub enum Request {
     /// unlocked vault and emits an owner event so GUI clients can attach.
     AgentOpenSshSession {
         host_id: String,
+    },
+    /// Prepare non-secret host fields and ask an owner GUI to open the normal
+    /// add-host editor. This request never writes the vault by itself.
+    AgentPrepareHost {
+        draft: AgentHostDraft,
     },
     ListAgentApprovals,
     ApproveAgentAction {

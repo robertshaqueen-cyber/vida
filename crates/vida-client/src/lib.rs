@@ -82,6 +82,22 @@ pub struct AgentApproval {
     pub expires_at: i64,
 }
 
+/// Non-secret SSH fields prepared by an Agent for the owner's existing host
+/// editor. Authentication material and trust policy are intentionally absent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AgentHostDraft {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerEvent {
@@ -98,6 +114,10 @@ pub enum OwnerEvent {
         host_name: String,
         cols: u16,
         rows: u16,
+    },
+    HostDraftPrepared {
+        draft_id: String,
+        draft: AgentHostDraft,
     },
 }
 
@@ -511,6 +531,16 @@ impl WsClient {
         .await
     }
 
+    /// Ask the owner GUI to review a non-secret host draft in the normal host
+    /// editor. This never saves the host by itself.
+    pub async fn agent_prepare_host(
+        &self,
+        draft: &AgentHostDraft,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send("AgentPrepareHost", serde_json::json!({"draft": draft}))
+            .await
+    }
+
     pub async fn list_agent_approvals(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("ListAgentApprovals").await
     }
@@ -826,6 +856,37 @@ mod tests {
             } if session_id == "session-1"
                 && host_id == "host-1"
                 && host_name == "Production"
+        ));
+        assert!(!wire.contains("password"));
+        assert!(!wire.contains("private_key"));
+    }
+
+    #[test]
+    fn agent_host_draft_event_contains_only_non_secret_fields() {
+        let (tx, _request_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
+        let client = WsClient {
+            tx,
+            push_registry: registry.clone(),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        {
+            let mut state = registry.lock().unwrap();
+            state.owner_event_sender = Some(sender);
+            state.prepared_owner_event_receiver = Some(receiver);
+        }
+
+        let wire = r#"{"type":"Event","event":"agent_approval","data":{"kind":"host_draft_prepared","draft_id":"draft-1","draft":{"name":"Edge","host":"example.com","user":"deploy","port":22,"tags":["prod"],"group":null,"notes":null}}}"#;
+        forward_text_push(wire, &registry);
+
+        let mut receiver = client.subscribe_owner_events();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            OwnerEvent::HostDraftPrepared { draft_id, draft }
+                if draft_id == "draft-1"
+                    && draft.name == "Edge"
+                    && draft.host == "example.com"
+                    && draft.user == "deploy"
         ));
         assert!(!wire.contains("password"));
         assert!(!wire.contains("private_key"));

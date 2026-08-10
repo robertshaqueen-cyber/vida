@@ -1627,6 +1627,121 @@ async fn agent_opens_one_configured_ssh_session_without_exposing_credentials() {
     );
 }
 
+#[tokio::test]
+async fn agent_prepares_non_secret_host_draft_without_writing_vault() {
+    use sha2::{Digest, Sha256};
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut owner, mut owner_reader) = connect(addr).await;
+    let owner_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"owner"}},"id":1}}"#,
+        token
+    );
+    assert_eq!(
+        send_recv(&mut owner, &mut owner_reader, &owner_auth).await["type"],
+        "Ok"
+    );
+    assert_eq!(
+        send_recv(
+            &mut owner,
+            &mut owner_reader,
+            r#"{"method":"CreateVault","params":{"passphrase":"test-passphrase"},"id":2}"#,
+        )
+        .await["type"],
+        "Ok"
+    );
+    let owner_attempt = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"AgentPrepareHost","params":{"draft":{"name":"Owner path","host":"example.com","user":"root","port":22}},"id":99}"#,
+    )
+    .await;
+    assert_eq!(owner_attempt["type"], "Error");
+
+    let agent_token = hex::encode(Sha256::digest(format!("vida-agent:{token}").as_bytes()));
+    let (mut agent, mut agent_reader) = connect(addr).await;
+    let agent_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"agent"}},"id":1}}"#,
+        agent_token
+    );
+    assert_eq!(
+        send_recv(&mut agent, &mut agent_reader, &agent_auth).await["result"]["role"],
+        "agent"
+    );
+
+    let prepared = send_recv(
+        &mut agent,
+        &mut agent_reader,
+        r#"{"method":"AgentPrepareHost","params":{"draft":{"name":"  New server  ","host":"example.com","user":"deploy","port":2222,"tags":["prod","prod"],"group":"  Edge  ","notes":"review me"}},"id":2}"#,
+    )
+    .await;
+    assert_eq!(prepared["type"], "Ok", "prepare failed: {prepared}");
+    assert_eq!(prepared["result"]["status"], "awaiting_human");
+    assert!(prepared["result"]["draft_id"].as_str().is_some());
+
+    let event = recv_text(&mut owner_reader).await;
+    assert_eq!(event["data"]["kind"], "host_draft_prepared");
+    assert_eq!(event["data"]["draft"]["name"], "New server");
+    assert_eq!(event["data"]["draft"]["group"], "Edge");
+    assert_eq!(event["data"]["draft"]["tags"], serde_json::json!(["prod"]));
+    assert!(!event.to_string().contains("password"));
+    assert!(!event.to_string().contains("private_key"));
+
+    let hosts = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"ListHosts","id":3}"#,
+    )
+    .await;
+    assert_eq!(hosts["result"], serde_json::json!([]));
+
+    let audit = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"ReadAgentAudit","params":{"limit":10},"id":4}"#,
+    )
+    .await;
+    let audit_text = audit.to_string();
+    assert!(audit_text.contains("host_prepare"));
+    assert!(!audit_text.contains("example.com"));
+    assert!(!audit_text.contains("New server"));
+    assert!(!audit_text.contains("review me"));
+
+    let credential_injection = send_recv(
+        &mut agent,
+        &mut agent_reader,
+        r#"{"method":"AgentPrepareHost","params":{"draft":{"name":"Rejected","host":"example.com","user":"root","port":22,"password":"must-not-enter"}},"id":3}"#,
+    )
+    .await;
+    assert_eq!(credential_injection["type"], "Error");
+    assert!(!credential_injection.to_string().contains("must-not-enter"));
+}
+
+#[tokio::test]
+async fn agent_host_draft_requires_unlocked_vault() {
+    use sha2::{Digest, Sha256};
+
+    let (addr, token, _dir) = start_daemon().await;
+    let agent_token = hex::encode(Sha256::digest(format!("vida-agent:{token}").as_bytes()));
+    let (mut agent, mut agent_reader) = connect(addr).await;
+    let agent_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"agent"}},"id":1}}"#,
+        agent_token
+    );
+    assert_eq!(
+        send_recv(&mut agent, &mut agent_reader, &agent_auth).await["result"]["role"],
+        "agent"
+    );
+    let response = send_recv(
+        &mut agent,
+        &mut agent_reader,
+        r#"{"method":"AgentPrepareHost","params":{"draft":{"name":"Locked","host":"example.com","user":"root","port":22}},"id":2}"#,
+    )
+    .await;
+    assert_eq!(response["type"], "Error");
+    assert!(response["message"].as_str().unwrap().contains("解锁"));
+}
+
 /// 打开会话 → 输入 → 读屏幕 → resize → 列出 → 关闭。
 /// 覆盖规格 5.2 全部 6 个 IPC 方法。
 #[tokio::test]

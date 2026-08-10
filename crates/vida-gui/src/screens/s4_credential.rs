@@ -94,6 +94,21 @@ impl State {
         }
     }
 
+    /// Create the normal add-host editor with only Agent-supplied, non-secret
+    /// metadata filled in. Credential and trust fields keep their human-owned
+    /// safe defaults.
+    pub fn new_agent_draft(draft: vida_client::AgentHostDraft) -> Self {
+        let mut state = Self::new_add();
+        state.name = draft.name;
+        state.host = draft.host;
+        state.user = draft.user;
+        state.port = draft.port.to_string();
+        state.tags = draft.tags.join(", ");
+        state.group = draft.group.unwrap_or_default();
+        state.notes = draft.notes.unwrap_or_default();
+        state
+    }
+
     /// Create editor pre-filled with existing host data for editing.
     #[allow(clippy::too_many_arguments)] // host fields map 1:1 to HostEntry
     pub fn new_edit(

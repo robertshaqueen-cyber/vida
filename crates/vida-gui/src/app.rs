@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use iced::{Element, Task};
 use vida_core::i18n::{self, I18n};
@@ -8,7 +8,7 @@ use crate::screens::{
     s5_settings, s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
 };
 use crate::term::frame;
-use crate::ws_client::{AgentApproval, OwnerEvent, PushMsg, WsClient};
+use crate::ws_client::{AgentApproval, AgentHostDraft, OwnerEvent, PushMsg, WsClient};
 
 pub fn run() -> Result<(), iced::Error> {
     // 默认 filter 用 bin 名 "vida"（module_path! 以 bin 名为前缀，
@@ -99,6 +99,9 @@ pub struct VidaApp {
     agent_approval_busy_id: Option<String>,
     agent_approval_notice: Option<String>,
     agent_approval_notice_is_error: bool,
+    /// Agent-prepared host metadata waits here while the human is already
+    /// editing another host. We never overwrite the human's in-progress form.
+    pending_agent_host_drafts: VecDeque<AgentHostDraft>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +373,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         agent_approval_busy_id: None,
         agent_approval_notice: None,
         agent_approval_notice_is_error: false,
+        pending_agent_host_drafts: VecDeque::new(),
     };
     restore_persisted_terminal_layout(&mut app, &ui_state);
 
@@ -924,6 +928,24 @@ async fn open_ssh_and_subscribe(client: &WsClient, host_id: &str) -> Result<Stri
     Ok(sid)
 }
 
+/// Open the next Agent-prepared host in the existing shared editor. If the
+/// human is already editing, leave the draft queued so Agent activity can
+/// never overwrite in-progress human input.
+fn open_next_agent_host_draft(app: &mut VidaApp) {
+    if app.editor_state.is_some() || !matches!(app.screen, Screen::Main(_)) {
+        return;
+    }
+    let Some(draft) = app.pending_agent_host_drafts.pop_front() else {
+        return;
+    };
+    if !app.tabs.iter().any(|tab| tab.id == "add_host") {
+        app.tabs
+            .push(Tab::add_host(app.i18n.tr("main_add_host_tab").to_string()));
+    }
+    app.active_tab_id = "add_host".into();
+    app.editor_state = Some(s4_credential::State::new_agent_draft(draft));
+}
+
 fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
     match message {
         // ---- Connection ----
@@ -1134,6 +1156,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                         },
                         |message| message,
                     );
+                }
+                OwnerEvent::HostDraftPrepared { draft_id: _, draft } => {
+                    app.pending_agent_host_drafts.push_back(draft);
+                    open_next_agent_host_draft(app);
                 }
             }
             Task::none()
@@ -1420,6 +1446,13 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::CloseTab(tab_id) => {
             let closed_position = app.tabs.iter().position(|tab| tab.id == tab_id);
+            let closed_editor = app.tabs.iter().any(|tab| {
+                tab.id == tab_id
+                    && matches!(
+                        tab.kind,
+                        crate::screens::TabKind::AddHost | crate::screens::TabKind::EditHost { .. }
+                    )
+            });
             close_terminal_session(app, &tab_id);
             app.tabs.retain(|t| t.id != tab_id);
             if app.active_tab_id == tab_id {
@@ -1431,6 +1464,10 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     .or_else(|| app.tabs.first())
                     .map(|tab| tab.id.clone())
                     .unwrap_or_default();
+            }
+            if closed_editor {
+                app.editor_state = None;
+                open_next_agent_host_draft(app);
             }
             persist_ui_state(app);
             Task::none()
@@ -1511,6 +1548,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 }
                 None => Task::none(),
             };
+            open_next_agent_host_draft(app);
             persist_ui_state(app);
             Task::batch([settings_task, restore_task, pending_task])
         }
@@ -1900,6 +1938,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             });
             app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
             app.editor_state = None;
+            open_next_agent_host_draft(app);
             // Reload hosts
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -1922,6 +1961,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
             });
             app.active_tab_id = app.tabs.first().map(|t| t.id.clone()).unwrap_or_default();
             app.editor_state = None;
+            open_next_agent_host_draft(app);
             // Reload hosts
             let client = app.ws_client.as_ref().unwrap().clone();
             Task::perform(
@@ -3397,9 +3437,9 @@ mod tests {
         editor_focus_event, mark_terminal_reconnected, parse_backup_bytes,
         restore_persisted_terminal_layout, suspend_all_terminal_sessions, update,
     };
-    use crate::screens::{s_terminal, s0_connection, s3_main};
+    use crate::screens::{s_terminal, s0_connection, s3_main, s4_credential};
     use crate::term::primitive::TerminalAppearance;
-    use crate::ws_client::{AgentApproval, OwnerEvent, PushMsg};
+    use crate::ws_client::{AgentApproval, AgentHostDraft, OwnerEvent, PushMsg};
 
     fn tab_key_event(modifiers: iced::keyboard::Modifiers) -> iced::Event {
         use iced::keyboard::{Key, Location, key};
@@ -3441,6 +3481,53 @@ mod tests {
         );
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn agent_host_draft_waits_instead_of_overwriting_human_editor() {
+        let (mut app, _) = super::new();
+        app.screen = Screen::Main(s3_main::State {
+            revealed_credential: None,
+            credential_copied: false,
+        });
+        let mut human_editor = s4_credential::State::new_add();
+        human_editor.name = "Human work in progress".into();
+        app.editor_state = Some(human_editor);
+        app.tabs.push(Tab::add_host("Add host".into()));
+        app.active_tab_id = "add_host".into();
+        let draft = AgentHostDraft {
+            name: "Agent server".into(),
+            host: "example.com".into(),
+            user: "deploy".into(),
+            port: 2222,
+            tags: vec!["prod".into()],
+            group: Some("edge".into()),
+            notes: Some("review".into()),
+        };
+
+        let _ = update(
+            &mut app,
+            AppMessage::AgentOwnerEvent(OwnerEvent::HostDraftPrepared {
+                draft_id: "draft-1".into(),
+                draft,
+            }),
+        );
+        assert_eq!(
+            app.editor_state.as_ref().unwrap().name,
+            "Human work in progress"
+        );
+        assert_eq!(app.pending_agent_host_drafts.len(), 1);
+
+        let _ = update(&mut app, AppMessage::CloseTab("add_host".into()));
+        let opened = app.editor_state.as_ref().unwrap();
+        assert_eq!(opened.name, "Agent server");
+        assert_eq!(opened.host, "example.com");
+        assert_eq!(opened.user, "deploy");
+        assert_eq!(opened.port, "2222");
+        assert_eq!(opened.auth_kind, s4_credential::AuthKind::Password);
+        assert_eq!(opened.agent_trust, "ask");
+        assert!(opened.password.is_empty());
+        assert_eq!(app.active_tab_id, "add_host");
     }
 
     fn app_with_two_terminal_tabs() -> VidaApp {
