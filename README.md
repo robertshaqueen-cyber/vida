@@ -21,6 +21,8 @@ vida 解决两个问题：
 危险命令审批、不含命令明文的审计，以及 GUI 实时审批与人工接管。
 **MCP 服务端（M6）**已提供标准 stdio 生命周期、结构化工具 Schema 和受限 Agent 身份，
 可把同一套能力安全接入支持 MCP 的 AI 客户端。
+**Agent 主动连接（M7）**允许 MCP 使用已配置主机 ID 打开或复用 SSH 会话；凭据仍只在
+daemon 内部使用，新会话会自动出现在 GUI，方便人类观察和接管。
 
 ## 截图
 
@@ -55,6 +57,8 @@ vida 解决两个问题：
 - 🤖 **MCP 服务端（M6）**：`vida-mcp` 通过标准 stdio MCP 暴露状态、主机摘要、活动会话、
   当前屏幕和安全命令执行；工具带输入/输出 Schema，重用 `vida-client` 与 daemon 的 Agent
   身份，不暴露凭据、原始按键、金库写入或审批能力
+- 🔌 **Agent 主动连接（M7）**：`session_open` 只接受 `host_list` 返回的已配置主机 ID；daemon
+  从解锁金库内部取用凭据，重复请求复用活动会话，并把新 SSH 终端实时加入 GUI 标签和审计
 
 规划中：
 
@@ -157,7 +161,7 @@ cargo test --workspace
 其他支持本地 stdio MCP 的客户端使用同一个配置语义：服务名为 `vida`，`command` 指向
 `target/release/vida-mcp` 的绝对路径，不需要参数。`vida-daemon` 与 GUI 仍按平常方式运行；
 MCP 服务端本身不会读取口令或私钥。当前工具固定为 `vida_status`、`host_list`、
-`session_list`、`screen_read`、`exec`。
+`session_list`、`session_open`、`screen_read`、`exec`。
 
 > 没有安装 age/expect 时，`age_cli_interop` 测试会**失败**（而不是跳过）——
 > 这是有意为之：该测试是设计铁律「金库必须可用标准 age CLI 解密」的唯一验证。
@@ -350,6 +354,21 @@ MCP 服务端本身不会读取口令或私钥。当前工具固定为 `vida_sta
 7. 停止 daemon 后让 Agent 查询状态 → 预期得到“启动 vida-daemon 后重试”的工具级错误，
    MCP 连接本身仍在；重新启动 daemon 后再次查询可自动恢复。命令执行遇到不确定断线时不得
    自动重发，而是要求先读取屏幕和检查 GUI 审批/审计状态。
+
+## M7 Agent 主动连接手动验收
+
+请构建 release 版 daemon、GUI 和 `vida-mcp`，保持金库解锁，并在 MCP 客户端刷新 Vida。
+
+1. 查看 Vida 工具 → 预期新增 `session_open`，输入只包含 `host_id`，不存在地址、密码、私钥、
+   私钥路径或口令字段。
+2. 让 Agent 先调用 `host_list`，再“打开搬瓦工东京，但不要执行命令” → 预期返回 SSH
+   `session_id`，GUI 自动新增并切换到“搬瓦工东京”终端标签，终端正常登录。
+3. 对同一个 `host_id` 再调用一次 `session_open` → 预期返回相同 `session_id` 且
+   `reused=true`，GUI 不新增重复标签，也不建立第二条 SSH 连接。
+4. 锁定金库后关闭该 SSH 标签，再让 Agent 打开该主机 → 预期明确提示先解锁，GUI 和 daemon
+   不创建空白会话；解锁后重试可正常打开。
+5. 使用不存在的 `host_id` → 预期得到“主机不存在/检查主机配置”的工具错误，不回显任何金库
+   数据；`audit --limit 20` 中成功的新连接记录为 `session_open`，不包含凭据或命令明文。
 
 ## UI 基础框架手动验收
 

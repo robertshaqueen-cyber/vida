@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use vida_client::WsClient;
 
-const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
+const SERVER_INSTRUCTIONS: &str = "Vida exposes terminal sessions that are also visible to the human in the Vida GUI. Call session_list before screen_read or exec so you can identify the intended local or SSH session by title and host. Use host_list followed by session_open only when the human asks you to connect a configured SSH host; Vida resolves its credential internally and opens the terminal in the GUI. Read the current screen before acting. Commands always pass through the daemon's Agent policy; if exec returns needs_approval, do not submit it again—ask the human to approve the pending request in the Vida GUI. Never ask Vida tools for passwords, private keys, passphrases, or raw keystrokes because those capabilities are intentionally unavailable.";
 
 #[derive(Clone)]
 struct VidaMcp {
@@ -81,6 +81,29 @@ impl VidaMcp {
             }
         }
     }
+
+    /// Opening by host ID is daemon-idempotent: if the first response is lost,
+    /// retrying returns the already-alive matching session instead of creating
+    /// another SSH login.
+    async fn session_open_request(&self, host_id: &str) -> Result<Value, String> {
+        let client = self.connect().await?;
+        match client.agent_open_ssh_session(host_id).await {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
+                self.invalidate_client().await;
+                let client = self.connect().await.map_err(|reconnect_error| {
+                    format!(
+                        "The SSH session result could not be confirmed and reconnecting to Vida failed. Inspect the Vida GUI before trying again. First error: {first_error}. Reconnect error: {reconnect_error}"
+                    )
+                })?;
+                client.agent_open_ssh_session(host_id).await.map_err(|error| {
+                    format!(
+                        "Vida could not open or recover the configured SSH session. The vault may be locked, the host may have been removed, or SSH could not start. Unlock Vida and inspect the host configuration, then retry. Details: {error}"
+                    )
+                })
+            }
+        }
+    }
 }
 
 enum ReadRequest {
@@ -131,6 +154,24 @@ struct HostOutput {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct SessionListOutput {
     sessions: Vec<SessionOutput>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SessionOpenInput {
+    /// Exact configured host ID returned by host_list.
+    host_id: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct SessionOpenOutput {
+    session_id: String,
+    host_id: String,
+    title: String,
+    cols: u16,
+    rows: u16,
+    /// True when Vida returned an already-alive session for this host.
+    reused: bool,
+    next_action: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -267,7 +308,7 @@ impl VidaMcp {
 
     #[tool(
         name = "host_list",
-        description = "Use when you need safe summaries of configured Vida hosts, including IDs, display names, addresses, authentication kind, and Agent trust. Do not use to retrieve credentials, private keys, passphrases, or to open a connection; those capabilities are intentionally unavailable, and active terminals are discovered with session_list."
+        description = "Use when you need safe summaries of configured Vida hosts, including IDs, display names, addresses, authentication kind, and Agent trust, or before session_open to select an exact host ID. Do not use to retrieve credentials, private keys, or passphrases; those capabilities are intentionally unavailable, and active terminals are discovered with session_list."
     )]
     async fn host_list(&self) -> Result<Json<HostListOutput>, String> {
         let value = self.read_request(ReadRequest::Hosts).await?;
@@ -283,6 +324,39 @@ impl VidaMcp {
         let value = self.read_request(ReadRequest::Sessions).await?;
         let sessions = decode(value, "session list")?;
         Ok(Json(SessionListOutput { sessions }))
+    }
+
+    #[tool(
+        name = "session_open",
+        description = "Use after host_list when the human asks you to connect one SSH host already configured in Vida. The daemon uses the vault credential internally, creates a human-visible GUI terminal, and reuses an alive session for repeated requests. Do not use for local terminals, unconfigured addresses, credential entry, host creation, or speculative/background connections."
+    )]
+    async fn session_open(
+        &self,
+        Parameters(input): Parameters<SessionOpenInput>,
+    ) -> Result<Json<SessionOpenOutput>, String> {
+        let value = self.session_open_request(&input.host_id).await?;
+        #[derive(Deserialize)]
+        struct RawSessionOpenOutput {
+            session_id: String,
+            host_id: String,
+            title: String,
+            cols: u16,
+            rows: u16,
+            reused: bool,
+        }
+        let raw: RawSessionOpenOutput = decode(value, "session open")?;
+        Ok(Json(SessionOpenOutput {
+            next_action: format!(
+                "Call session_list to confirm the target, then screen_read on session {} before sending any command.",
+                raw.session_id
+            ),
+            session_id: raw.session_id,
+            host_id: raw.host_id,
+            title: raw.title,
+            cols: raw.cols,
+            rows: raw.rows,
+            reused: raw.reused,
+        }))
     }
 
     #[tool(
@@ -354,7 +428,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_only_the_five_reviewed_tools() {
+    fn exposes_only_the_six_reviewed_tools() {
         let server = VidaMcp::new();
         let mut names = server
             .tool_router
@@ -370,6 +444,7 @@ mod tests {
                 "host_list",
                 "screen_read",
                 "session_list",
+                "session_open",
                 "vida_status"
             ]
         );

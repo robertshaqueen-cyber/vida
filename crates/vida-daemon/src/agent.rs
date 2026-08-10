@@ -50,8 +50,20 @@ pub enum AuditOutcome {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
-    ApprovalRequested { approval: PendingApproval },
-    ApprovalResolved { approval_id: String, status: String },
+    ApprovalRequested {
+        approval: PendingApproval,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        status: String,
+    },
+    SessionOpened {
+        session_id: String,
+        host_id: String,
+        host_name: String,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +281,44 @@ impl AgentController {
             AuditOutcome::Failed,
             Some(message.to_string()),
         ))
+    }
+
+    /// Persist the Agent-created connection before notifying owner clients.
+    /// Host IDs are already owner-visible metadata; credentials never enter
+    /// this record or the event stream.
+    pub fn record_session_open(&self, session_id: &str, host_id: &str, reused: bool) -> Result<()> {
+        self.append_audit(AuditEntry {
+            timestamp: chrono::Utc::now().timestamp(),
+            session_id: session_id.to_string(),
+            host_id: Some(host_id.to_string()),
+            tool: "session_open".into(),
+            input: "[configured host selected by id]".into(),
+            matched_rules: Vec::new(),
+            approval_id: None,
+            outcome: AuditOutcome::Allowed,
+            result_summary: Some(if reused {
+                "existing alive SSH terminal reused".into()
+            } else {
+                "SSH terminal opened; owner notification emitted".into()
+            }),
+        })
+    }
+
+    pub fn notify_session_opened(
+        &self,
+        session_id: &str,
+        host_id: &str,
+        host_name: &str,
+        cols: u16,
+        rows: u16,
+    ) {
+        let _ = self.events.send(AgentEvent::SessionOpened {
+            session_id: session_id.to_string(),
+            host_id: host_id.to_string(),
+            host_name: host_name.to_string(),
+            cols,
+            rows,
+        });
     }
 
     pub fn take_for_approval(&mut self, approval_id: &str, now: i64) -> Result<PendingApproval> {

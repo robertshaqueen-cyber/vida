@@ -85,8 +85,20 @@ pub struct AgentApproval {
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerEvent {
-    ApprovalRequested { approval: AgentApproval },
-    ApprovalResolved { approval_id: String, status: String },
+    ApprovalRequested {
+        approval: AgentApproval,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        status: String,
+    },
+    SessionOpened {
+        session_id: String,
+        host_id: String,
+        host_name: String,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// 推送订阅注册表。
@@ -489,6 +501,16 @@ impl WsClient {
         .await
     }
 
+    /// Ask the daemon to open one configured SSH host using credentials that
+    /// remain inside the unlocked vault.
+    pub async fn agent_open_ssh_session(&self, host_id: &str) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "AgentOpenSshSession",
+            serde_json::json!({"host_id": host_id}),
+        )
+        .await
+    }
+
     pub async fn list_agent_approvals(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("ListAgentApprovals").await
     }
@@ -772,6 +794,41 @@ mod tests {
             OwnerEvent::ApprovalRequested { approval }
                 if approval.approval_id == "approval-1" && approval.command == "reboot"
         ));
+    }
+
+    #[test]
+    fn agent_opened_session_event_is_queued_without_credentials() {
+        let (tx, _request_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(std::sync::Mutex::new(PushRegistryState::default()));
+        let client = WsClient {
+            tx,
+            push_registry: registry.clone(),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        {
+            let mut state = registry.lock().unwrap();
+            state.owner_event_sender = Some(sender);
+            state.prepared_owner_event_receiver = Some(receiver);
+        }
+
+        let wire = r#"{"type":"Event","event":"agent_approval","data":{"kind":"session_opened","session_id":"session-1","host_id":"host-1","host_name":"Production","cols":100,"rows":40}}"#;
+        forward_text_push(wire, &registry);
+
+        let mut receiver = client.subscribe_owner_events();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            OwnerEvent::SessionOpened {
+                session_id,
+                host_id,
+                host_name,
+                cols: 100,
+                rows: 40,
+            } if session_id == "session-1"
+                && host_id == "host-1"
+                && host_name == "Production"
+        ));
+        assert!(!wire.contains("password"));
+        assert!(!wire.contains("private_key"));
     }
 
     #[tokio::test]

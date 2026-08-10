@@ -234,6 +234,31 @@ WebSocket 连接后保持 stdin 打开，按规范测量稳定进程：
 该数字来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次测得 peak 也是
 2640K。测量过程未修改金库或终端，仅调用状态读取。
 
+### M7 Agent 主动打开已配置 SSH
+
+- daemon 新增 Agent-only `AgentOpenSshSession`，仅接受已保存的 `host_id`；owner 继续使用原有
+  `OpenSshSession`，Agent 仍不能调用人的原始输入、凭据显示或金库写入接口。
+- 同一主机已有活动 SSH 会话时直接复用；新会话完成绑定和无凭据审计后向 owner 推送
+  `session_opened`，GUI 预注册推送通道并走既有终端标签创建路径。
+- MCP 新增带完整输入/输出 Schema 的 `session_open`；不确定断线允许安全重试一次，因为 daemon
+  端已保证按主机 ID 幂等。工具说明禁止后台试探连接和任意地址/凭据输入。
+- 自动测试覆盖 Agent/owner 角色隔离、真实 SSH PTY 创建、并发与重复调用复用、owner 事件、MCP 工具
+  清单与凭据不进入响应/事件/审计。所有者手动验收见 README「M7 Agent 主动连接手动验收」。
+
+#### M7 release 内存实测（2026-08-10）
+
+macOS、同机显示器 scale factor=1（两个被测进程均无窗口，scale factor 不参与其内存分配）。
+使用隔离临时配置启动最终 release daemon 和 `vida-mcp`；MCP 完成 initialize，并通过
+`vida_status` 建立 Agent WebSocket 连接，使 M7 工具表、Agent 身份和连接路径实际加载：
+
+| 进程/场景 | Physical footprint |
+|---|---:|
+| `vida-mcp`，MCP 已初始化、Agent 连接已建立 | **2848K** |
+| release daemon，空金库、Agent 连接已建立 | **4144K** |
+
+两项均来自 `vmmap --summary <pid>` 的 `Physical footprint`，不是 RSS；同次 peak 分别为
+2864K 和 4224K。测量只读取空金库状态，没有创建主机、会话或修改用户配置。
+
 ### M1 内存数据（含 S0-S9 GUI）
 
 | 场景 | Footprint | 说明 |

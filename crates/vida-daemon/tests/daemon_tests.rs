@@ -1520,6 +1520,113 @@ async fn agent_role_is_policy_gated_and_owner_can_deny() {
     assert!(outcomes.contains(&"denied"));
 }
 
+#[tokio::test]
+async fn agent_opens_one_configured_ssh_session_without_exposing_credentials() {
+    use sha2::{Digest, Sha256};
+
+    let (addr, token, _dir) = start_daemon().await;
+    let (mut owner, mut owner_reader) = connect(addr).await;
+    let owner_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"owner"}},"id":1}}"#,
+        token
+    );
+    assert_eq!(
+        send_recv(&mut owner, &mut owner_reader, &owner_auth).await["type"],
+        "Ok"
+    );
+    assert_eq!(
+        send_recv(
+            &mut owner,
+            &mut owner_reader,
+            r#"{"method":"CreateVault","params":{"passphrase":"test-passphrase"},"id":2}"#,
+        )
+        .await["type"],
+        "Ok"
+    );
+    let added = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"UpdateHost","params":{"host":{"id":null,"name":"Agent SSH","host":"10.0.0.1","user":"root","port":22,"tags":[],"group":null,"color":null,"password":"credential-must-not-leak","notes":null}},"id":3}"#,
+    )
+    .await;
+    let host_id = added["result"]["id"].as_str().unwrap().to_string();
+
+    let agent_token = hex::encode(Sha256::digest(format!("vida-agent:{token}").as_bytes()));
+    let (mut agent, mut agent_reader) = connect(addr).await;
+    let agent_auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}","role":"agent"}},"id":1}}"#,
+        agent_token
+    );
+    assert_eq!(
+        send_recv(&mut agent, &mut agent_reader, &agent_auth).await["result"]["role"],
+        "agent"
+    );
+    let (mut concurrent_agent, mut concurrent_agent_reader) = connect(addr).await;
+    assert_eq!(
+        send_recv(
+            &mut concurrent_agent,
+            &mut concurrent_agent_reader,
+            &agent_auth,
+        )
+        .await["result"]["role"],
+        "agent"
+    );
+
+    let open = format!(
+        r#"{{"method":"AgentOpenSshSession","params":{{"host_id":"{}"}},"id":2}}"#,
+        host_id
+    );
+    let (first, concurrent) = tokio::join!(
+        send_recv(&mut agent, &mut agent_reader, &open),
+        send_recv(&mut concurrent_agent, &mut concurrent_agent_reader, &open,)
+    );
+    for response in [&first, &concurrent] {
+        assert_eq!(response["type"], "Ok", "open failed: {response}");
+        assert_eq!(response["result"]["host_id"], host_id);
+        assert_eq!(response["result"]["title"], "Agent SSH");
+        assert!(!response.to_string().contains("credential-must-not-leak"));
+    }
+    assert_ne!(first["result"]["reused"], concurrent["result"]["reused"]);
+    assert_eq!(
+        first["result"]["session_id"],
+        concurrent["result"]["session_id"]
+    );
+    let session_id = first["result"]["session_id"].as_str().unwrap().to_string();
+
+    let event = recv_text(&mut owner_reader).await;
+    assert_eq!(event["event"], "agent_approval");
+    assert_eq!(event["data"]["kind"], "session_opened");
+    assert_eq!(event["data"]["session_id"], session_id);
+    assert_eq!(event["data"]["host_id"], host_id);
+    assert!(!event.to_string().contains("credential-must-not-leak"));
+
+    let second = send_recv(&mut agent, &mut agent_reader, &open).await;
+    assert_eq!(second["result"]["session_id"], session_id);
+    assert_eq!(second["result"]["reused"], true);
+
+    let audit = send_recv(
+        &mut owner,
+        &mut owner_reader,
+        r#"{"method":"ReadAgentAudit","params":{"limit":10},"id":4}"#,
+    )
+    .await;
+    assert!(audit["result"].as_array().unwrap().iter().any(|entry| {
+        entry["tool"] == "session_open"
+            && entry["session_id"] == session_id
+            && entry["host_id"] == host_id
+    }));
+    assert!(!audit.to_string().contains("credential-must-not-leak"));
+
+    let close = format!(
+        r#"{{"method":"CloseSession","params":{{"session_id":"{}"}},"id":5}}"#,
+        session_id
+    );
+    assert_eq!(
+        send_recv(&mut owner, &mut owner_reader, &close).await["type"],
+        "Ok"
+    );
+}
+
 /// 打开会话 → 输入 → 读屏幕 → resize → 列出 → 关闭。
 /// 覆盖规格 5.2 全部 6 个 IPC 方法。
 #[tokio::test]

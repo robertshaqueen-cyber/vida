@@ -1079,6 +1079,62 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     app.agent_approval_notice_is_error = status == "failed";
                     normalize_agent_approval_selection(app);
                 }
+                OwnerEvent::SessionOpened {
+                    session_id,
+                    host_id,
+                    host_name,
+                    cols: _,
+                    rows: _,
+                } => {
+                    if app
+                        .terminal_sessions
+                        .values()
+                        .any(|session| session.session_id == session_id)
+                    {
+                        return Task::none();
+                    }
+                    let Some(client) = app.ws_client.as_ref().cloned() else {
+                        return Task::none();
+                    };
+                    if !matches!(app.screen, Screen::Main(_)) {
+                        // The session remains daemon-owned and discoverable;
+                        // do not close an Agent session merely because the GUI
+                        // is temporarily showing a conflict/unlock screen.
+                        return Task::none();
+                    }
+                    app.recent_host_ids.retain(|id| *id != host_id);
+                    app.recent_host_ids.insert(0, host_id.clone());
+                    app.recent_host_ids.truncate(10);
+                    app.terminal_opening = true;
+                    app.terminal_error = None;
+                    persist_ui_state(app);
+                    return Task::perform(
+                        async move {
+                            client.prepare_subscription(&session_id);
+                            match client
+                                .send(
+                                    "SubscribeSession",
+                                    serde_json::json!({"session_id": session_id}),
+                                )
+                                .await
+                            {
+                                Ok(_) => AppMessage::TerminalOpened {
+                                    session_id,
+                                    title: host_name,
+                                    host_id: Some(host_id),
+                                },
+                                Err(error) => {
+                                    client.unsubscribe(&session_id);
+                                    AppMessage::TerminalSetupError(format!(
+                                        "订阅 Agent 打开的 SSH 会话失败: {}",
+                                        error.message
+                                    ))
+                                }
+                            }
+                        },
+                        |message| message,
+                    );
+                }
             }
             Task::none()
         }

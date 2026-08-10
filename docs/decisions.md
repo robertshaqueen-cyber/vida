@@ -1135,3 +1135,16 @@ Agent 身份连接 daemon，只开放 `vida_status`、`host_list`、`session_lis
 `screen_read` 保留干净文本、宽字符列与光标坐标，但在 MCP 边界去掉每行用于 GPU 网格的尾部
 填充空格，降低 Agent 上下文消耗。MCP stdout 完全归协议使用，未来诊断只能写 stderr，且
 不得含命令或任何凭据材料。
+
+### M7 Agent 使用已配置主机打开 SSH
+
+MCP 新增 `session_open(host_id)`，但不扩大到任意地址或凭据输入。Agent 必须先用 `host_list`
+取得准确 ID；daemon 从已解锁金库内部解析主机和认证材料，MCP、WebSocket 响应、owner 事件与
+审计均不携带密码、私钥或口令。金库锁定、主机不存在或 SSH 进程无法启动时直接返回可操作的
+错误，不创建假的成功结果。
+
+打开请求在 daemon 侧按主机 ID 幂等：若该主机已有仍存活且已绑定的 SSH 会话，返回原
+`session_id`；因此 MCP 在响应不确定时可重连重试一次而不会制造重复登录。新会话先持久化
+Agent 会话绑定和无凭据审计，再发送 `session_opened` owner 事件。GUI 在请求首帧前建立订阅，
+随后按现有 `TerminalOpened` 路径创建并持久化标签，使 Agent 发起的会话仍然对人可见、可选中、
+可关闭和可接管。主机创建、凭据选择及金库写入仍不属于本里程碑。

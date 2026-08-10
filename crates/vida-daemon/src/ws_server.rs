@@ -587,6 +587,7 @@ async fn handle_request(
     if matches!(
         &request,
         Request::AgentExec { .. }
+            | Request::AgentOpenSshSession { .. }
             | Request::ListAgentApprovals
             | Request::ApproveAgentAction { .. }
             | Request::DenyAgentAction { .. }
@@ -686,6 +687,7 @@ async fn handle_request(
         }
 
         Request::AgentExec { .. }
+        | Request::AgentOpenSshSession { .. }
         | Request::ListAgentApprovals
         | Request::ApproveAgentAction { .. }
         | Request::DenyAgentAction { .. }
@@ -755,10 +757,14 @@ async fn handle_request(
 
 fn request_allowed_for_role(request: &Request, role: ClientRole) -> bool {
     match role {
-        ClientRole::Owner => !matches!(request, Request::AgentExec { .. }),
+        ClientRole::Owner => !matches!(
+            request,
+            Request::AgentExec { .. } | Request::AgentOpenSshSession { .. }
+        ),
         ClientRole::Agent => matches!(
             request,
             Request::AgentExec { .. }
+                | Request::AgentOpenSshSession { .. }
                 | Request::VaultStatus
                 | Request::ListHosts
                 | Request::Pty(PtyRequest::ListSessions)
@@ -777,6 +783,84 @@ async fn handle_agent_request(
 ) -> Result<serde_json::Value> {
     let now = chrono::Utc::now().timestamp();
     match request {
+        Request::AgentOpenSshSession { host_id } => {
+            if host_id.is_empty() || host_id.len() > 256 {
+                anyhow::bail!("Agent 打开 SSH 时必须提供有效的主机 ID");
+            }
+            const COLS: u16 = 100;
+            const ROWS: u16 = 40;
+
+            let (host, pty) = {
+                let state = state.lock().await;
+                (state.host_for_ssh(&host_id)?, state.pty.clone())
+            };
+
+            // Serialize Agent-originated opens while checking and registering
+            // the binding. This makes repeated and concurrent calls
+            // idempotent for one configured host, so one host cannot race into
+            // multiple SSH logins and GUI tabs.
+            let mut agent = agent.lock().await;
+            let live_sessions = pty
+                .read()
+                .map_err(|_| anyhow::anyhow!("PTY 锁异常"))?
+                .try_list_sessions()?;
+            let existing = live_sessions.into_iter().find(|session| {
+                session.alive
+                    && matches!(
+                        agent.target(&session.session_id),
+                        Some(SessionTarget::Host { host_id: bound }) if bound == &host_id
+                    )
+            });
+            if let Some(session) = existing {
+                agent.record_session_open(&session.session_id, &host_id, true)?;
+                return Ok(serde_json::json!({
+                    "session_id": session.session_id,
+                    "host_id": host_id,
+                    "title": host.name,
+                    "cols": session.cols,
+                    "rows": session.rows,
+                    "reused": true,
+                }));
+            }
+
+            let host_name = host.name.clone();
+            let auth = ssh_auth_from_vault(host.auth);
+            let session_id = {
+                let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
+                pty.open_ssh_session(COLS, ROWS, &host.host, &host.user, host.port, auth)?
+            };
+
+            let register_result = agent.register_session(
+                &session_id,
+                SessionTarget::Host {
+                    host_id: host_id.clone(),
+                },
+            );
+            if let Err(error) = register_result {
+                let _ = pty
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("PTY 锁异常"))?
+                    .close_session(&session_id);
+                return Err(error);
+            }
+            if let Err(error) = agent.record_session_open(&session_id, &host_id, false) {
+                let _ = agent.remove_session(&session_id);
+                let _ = pty
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("PTY 锁异常"))?
+                    .close_session(&session_id);
+                return Err(error);
+            }
+            agent.notify_session_opened(&session_id, &host_id, &host_name, COLS, ROWS);
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "host_id": host_id,
+                "title": host_name,
+                "cols": COLS,
+                "rows": ROWS,
+                "reused": false,
+            }))
+        }
         Request::AgentExec {
             session_id,
             command,
@@ -898,6 +982,30 @@ async fn handle_agent_request(
     }
 }
 
+fn ssh_auth_from_vault(auth: vida_core::vault::AuthMethod) -> crate::pty::SshAuth {
+    match auth {
+        vida_core::vault::AuthMethod::Password { password } => {
+            crate::pty::SshAuth::Password(secrecy::SecretString::from(password.expose().to_owned()))
+        }
+        vida_core::vault::AuthMethod::Key {
+            private_key_path,
+            passphrase,
+        } => crate::pty::SshAuth::KeyFile {
+            path: private_key_path,
+            passphrase: passphrase
+                .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
+        },
+        vida_core::vault::AuthMethod::KeyInline {
+            private_key,
+            passphrase,
+        } => crate::pty::SshAuth::InlineKey {
+            private_key: secrecy::SecretString::from(private_key.expose().to_owned()),
+            passphrase: passphrase
+                .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
+        },
+    }
+}
+
 /// Keep the encrypted backup bytes in the response. The GUI owns destination
 /// selection and persists these bytes only after the user confirms a path.
 fn backup_response(data: Vec<u8>) -> serde_json::Value {
@@ -935,29 +1043,7 @@ async fn handle_pty_request(
             rows,
         } => {
             let host = state.lock().await.host_for_ssh(host_id)?;
-            let auth = match host.auth {
-                vida_core::vault::AuthMethod::Password { password } => {
-                    crate::pty::SshAuth::Password(secrecy::SecretString::from(
-                        password.expose().to_owned(),
-                    ))
-                }
-                vida_core::vault::AuthMethod::Key {
-                    private_key_path,
-                    passphrase,
-                } => crate::pty::SshAuth::KeyFile {
-                    path: private_key_path,
-                    passphrase: passphrase
-                        .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
-                },
-                vida_core::vault::AuthMethod::KeyInline {
-                    private_key,
-                    passphrase,
-                } => crate::pty::SshAuth::InlineKey {
-                    private_key: secrecy::SecretString::from(private_key.expose().to_owned()),
-                    passphrase: passphrase
-                        .map(|value| secrecy::SecretString::from(value.expose().to_owned())),
-                },
-            };
+            let auth = ssh_auth_from_vault(host.auth);
             let session_id = {
                 let mut pty = pty.write().map_err(|_| anyhow::anyhow!("PTY 锁异常"))?;
                 pty.open_ssh_session(*cols, *rows, &host.host, &host.user, host.port, auth)?

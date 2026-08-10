@@ -89,6 +89,12 @@ pub enum Request {
         session_id: String,
         command: String,
     },
+    /// Open one configured SSH host without exposing its credential to the
+    /// Agent client. The daemon resolves the host and credential from the
+    /// unlocked vault and emits an owner event so GUI clients can attach.
+    AgentOpenSshSession {
+        host_id: String,
+    },
     ListAgentApprovals,
     ApproveAgentAction {
         approval_id: String,

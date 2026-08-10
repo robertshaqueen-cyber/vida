@@ -85,6 +85,7 @@ async fn stdio_lifecycle_lists_only_reviewed_tools_without_daemon() {
             "host_list",
             "screen_read",
             "session_list",
+            "session_open",
             "vida_status"
         ]
     );
