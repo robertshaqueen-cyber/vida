@@ -845,6 +845,35 @@ impl PtyManager {
         ))
     }
 
+    pub fn is_hosted(&self) -> bool {
+        matches!(self, Self::Hosted(_))
+    }
+
+    pub fn cache_unlock_passphrase(
+        &self,
+        passphrase: &SecretString,
+        ttl: std::time::Duration,
+    ) -> Result<bool> {
+        match self {
+            Self::Embedded(_) => Ok(false),
+            Self::Hosted(client) => client.cache_unlock_passphrase(passphrase, ttl),
+        }
+    }
+
+    pub fn read_unlock_cache(&self) -> Result<Option<SecretString>> {
+        match self {
+            Self::Embedded(_) => Ok(None),
+            Self::Hosted(client) => client.read_unlock_cache(),
+        }
+    }
+
+    pub fn clear_unlock_cache(&self) -> Result<bool> {
+        match self {
+            Self::Embedded(_) => Ok(false),
+            Self::Hosted(client) => client.clear_unlock_cache(),
+        }
+    }
+
     pub fn open_session(&mut self, cols: u16, rows: u16) -> Result<String> {
         match self {
             Self::Embedded(engine) => engine.open_session(cols, rows),

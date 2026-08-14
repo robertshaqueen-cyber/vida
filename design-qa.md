@@ -159,3 +159,51 @@ needed because the title, icon, explanatory copy, and primary action are all leg
 None classified until the implementation screenshot is available.
 
 final result: blocked
+
+---
+
+# M10 SFTP design QA
+
+- Reference: Tabby SSH terminal screenshot supplied by the owner.
+- Target: desktop SFTP entry in the SSH terminal toolbar plus a Vida-native file manager tab.
+- Code inspection: shared Vida button, icon, surface, hover, disabled and scroll styles are reused;
+  no iced default visible control was introduced.
+- Source capture: available and inspected at 1530×827.
+- Prototype capture: owner supplied a populated Vida SFTP screenshot at 1024×800. Toolbar density,
+  shared button styles, path row, table columns, spacing and dark surfaces are visually consistent
+  with the established Vida desktop UI.
+- Functional issue found from the capture: the first implementation displayed relative `.` and
+  therefore Parent could not navigate above the remote home. It also had no create-folder action.
+  The implementation now asks the server for its canonical absolute working directory and adds a
+  shared-style inline create-folder flow.
+
+The owner must rebuild and confirm that the path displays `/root` (or the account's absolute home),
+Parent reaches `/`, and creating a test directory refreshes the list. One updated screenshot is
+needed before changing this M10 result to passed.
+
+M10 final result: failed — follow-up verification required
+
+## M10 Tabby interaction reference — iteration 2
+
+The owner supplied additional Tabby captures for the root listing, breadcrumb plus Parent row,
+filter state, compact toolbar, and file/directory context menus. Vida keeps its established green-black
+palette and shared rounded controls, but now matches the demonstrated core operations more closely:
+filter toggle, create folder, separate upload-file/upload-folder actions, native drag-in feedback,
+and queued recursive folder upload. Remote drag-out and destructive context-menu actions are not
+claimed by this checkpoint. Updated Vida captures of the normal, filter-open and drag-hover states
+are still required.
+
+M10 iteration 2 result: blocked — owner captures required
+
+## M10 Vida interaction capture — iteration 3
+
+The owner supplied a populated Vida capture at 1024×800 and identified five desktop file-manager
+interaction gaps: persistent upload notice, Parent placed beside the path instead of in the list,
+single-only selection, an off-screen loading label, and repeated uncached directory reads. The update
+keeps the existing Vida toolbar and surface system while moving Parent into the first content row,
+placing a pulsing loading indicator beside the path, disabling duplicate navigation while a request is
+active, adding drag-range plus Cmd/Ctrl additive file-and-folder selection, sequential batch download,
+a bounded 30-second directory cache, and 200-row incremental rendering on scroll. Upload completion is
+cleared after the authoritative refresh response.
+
+M10 iteration 3 result: blocked — rebuilt owner captures of normal, loading, and multi-selection states required

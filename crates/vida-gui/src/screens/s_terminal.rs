@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use iced::widget::{Space, column, container, row, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Background, Color, Element, Length};
 use vida_core::i18n::I18n;
 
@@ -87,6 +87,14 @@ impl TerminalSession {
                 icons::icon(icons::TERMINAL, 15).color(ui::ACCENT),
                 text(&self.title).size(13),
                 Space::new().width(Length::Fill),
+                if let Some(host_id) = &self.remote_host_id {
+                    button(row![icons::icon(icons::FOLDER, 14), text("SFTP").size(12)].spacing(6))
+                        .on_press(AppMessage::OpenSftp(host_id.clone()))
+                        .style(ui::secondary_button)
+                        .padding([7, 10])
+                } else {
+                    button(text("")).style(ui::icon_button(false)).padding(0)
+                },
                 status,
             ]
             .spacing(9)

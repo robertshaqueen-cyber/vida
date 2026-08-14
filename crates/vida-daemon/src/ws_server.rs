@@ -599,6 +599,16 @@ async fn handle_request(
         return handle_agent_request(request, state, agent).await;
     }
 
+    if matches!(
+        &request,
+        Request::SftpList { .. }
+            | Request::SftpUpload { .. }
+            | Request::SftpDownload { .. }
+            | Request::SftpCreateDirectory { .. }
+    ) {
+        return handle_sftp_request(request, state).await;
+    }
+
     let mut state = state.lock().await;
 
     match request {
@@ -688,6 +698,12 @@ async fn handle_request(
             state.set_host_agent_trust(&host_id, trust)?;
             Ok(serde_json::json!({"updated": true, "trust": trust}))
         }
+        Request::SftpList { .. }
+        | Request::SftpUpload { .. }
+        | Request::SftpDownload { .. }
+        | Request::SftpCreateDirectory { .. } => {
+            unreachable!("SFTP requests handled before state lock")
+        }
 
         Request::AgentExec { .. }
         | Request::AgentOpenSshSession { .. }
@@ -758,6 +774,67 @@ async fn handle_request(
             state.handle_remote_missing(&action)?;
             Ok(serde_json::json!({"handled": true}))
         }
+    }
+}
+
+async fn handle_sftp_request(
+    request: Request,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<serde_json::Value> {
+    match request {
+        Request::SftpList { host_id, path } => {
+            let host = state.lock().await.host_for_ssh(&host_id)?;
+            let listing = tokio::task::spawn_blocking(move || crate::sftp::list(host, &path))
+                .await
+                .context("SFTP 目录任务意外结束")??;
+            Ok(serde_json::to_value(listing)?)
+        }
+        Request::SftpUpload {
+            host_id,
+            local_path,
+            remote_path,
+        } => {
+            let host = state.lock().await.host_for_ssh(&host_id)?;
+            tokio::task::spawn_blocking(move || {
+                crate::sftp::upload(host, std::path::Path::new(&local_path), &remote_path)
+            })
+            .await
+            .context("SFTP 上传任务意外结束")??;
+            Ok(serde_json::json!({"uploaded": true}))
+        }
+        Request::SftpDownload {
+            host_id,
+            remote_path,
+            local_path,
+            recursive,
+        } => {
+            let host = state.lock().await.host_for_ssh(&host_id)?;
+            tokio::task::spawn_blocking(move || {
+                crate::sftp::download(
+                    host,
+                    &remote_path,
+                    std::path::Path::new(&local_path),
+                    recursive,
+                )
+            })
+            .await
+            .context("SFTP 下载任务意外结束")??;
+            Ok(serde_json::json!({"downloaded": true}))
+        }
+        Request::SftpCreateDirectory {
+            host_id,
+            parent,
+            name,
+        } => {
+            let host = state.lock().await.host_for_ssh(&host_id)?;
+            tokio::task::spawn_blocking(move || {
+                crate::sftp::create_directory(host, &parent, &name)
+            })
+            .await
+            .context("SFTP 新建文件夹任务意外结束")??;
+            Ok(serde_json::json!({"created": true}))
+        }
+        _ => unreachable!("only SFTP requests reach this handler"),
     }
 }
 
@@ -1449,7 +1526,8 @@ pub async fn start(state: Arc<Mutex<DaemonState>>) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::backup_response;
+    use super::{ClientRole, backup_response, request_allowed_for_role};
+    use crate::protocol::Request;
 
     #[test]
     fn backup_response_preserves_every_encrypted_byte() {
@@ -1464,5 +1542,24 @@ mod tests {
 
         assert_eq!(response["bytes"], ciphertext.len());
         assert_eq!(returned, ciphertext);
+    }
+
+    #[test]
+    fn sftp_is_owner_only() {
+        let requests = [
+            Request::SftpList {
+                host_id: "host-1".into(),
+                path: "/".into(),
+            },
+            Request::SftpCreateDirectory {
+                host_id: "host-1".into(),
+                parent: "/tmp".into(),
+                name: "uploads".into(),
+            },
+        ];
+        for request in requests {
+            assert!(request_allowed_for_role(&request, ClientRole::Owner));
+            assert!(!request_allowed_for_role(&request, ClientRole::Agent));
+        }
     }
 }

@@ -2668,6 +2668,78 @@ async fn production_daemon_restart_preserves_shell_process() {
     );
 }
 
+/// 有期主口令只保存在分离宿主内存中。没有终端会话时，宿主也必须在缓存有效期内
+/// 跨 daemon 重启存活；主动锁定后立即清除并允许宿主退出。
+#[cfg(unix)]
+#[tokio::test]
+async fn production_daemon_restart_uses_memory_unlock_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut first_daemon = spawn_production_daemon(directory.path());
+    let (first_addr, token) = wait_for_production_daemon(directory.path()).await;
+    let (mut ws, mut reader) = connect(first_addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":1}}"#,
+        token.trim()
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &auth).await["type"], "Ok");
+    let created = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"CreateVault","params":{"passphrase":"memory-cache-passphrase"},"id":2}"#,
+    )
+    .await;
+    assert_eq!(created["type"], "Ok", "create vault failed: {created}");
+    assert_eq!(
+        send_recv(&mut ws, &mut reader, r#"{"method":"Lock","id":3}"#).await["type"],
+        "Ok"
+    );
+    let unlocked = send_recv(
+        &mut ws,
+        &mut reader,
+        r#"{"method":"Unlock","params":{"passphrase":"memory-cache-passphrase","remember_seconds":60},"id":4}"#,
+    )
+    .await;
+    assert_eq!(unlocked["type"], "Ok", "unlock failed: {unlocked}");
+    drop(ws);
+    drop(reader);
+    first_daemon.kill().unwrap();
+    first_daemon.wait().unwrap();
+    std::fs::remove_file(directory.path().join("daemon.port")).unwrap();
+
+    let mut second_daemon = spawn_production_daemon(directory.path());
+    let (second_addr, token) = wait_for_production_daemon(directory.path()).await;
+    let (mut ws, mut reader) = connect(second_addr).await;
+    let auth = format!(
+        r#"{{"method":"Auth","params":{{"token":"{}"}},"id":5}}"#,
+        token.trim()
+    );
+    assert_eq!(send_recv(&mut ws, &mut reader, &auth).await["type"], "Ok");
+    let status = send_recv(&mut ws, &mut reader, r#"{"method":"VaultStatus","id":6}"#).await;
+    assert_eq!(status["type"], "Ok", "status failed: {status}");
+    assert_eq!(status["result"]["locked"], false);
+
+    assert_eq!(
+        send_recv(&mut ws, &mut reader, r#"{"method":"Lock","id":7}"#).await["type"],
+        "Ok"
+    );
+    drop(ws);
+    drop(reader);
+    unsafe {
+        libc::kill(second_daemon.id() as i32, libc::SIGINT);
+    }
+    second_daemon.wait().unwrap();
+
+    let socket = directory.path().join("session-host.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !socket.exists(),
+        "locked detached host should discard cache and exit"
+    );
+}
+
 // -----------------------------------------------------------------------
 // 配置目录（首次启动）：不存在时自动创建；不可写时给人话错误（不 panic）
 // -----------------------------------------------------------------------

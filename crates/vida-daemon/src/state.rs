@@ -73,6 +73,12 @@ impl DaemonState {
         passphrase: &str,
         remember_seconds: Option<u64>,
     ) -> Result<VaultStatusInfo> {
+        if let Some(seconds) = remember_seconds {
+            anyhow::ensure!(
+                (1..=vida_core::keyring_cache::MAX_CACHE_SECONDS).contains(&seconds),
+                "口令记住时长必须在 1 秒到 7 天之间"
+            );
+        }
         if !self.vault_path.exists() {
             anyhow::bail!("{}", self.i18n.tr("daemon_vault_missing"));
         }
@@ -80,13 +86,36 @@ impl DaemonState {
         let vault = vida_core::vault::decrypt(&ct, passphrase)?;
         if let Some(seconds) = remember_seconds {
             let sec = secrecy::SecretString::from(passphrase.to_string());
-            vida_core::keyring_cache::cache_passphrase(
-                &sec,
-                std::time::Duration::from_secs(seconds),
-            )?;
-            info!("Passphrase cached in keyring with bounded expiry");
-        } else if let Err(error) = vida_core::keyring_cache::clear_cache() {
-            warn!("Could not clear passphrase cache: {}", error);
+            let ttl = std::time::Duration::from_secs(seconds);
+            let pty = self
+                .pty
+                .read()
+                .map_err(|_| anyhow::anyhow!("终端会话宿主锁异常"))?;
+            if pty.is_hosted() {
+                match pty.cache_unlock_passphrase(&sec, ttl) {
+                    Ok(true) => info!("Passphrase cached in detached memory with bounded expiry"),
+                    Ok(false) => warn!(
+                        "Existing session host does not support passphrase caching; restart it after closing active sessions"
+                    ),
+                    Err(error) => warn!("Could not cache passphrase in session host: {}", error),
+                }
+            } else {
+                vida_core::keyring_cache::cache_passphrase(&sec, ttl)?;
+                info!("Passphrase cached in keyring with bounded expiry");
+            }
+        } else {
+            let pty = self
+                .pty
+                .read()
+                .map_err(|_| anyhow::anyhow!("终端会话宿主锁异常"))?;
+            let result = if pty.is_hosted() {
+                pty.clear_unlock_cache().map(|_| ())
+            } else {
+                vida_core::keyring_cache::clear_cache()
+            };
+            if let Err(error) = result {
+                warn!("Could not clear passphrase cache: {}", error);
+            }
         }
         self.vault = Some(vault);
         self.passphrase = Some(passphrase.to_string());
@@ -95,11 +124,23 @@ impl DaemonState {
         Ok(self.vault_status())
     }
 
-    /// Attempt unattended startup unlock from a still-valid OS-keyring cache.
-    /// Expired, legacy, unavailable, or incorrect entries simply leave the
-    /// vault locked; none of those values are logged.
+    /// Attempt unattended startup unlock from a still-valid detached-memory
+    /// cache. Embedded test states retain the keyring fallback for isolation.
+    /// Expired, unavailable, or incorrect entries simply leave the vault
+    /// locked; none of those values are logged.
     pub fn try_unlock_cached(&mut self) -> Result<bool> {
-        let Some(passphrase) = vida_core::keyring_cache::get_cached_passphrase() else {
+        let passphrase = {
+            let pty = self
+                .pty
+                .read()
+                .map_err(|_| anyhow::anyhow!("终端会话宿主锁异常"))?;
+            if pty.is_hosted() {
+                pty.read_unlock_cache()?
+            } else {
+                vida_core::keyring_cache::get_cached_passphrase()
+            }
+        };
+        let Some(passphrase) = passphrase else {
             return Ok(false);
         };
         if !self.vault_path.exists() {
@@ -109,7 +150,15 @@ impl DaemonState {
         let vault = match vida_core::vault::decrypt(&encrypted, passphrase.expose_secret()) {
             Ok(vault) => vault,
             Err(_) => {
-                let _ = vida_core::keyring_cache::clear_cache();
+                let pty = self
+                    .pty
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("终端会话宿主锁异常"))?;
+                if pty.is_hosted() {
+                    let _ = pty.clear_unlock_cache();
+                } else {
+                    let _ = vida_core::keyring_cache::clear_cache();
+                }
                 warn!("Cached vault passphrase was rejected and has been cleared");
                 return Ok(false);
             }
@@ -117,7 +166,7 @@ impl DaemonState {
         self.vault = Some(vault);
         self.passphrase = Some(passphrase.expose_secret().to_string());
         self.init_sync()?;
-        info!("Vault unlocked from unexpired keyring cache");
+        info!("Vault unlocked from unexpired passphrase cache");
         Ok(true)
     }
 
@@ -125,7 +174,18 @@ impl DaemonState {
         self.vault = None;
         self.passphrase = None;
         self.sync = None;
-        if let Err(error) = vida_core::keyring_cache::clear_cache() {
+        let result = self
+            .pty
+            .read()
+            .map_err(|_| anyhow::anyhow!("终端会话宿主锁异常"))
+            .and_then(|pty| {
+                if pty.is_hosted() {
+                    pty.clear_unlock_cache().map(|_| ())
+                } else {
+                    vida_core::keyring_cache::clear_cache()
+                }
+            });
+        if let Err(error) = result {
             warn!("Could not clear passphrase cache while locking: {}", error);
         }
         info!("Vault locked");

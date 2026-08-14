@@ -111,6 +111,16 @@ pub fn apply_env(command: &mut portable_pty::CommandBuilder, env: &AskpassEnv) -
     Ok(())
 }
 
+pub fn apply_env_process(command: &mut std::process::Command, env: &AskpassEnv) -> Result<()> {
+    let executable = std::env::current_exe().context("无法定位 vida-daemon askpass helper")?;
+    command.env("SSH_ASKPASS", executable);
+    command.env("SSH_ASKPASS_REQUIRE", "force");
+    command.env("DISPLAY", "vida:0");
+    command.env(ENV_ADDR, &env.address);
+    command.env(ENV_TOKEN, &env.token);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

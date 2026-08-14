@@ -9,6 +9,7 @@ pub mod s6_conflict;
 pub mod s7_conflict_file;
 pub mod s8_remote_missing;
 pub mod s9_backup;
+pub mod s_sftp;
 pub mod s_terminal;
 
 use iced::Element;
@@ -25,6 +26,7 @@ use crate::app::AppMessage;
 pub enum TabKind {
     Host { host_id: String },
     Terminal { session_id: String, number: u32 },
+    Sftp { host_id: String },
     AddHost,
     EditHost { host_id: String },
     Settings,
@@ -75,6 +77,13 @@ impl Tab {
             id: format!("terminal:{session_id}"),
             name,
             kind: TabKind::Terminal { session_id, number },
+        }
+    }
+    pub fn sftp(host_id: String, name: String) -> Self {
+        Self {
+            id: format!("sftp:{host_id}"),
+            name,
+            kind: TabKind::Sftp { host_id },
         }
     }
 }

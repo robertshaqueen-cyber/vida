@@ -160,6 +160,20 @@ pub fn notice(_: &Theme) -> container::Style {
     }
 }
 
+/// Highlighted native file-drop target used by file-management screens.
+pub fn drop_target(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(ACCENT_MUTED.scale_alpha(0.55))),
+        text_color: Some(TEXT_PRIMARY),
+        border: Border {
+            color: ACCENT.scale_alpha(0.65),
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 pub fn error_notice(_: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(DANGER.scale_alpha(0.10))),
@@ -279,6 +293,60 @@ pub fn nav_item(active: bool) -> impl Fn(&Theme, button::Status) -> button::Styl
             },
             ..button::Style::default()
         }
+    }
+}
+
+/// Shared file-list row styling for pointer-driven selection surfaces.
+pub fn file_row(selected: bool, hovered: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: if selected || hovered {
+            Some(Background::Color(if selected {
+                ACCENT_MUTED
+            } else {
+                BG_SURFACE_HOVER
+            }))
+        } else {
+            None
+        },
+        text_color: Some(if selected { ACCENT } else { TEXT_SECONDARY }),
+        border: Border {
+            radius: RADIUS_MD.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Shared floating context-menu surface used by pointer-driven views.
+pub fn context_menu_surface(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SURFACE)),
+        text_color: Some(TEXT_PRIMARY),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: RADIUS_MD.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.38),
+            offset: Vector::new(3.0, 5.0),
+            blur_radius: 12.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Shared context-menu action with an explicit hover state.
+pub fn context_menu_item(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hovered.then_some(Background::Color(BG_SURFACE_HOVER)),
+        text_color: if hovered { ACCENT } else { TEXT_PRIMARY },
+        border: Border {
+            radius: RADIUS_SM.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
     }
 }
 
@@ -423,6 +491,7 @@ pub mod icons {
     pub const DATABASE: &str = "\u{e0b1}";
     pub const EYE: &str = "\u{e0be}";
     pub const FOLDER: &str = "\u{e0db}";
+    pub const FILE: &str = "\u{e0c3}";
     pub const HOUSE: &str = "\u{e0f9}";
     pub const LANGUAGES: &str = "\u{e104}";
     pub const LOCK: &str = "\u{e10f}";

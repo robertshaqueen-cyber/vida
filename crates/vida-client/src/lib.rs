@@ -630,6 +630,46 @@ impl WsClient {
         .await
     }
 
+    pub async fn sftp_list(&self, host_id: &str, path: &str) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "SftpList",
+            serde_json::json!({"host_id": host_id, "path": path}),
+        )
+        .await
+    }
+
+    pub async fn sftp_upload(
+        &self,
+        host_id: &str,
+        local_path: &str,
+        remote_path: &str,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send("SftpUpload", serde_json::json!({"host_id": host_id, "local_path": local_path, "remote_path": remote_path})).await
+    }
+
+    pub async fn sftp_download(
+        &self,
+        host_id: &str,
+        remote_path: &str,
+        local_path: &str,
+        recursive: bool,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send("SftpDownload", serde_json::json!({"host_id": host_id, "remote_path": remote_path, "local_path": local_path, "recursive": recursive})).await
+    }
+
+    pub async fn sftp_create_directory(
+        &self,
+        host_id: &str,
+        parent: &str,
+        name: &str,
+    ) -> DaemonResult<serde_json::Value> {
+        self.send(
+            "SftpCreateDirectory",
+            serde_json::json!({"host_id": host_id, "parent": parent, "name": name}),
+        )
+        .await
+    }
+
     pub async fn get_settings(&self) -> DaemonResult<serde_json::Value> {
         self.send_no_params("GetSettings").await
     }

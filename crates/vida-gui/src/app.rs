@@ -4,7 +4,7 @@ use iced::{Element, Task};
 use vida_core::i18n::{self, I18n};
 
 use crate::screens::{
-    Screen, Tab, s_terminal, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential,
+    Screen, Tab, s_sftp, s_terminal, s0_connection, s1_setup, s2_unlock, s3_main, s4_credential,
     s5_settings, s6_conflict, s7_conflict_file, s8_remote_missing, s9_backup,
 };
 use crate::term::frame;
@@ -69,6 +69,7 @@ pub struct VidaApp {
     /// 正式终端标签的 UI 状态。key 是稳定 tab id；会话重连后 session_id
     /// 可以变化，但 tab id 不变。
     terminal_sessions: HashMap<String, s_terminal::TerminalSession>,
+    sftp_states: HashMap<String, s_sftp::State>,
     terminal_opening: bool,
     terminal_error: Option<String>,
     next_terminal_number: u32,
@@ -158,6 +159,57 @@ pub enum AppMessage {
     // Formal local terminal tabs (M2b-3)
     OpenLocalTerminal,
     OpenSshTerminal(String),
+    OpenSftp(String),
+    SftpRefresh,
+    SftpParent,
+    SftpEnter(String),
+    SftpSelectionStart(String),
+    SftpSelectionHover(String),
+    SftpSelectionHoverCleared,
+    SftpSelectionFinished,
+    SftpCursorMoved(iced::Point),
+    SftpContextOpen(String),
+    SftpCopyRemotePath(String),
+    SftpSelectionAdditive(bool),
+    SftpScrolled(f32),
+    SftpLoadingTick,
+    SftpToggleFilter,
+    SftpFilterChanged(String),
+    SftpToggleCreateDirectory,
+    SftpNewDirectoryNameChanged(String),
+    SftpCreateDirectory,
+    SftpCreateDirectoryFinished {
+        tab_id: String,
+        path: String,
+        result: Result<(), String>,
+    },
+    SftpLoaded {
+        tab_id: String,
+        path: String,
+        entries: Vec<s_sftp::Entry>,
+    },
+    SftpFailed {
+        tab_id: String,
+        message: String,
+    },
+    SftpChooseUpload,
+    SftpChooseUploadFolder,
+    SftpUploadPicked(Option<String>),
+    SftpFilesHovered,
+    SftpFilesHoveredLeft,
+    SftpFileDropped(String),
+    SftpChooseDownload,
+    SftpDownloadPicked {
+        local: Option<String>,
+        selections: Vec<(String, bool)>,
+        destination_is_folder: bool,
+    },
+    SftpTransferFinished {
+        tab_id: String,
+        path: String,
+        upload: bool,
+        result: Result<(), String>,
+    },
     TerminalPush(PushMsg),
     /// 订阅建立完成。
     TerminalOpened {
@@ -357,6 +409,7 @@ fn new() -> (VidaApp, Task<AppMessage>) {
         clipboard_guard: None,
         clipboard_token: 0,
         terminal_sessions: HashMap::new(),
+        sftp_states: HashMap::new(),
         terminal_opening: false,
         terminal_error: None,
         next_terminal_number: 1,
@@ -520,6 +573,113 @@ fn active_terminal(app: &VidaApp) -> Option<&s_terminal::TerminalSession> {
 
 fn active_terminal_mut(app: &mut VidaApp) -> Option<&mut s_terminal::TerminalSession> {
     app.terminal_sessions.get_mut(&app.active_tab_id)
+}
+
+fn sftp_load_task(
+    client: WsClient,
+    tab_id: String,
+    host_id: String,
+    path: String,
+) -> Task<AppMessage> {
+    Task::perform(
+        async move {
+            match client.sftp_list(&host_id, &path).await {
+                Ok(value) => {
+                    let canonical_path = value
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or(path);
+                    let entries =
+                        serde_json::from_value(value.get("entries").cloned().unwrap_or_default())
+                            .map_err(|error| error.to_string());
+                    match entries {
+                        Ok(entries) => AppMessage::SftpLoaded {
+                            tab_id,
+                            path: canonical_path,
+                            entries,
+                        },
+                        Err(message) => AppMessage::SftpFailed { tab_id, message },
+                    }
+                }
+                Err(error) => AppMessage::SftpFailed {
+                    tab_id,
+                    message: error.to_string(),
+                },
+            }
+        },
+        |message| message,
+    )
+}
+
+fn sftp_start_next_upload(app: &mut VidaApp, tab_id: String) -> Task<AppMessage> {
+    let Some(client) = app.ws_client.clone() else {
+        return Task::none();
+    };
+    let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+        return Task::none();
+    };
+    if state.upload_in_progress {
+        return Task::none();
+    }
+    let Some((local, remote)) = state.pending_uploads.pop_front() else {
+        return Task::none();
+    };
+    let host_id = state.host_id.clone();
+    let path = state.path.clone();
+    state.upload_in_progress = true;
+    state.error = None;
+    state.notice = None;
+    Task::perform(
+        async move {
+            client
+                .sftp_upload(&host_id, &local, &remote)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        move |result| AppMessage::SftpTransferFinished {
+            tab_id,
+            path,
+            upload: true,
+            result,
+        },
+    )
+}
+
+fn sftp_start_next_download(app: &mut VidaApp, tab_id: String) -> Task<AppMessage> {
+    let Some(client) = app.ws_client.clone() else {
+        return Task::none();
+    };
+    let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+        return Task::none();
+    };
+    if state.download_in_progress {
+        return Task::none();
+    }
+    let Some((remote, local, recursive)) = state.pending_downloads.pop_front() else {
+        return Task::none();
+    };
+    let host_id = state.host_id.clone();
+    let path = state.path.clone();
+    state.download_in_progress = true;
+    state.error = None;
+    state.notice = None;
+    Task::perform(
+        async move {
+            client
+                .sftp_download(&host_id, &remote, &local, recursive)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        move |result| AppMessage::SftpTransferFinished {
+            tab_id,
+            path,
+            upload: false,
+            result,
+        },
+    )
 }
 
 fn classify_ssh_failure(i18n: &I18n, output: &str) -> String {
@@ -778,6 +938,9 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
     if editor_is_active {
         subscriptions.push(iced::event::listen_with(editor_focus_event));
     }
+    if app.sftp_states.contains_key(&app.active_tab_id) {
+        subscriptions.push(iced::event::listen_with(sftp_file_event));
+    }
 
     let Some(ws) = app.ws_client.as_ref() else {
         return iced::Subscription::batch(subscriptions);
@@ -850,6 +1013,17 @@ fn subscription(app: &VidaApp) -> iced::Subscription<AppMessage> {
         );
     }
 
+    if app
+        .sftp_states
+        .get(&app.active_tab_id)
+        .is_some_and(|state| state.loading)
+    {
+        subscriptions.push(
+            iced::time::every(std::time::Duration::from_millis(280))
+                .map(|_| AppMessage::SftpLoadingTick),
+        );
+    }
+
     iced::Subscription::batch(subscriptions)
 }
 
@@ -873,6 +1047,34 @@ fn editor_focus_event(
                 AppMessage::EditorFocusNext
             })
         }
+        _ => None,
+    }
+}
+
+fn sftp_file_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<AppMessage> {
+    match event {
+        iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+            Some(AppMessage::SftpFilesHovered)
+        }
+        iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+            Some(AppMessage::SftpFilesHoveredLeft)
+        }
+        iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(
+            AppMessage::SftpFileDropped(path.to_string_lossy().into_owned()),
+        ),
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+            Some(AppMessage::SftpSelectionFinished)
+        }
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+            Some(AppMessage::SftpCursorMoved(position))
+        }
+        iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => Some(
+            AppMessage::SftpSelectionAdditive(modifiers.command() || modifiers.control()),
+        ),
         _ => None,
     }
 }
@@ -1468,6 +1670,7 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                     )
             });
             close_terminal_session(app, &tab_id);
+            app.sftp_states.remove(&tab_id);
             app.tabs.retain(|t| t.id != tab_id);
             if app.active_tab_id == tab_id {
                 app.active_tab_id = closed_position
@@ -2846,6 +3049,509 @@ fn update(app: &mut VidaApp, message: AppMessage) -> Task<AppMessage> {
                 |message| message,
             )
         }
+        AppMessage::OpenSftp(host_id) => {
+            if app.vault_locked {
+                return Task::none();
+            }
+            let Some(host) = app.hosts.iter().find(|host| host.id == host_id) else {
+                return Task::none();
+            };
+            let tab_id = format!("sftp:{host_id}");
+            if !app.tabs.iter().any(|tab| tab.id == tab_id) {
+                app.tabs
+                    .push(Tab::sftp(host_id.clone(), format!("SFTP · {}", host.name)));
+                app.sftp_states.insert(
+                    tab_id.clone(),
+                    s_sftp::State::new(host_id.clone(), host.name.clone()),
+                );
+            }
+            app.active_tab_id = tab_id.clone();
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            sftp_load_task(client, tab_id, host_id, ".".into())
+        }
+        AppMessage::SftpRefresh => {
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            if state.loading {
+                return Task::none();
+            }
+            state.loading = true;
+            state.error = None;
+            state.notice = None;
+            let (host_id, path) = (state.host_id.clone(), state.path.clone());
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            sftp_load_task(client, tab_id, host_id, path)
+        }
+        AppMessage::SftpParent => {
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            if state.loading {
+                return Task::none();
+            }
+            let path = s_sftp::parent_remote(&state.path);
+            if let Some(fresh) = state.restore_cached(&path) {
+                state.loading = !fresh;
+                state.error = None;
+                state.notice = None;
+                if fresh {
+                    return Task::none();
+                }
+            } else {
+                state.path = path.clone();
+                state.entries.clear();
+                state.reset_selection();
+                state.visible_limit = s_sftp::DIRECTORY_PAGE_SIZE;
+                state.loading = true;
+            }
+            state.error = None;
+            let host_id = state.host_id.clone();
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            sftp_load_task(client, tab_id, host_id, path)
+        }
+        AppMessage::SftpEnter(path) => {
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            if state.loading {
+                return Task::none();
+            }
+            if let Some(fresh) = state.restore_cached(&path) {
+                state.loading = !fresh;
+                state.error = None;
+                state.notice = None;
+                if fresh {
+                    return Task::none();
+                }
+            } else {
+                state.path = path.clone();
+                state.entries.clear();
+                state.reset_selection();
+                state.visible_limit = s_sftp::DIRECTORY_PAGE_SIZE;
+                state.loading = true;
+            }
+            state.error = None;
+            let host_id = state.host_id.clone();
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            sftp_load_task(client, tab_id, host_id, path)
+        }
+        AppMessage::SftpSelectionStart(name) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                if state.loading {
+                    return Task::none();
+                }
+                state.selection_base = if state.selection_additive {
+                    state.selected.clone()
+                } else {
+                    std::collections::BTreeSet::new()
+                };
+                if state.selection_additive && state.selected.contains(&name) {
+                    state.selected.remove(&name);
+                    state.selection_base.remove(&name);
+                } else {
+                    state.selected = state.selection_base.clone();
+                    state.selected.insert(name.clone());
+                }
+                state.selection_anchor = Some(name);
+                state.selection_dragging = true;
+                state.context_entry = None;
+            }
+            Task::none()
+        }
+        AppMessage::SftpContextOpen(name) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                if state.loading {
+                    return Task::none();
+                }
+                if !state.selected.contains(&name) {
+                    state.selected.clear();
+                    state.selected.insert(name.clone());
+                    state.selection_anchor = Some(name.clone());
+                }
+                state.selection_dragging = false;
+                state.context_entry = Some(name);
+                state.context_position = Some(state.cursor_position);
+            }
+            Task::none()
+        }
+        AppMessage::SftpCursorMoved(position) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.cursor_position = position;
+            }
+            Task::none()
+        }
+        AppMessage::SftpCopyRemotePath(path) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.context_entry = None;
+                state.context_position = None;
+            }
+            iced::clipboard::write(path)
+        }
+        AppMessage::SftpSelectionHover(name) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.hovered = Some(name.clone());
+                if state.selection_dragging {
+                    state.select_range_to(&name);
+                }
+            }
+            Task::none()
+        }
+        AppMessage::SftpSelectionHoverCleared => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.hovered = None;
+            }
+            Task::none()
+        }
+        AppMessage::SftpSelectionFinished => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.selection_dragging = false;
+                state.context_entry = None;
+                state.context_position = None;
+            }
+            Task::none()
+        }
+        AppMessage::SftpSelectionAdditive(additive) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.selection_additive = additive;
+            }
+            Task::none()
+        }
+        AppMessage::SftpScrolled(relative_y) => {
+            if relative_y >= 0.9
+                && let Some(state) = app.sftp_states.get_mut(&app.active_tab_id)
+            {
+                state.visible_limit = state
+                    .visible_limit
+                    .saturating_add(s_sftp::DIRECTORY_PAGE_SIZE);
+            }
+            Task::none()
+        }
+        AppMessage::SftpLoadingTick => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id)
+                && state.loading
+            {
+                state.loading_pulse = !state.loading_pulse;
+            }
+            Task::none()
+        }
+        AppMessage::SftpToggleFilter => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.show_filter = !state.show_filter;
+                if !state.show_filter {
+                    state.filter.clear();
+                }
+                state.visible_limit = s_sftp::DIRECTORY_PAGE_SIZE;
+                state.reset_selection();
+            }
+            Task::none()
+        }
+        AppMessage::SftpFilterChanged(filter) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.filter = filter;
+                state.reset_selection();
+                state.visible_limit = s_sftp::DIRECTORY_PAGE_SIZE;
+            }
+            Task::none()
+        }
+        AppMessage::SftpToggleCreateDirectory => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.show_create_directory = !state.show_create_directory;
+                state.new_directory_name.clear();
+                state.error = None;
+            }
+            Task::none()
+        }
+        AppMessage::SftpNewDirectoryNameChanged(name) => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.new_directory_name = name;
+            }
+            Task::none()
+        }
+        AppMessage::SftpCreateDirectory => {
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            if state.loading {
+                return Task::none();
+            }
+            let name = state.new_directory_name.trim().to_owned();
+            if name.is_empty() {
+                return Task::none();
+            }
+            let host_id = state.host_id.clone();
+            let path = state.path.clone();
+            let request_path = path.clone();
+            state.loading = true;
+            state.error = None;
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            Task::perform(
+                async move {
+                    client
+                        .sftp_create_directory(&host_id, &request_path, &name)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+                move |result| AppMessage::SftpCreateDirectoryFinished {
+                    tab_id,
+                    path,
+                    result,
+                },
+            )
+        }
+        AppMessage::SftpCreateDirectoryFinished {
+            tab_id,
+            path,
+            result,
+        } => {
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            match result {
+                Ok(()) => {
+                    state.show_create_directory = false;
+                    state.new_directory_name.clear();
+                    state.notice = Some(app.i18n.tr("sftp_create_ok").to_string());
+                }
+                Err(message) => {
+                    state.loading = false;
+                    state.error = Some(message);
+                    return Task::none();
+                }
+            }
+            let host_id = state.host_id.clone();
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            sftp_load_task(client, tab_id, host_id, path)
+        }
+        AppMessage::SftpLoaded {
+            tab_id,
+            path,
+            entries,
+        } => {
+            if let Some(state) = app.sftp_states.get_mut(&tab_id) {
+                state.path = path;
+                state.entries = entries.clone();
+                state.remember_directory(state.path.clone(), entries);
+                state.loading = false;
+                state.loading_pulse = false;
+                state.error = None;
+                state.notice = None;
+                state.visible_limit = s_sftp::DIRECTORY_PAGE_SIZE;
+                state.reset_selection();
+            }
+            Task::none()
+        }
+        AppMessage::SftpFailed { tab_id, message } => {
+            if let Some(state) = app.sftp_states.get_mut(&tab_id) {
+                state.loading = false;
+                state.loading_pulse = false;
+                state.notice = None;
+                state.error = Some(message);
+            }
+            Task::none()
+        }
+        AppMessage::SftpChooseUpload => Task::perform(
+            async {
+                rfd::AsyncFileDialog::new()
+                    .pick_file()
+                    .await
+                    .map(|f| f.path().to_string_lossy().into_owned())
+            },
+            AppMessage::SftpUploadPicked,
+        ),
+        AppMessage::SftpChooseUploadFolder => Task::perform(
+            async {
+                rfd::AsyncFileDialog::new()
+                    .pick_folder()
+                    .await
+                    .map(|folder| folder.path().to_string_lossy().into_owned())
+            },
+            AppMessage::SftpUploadPicked,
+        ),
+        AppMessage::SftpFilesHovered => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.drag_hovered = true;
+            }
+            Task::none()
+        }
+        AppMessage::SftpFilesHoveredLeft => {
+            if let Some(state) = app.sftp_states.get_mut(&app.active_tab_id) {
+                state.drag_hovered = false;
+            }
+            Task::none()
+        }
+        AppMessage::SftpFileDropped(local) => {
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            state.drag_hovered = false;
+            let Some(name) = std::path::Path::new(&local)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                state.error = Some(app.i18n.tr("sftp_invalid_local_name").to_string());
+                return Task::none();
+            };
+            let remote = s_sftp::join_remote(&state.path, &name);
+            state.pending_uploads.push_back((local, remote));
+            sftp_start_next_upload(app, tab_id)
+        }
+        AppMessage::SftpUploadPicked(local) => {
+            let Some(local) = local else {
+                return Task::none();
+            };
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            let Some(name) = std::path::Path::new(&local)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                state.error = Some(app.i18n.tr("sftp_invalid_local_name").to_string());
+                return Task::none();
+            };
+            let remote = s_sftp::join_remote(&state.path, &name);
+            state.pending_uploads.push_back((local, remote));
+            sftp_start_next_upload(app, tab_id)
+        }
+        AppMessage::SftpChooseDownload => {
+            let Some(state) = app.sftp_states.get(&app.active_tab_id) else {
+                return Task::none();
+            };
+            let selections = state
+                .entries
+                .iter()
+                .filter(|entry| state.selected.contains(&entry.name))
+                .map(|entry| (entry.name.clone(), entry.is_dir))
+                .collect::<Vec<_>>();
+            if selections.is_empty() {
+                return Task::none();
+            }
+            let destination_is_folder = selections.len() > 1 || selections[0].1;
+            let suggested_name = selections[0].0.clone();
+            Task::perform(
+                async move {
+                    let local = if destination_is_folder {
+                        rfd::AsyncFileDialog::new()
+                            .pick_folder()
+                            .await
+                            .map(|folder| folder.path().to_string_lossy().into_owned())
+                    } else {
+                        rfd::AsyncFileDialog::new()
+                            .set_file_name(&suggested_name)
+                            .save_file()
+                            .await
+                            .map(|file| file.path().to_string_lossy().into_owned())
+                    };
+                    AppMessage::SftpDownloadPicked {
+                        local,
+                        selections,
+                        destination_is_folder,
+                    }
+                },
+                |message| message,
+            )
+        }
+        AppMessage::SftpDownloadPicked {
+            local,
+            selections,
+            destination_is_folder,
+        } => {
+            let Some(local) = local else {
+                return Task::none();
+            };
+            let tab_id = app.active_tab_id.clone();
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            for (name, is_dir) in selections {
+                let remote = s_sftp::join_remote(&state.path, &name);
+                let target = if destination_is_folder {
+                    std::path::Path::new(&local)
+                        .join(&name)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    local.clone()
+                };
+                state.pending_downloads.push_back((remote, target, is_dir));
+            }
+            sftp_start_next_download(app, tab_id)
+        }
+        AppMessage::SftpTransferFinished {
+            tab_id,
+            path,
+            upload,
+            result,
+        } => {
+            if let Some(state) = app.sftp_states.get_mut(&tab_id) {
+                if upload {
+                    state.upload_in_progress = false;
+                } else {
+                    state.download_in_progress = false;
+                }
+                match result {
+                    Ok(()) if upload && !state.pending_uploads.is_empty() => {
+                        return sftp_start_next_upload(app, tab_id);
+                    }
+                    Ok(()) if !upload && !state.pending_downloads.is_empty() => {
+                        return sftp_start_next_download(app, tab_id);
+                    }
+                    Ok(()) => {
+                        state.notice = Some(
+                            app.i18n
+                                .tr(if upload {
+                                    "sftp_upload_ok"
+                                } else {
+                                    "sftp_download_ok"
+                                })
+                                .to_string(),
+                        )
+                    }
+                    Err(message) => {
+                        state.loading = false;
+                        state.upload_in_progress = false;
+                        state.download_in_progress = false;
+                        state.pending_uploads.clear();
+                        state.pending_downloads.clear();
+                        state.error = Some(message);
+                        return Task::none();
+                    }
+                }
+            }
+            if !upload {
+                return Task::none();
+            }
+            let Some(state) = app.sftp_states.get_mut(&tab_id) else {
+                return Task::none();
+            };
+            state.loading = true;
+            let host_id = state.host_id.clone();
+            let refresh_path = if upload { state.path.clone() } else { path };
+            let Some(client) = app.ws_client.clone() else {
+                return Task::none();
+            };
+            sftp_load_task(client, tab_id, host_id, refresh_path)
+        }
         AppMessage::TerminalOpened {
             session_id,
             title,
@@ -3173,6 +3879,11 @@ fn view(app: &VidaApp) -> Element<'_, AppMessage> {
                         .get(&active_tab.id)
                         .map(|session| session.view(&app.i18n))
                         .unwrap_or_else(|| text(app.i18n.tr("terminal_state_missing")).into()),
+                    TabKind::Sftp { .. } => app
+                        .sftp_states
+                        .get(&active_tab.id)
+                        .map(|state| state.view(&app.i18n))
+                        .unwrap_or_else(|| text("SFTP").into()),
                     TabKind::AddHost | TabKind::EditHost { .. } => {
                         if let Some(editor) = &app.editor_state {
                             editor.view(&app.i18n)
@@ -3449,7 +4160,7 @@ mod tests {
     use super::{
         AppMessage, PendingVaultAction, Screen, Tab, VidaApp, classify_ssh_failure,
         editor_focus_event, mark_terminal_reconnected, parse_backup_bytes,
-        restore_persisted_terminal_layout, suspend_all_terminal_sessions, update,
+        restore_persisted_terminal_layout, sftp_file_event, suspend_all_terminal_sessions, update,
     };
     use crate::screens::{s_terminal, s0_connection, s3_main, s4_credential};
     use crate::term::primitive::TerminalAppearance;
@@ -3495,6 +4206,20 @@ mod tests {
         );
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn native_file_drop_is_routed_to_sftp_upload() {
+        let path = std::path::PathBuf::from("/tmp/dragged folder");
+        let result = sftp_file_event(
+            iced::Event::Window(iced::window::Event::FileDropped(path.clone())),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+
+        assert!(
+            matches!(result, Some(AppMessage::SftpFileDropped(value)) if value == path.to_string_lossy())
+        );
     }
 
     #[test]

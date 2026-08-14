@@ -63,9 +63,9 @@ pub enum Request {
         passphrase: String,
     },
     /// Unlock an existing vault.
-    /// `remember_seconds`: cache the passphrase in the OS keyring for this
-    /// bounded duration. `remember=true` is retained for older clients and
-    /// maps to seven days.
+    /// `remember_seconds`: cache the passphrase in detached session-host
+    /// memory for this bounded duration. `remember=true` is retained for older
+    /// clients and maps to seven days.
     Unlock {
         passphrase: String,
         #[serde(default)]
@@ -122,6 +122,31 @@ pub enum Request {
     SetHostAgentTrust {
         host_id: String,
         trust: AgentTrust,
+    },
+    /// Owner-only SFTP directory listing. Credentials stay inside the daemon.
+    SftpList {
+        host_id: String,
+        path: String,
+    },
+    /// Owner-only upload from a local path selected by the GUI.
+    SftpUpload {
+        host_id: String,
+        local_path: String,
+        remote_path: String,
+    },
+    /// Owner-only download to a local path selected by the GUI.
+    SftpDownload {
+        host_id: String,
+        remote_path: String,
+        local_path: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    /// Owner-only creation of one direct child directory.
+    SftpCreateDirectory {
+        host_id: String,
+        parent: String,
+        name: String,
     },
 
     // Agent control. AgentExec is Agent-role only; approval and audit are

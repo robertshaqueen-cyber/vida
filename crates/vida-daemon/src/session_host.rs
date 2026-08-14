@@ -33,8 +33,27 @@ mod unix {
     const PUSH_MAGIC: u8 = 0x56;
 
     enum HostProbe {
-        Compatible(UnixStream),
+        Compatible {
+            stream: UnixStream,
+            supports_unlock_cache: bool,
+        },
         Unavailable,
+    }
+
+    #[derive(Serialize, Deserialize, Zeroize)]
+    #[zeroize(drop)]
+    #[serde(transparent)]
+    struct HostSecret(String);
+
+    struct UnlockCache {
+        passphrase: SecretString,
+        expires_at: Instant,
+    }
+
+    impl UnlockCache {
+        fn is_valid(&self) -> bool {
+            self.expires_at > Instant::now()
+        }
     }
 
     #[derive(Serialize, Deserialize, Zeroize)]
@@ -96,6 +115,12 @@ mod unix {
         Subscribe {
             session_id: String,
         },
+        CacheUnlock {
+            passphrase: HostSecret,
+            ttl_seconds: u64,
+        },
+        ReadUnlockCache,
+        ClearUnlockCache,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -103,6 +128,8 @@ mod unix {
         ok: bool,
         value: serde_json::Value,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<HostSecret>,
     }
 
     impl HostResponse {
@@ -111,6 +138,16 @@ mod unix {
                 ok: true,
                 value,
                 error: None,
+                secret: None,
+            }
+        }
+
+        fn success_secret(secret: SecretString) -> Self {
+            Self {
+                ok: true,
+                value: serde_json::Value::Null,
+                error: None,
+                secret: Some(HostSecret(secret.expose_secret().to_owned())),
             }
         }
 
@@ -119,6 +156,7 @@ mod unix {
                 ok: false,
                 value: serde_json::Value::Null,
                 error: Some(error.to_string()),
+                secret: None,
             }
         }
     }
@@ -126,6 +164,7 @@ mod unix {
     pub struct SessionHostClient {
         socket_path: PathBuf,
         control: Mutex<Option<UnixStream>>,
+        supports_unlock_cache: bool,
     }
 
     impl SessionHostClient {
@@ -134,14 +173,21 @@ mod unix {
             let client = Self {
                 socket_path,
                 control: Mutex::new(None),
+                supports_unlock_cache: false,
             };
             match client.probe()? {
-                HostProbe::Compatible(stream) => {
+                HostProbe::Compatible {
+                    stream,
+                    supports_unlock_cache,
+                } => {
                     *client
                         .control
                         .lock()
                         .map_err(|_| anyhow::anyhow!("会话宿主控制通道锁异常"))? = Some(stream);
-                    return Ok(client);
+                    return Ok(Self {
+                        supports_unlock_cache,
+                        ..client
+                    });
                 }
                 HostProbe::Unavailable => {}
             }
@@ -173,21 +219,23 @@ mod unix {
 
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline {
-                if client.ping().is_ok() {
-                    return Ok(client);
+                if let HostProbe::Compatible {
+                    stream,
+                    supports_unlock_cache,
+                } = client.probe()?
+                {
+                    *client
+                        .control
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("会话宿主控制通道锁异常"))? = Some(stream);
+                    return Ok(Self {
+                        supports_unlock_cache,
+                        ..client
+                    });
                 }
                 thread::sleep(Duration::from_millis(25));
             }
             anyhow::bail!("终端会话宿主启动超时，请重新启动 vida-daemon")
-        }
-
-        fn ping(&self) -> Result<()> {
-            let value = self.call(HostRequest::Ping)?;
-            let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-            if version != u64::from(PROTOCOL_VERSION) {
-                anyhow::bail!("会话宿主协议版本不兼容，请关闭现有 Vida 会话后重试");
-            }
-            Ok(())
         }
 
         fn probe(&self) -> Result<HostProbe> {
@@ -213,13 +261,24 @@ mod unix {
                     }
                     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-                    Ok(HostProbe::Compatible(stream))
+                    Ok(HostProbe::Compatible {
+                        stream,
+                        supports_unlock_cache: response
+                            .value
+                            .get("unlock_cache")
+                            .and_then(|value| value.as_u64())
+                            == Some(1),
+                    })
                 }
                 Err(_) => Ok(HostProbe::Unavailable),
             }
         }
 
         fn call(&self, request: HostRequest) -> Result<serde_json::Value> {
+            Ok(self.exchange(request)?.value)
+        }
+
+        fn exchange(&self, request: HostRequest) -> Result<HostResponse> {
             let mut control = self
                 .control
                 .lock()
@@ -244,7 +303,7 @@ mod unix {
                 }
             };
             if response.ok {
-                Ok(response.value)
+                Ok(response)
             } else {
                 anyhow::bail!(
                     response
@@ -252,6 +311,45 @@ mod unix {
                         .unwrap_or_else(|| "会话宿主返回未知错误".into())
                 )
             }
+        }
+
+        pub fn cache_unlock_passphrase(
+            &self,
+            passphrase: &SecretString,
+            ttl: Duration,
+        ) -> Result<bool> {
+            if !self.supports_unlock_cache {
+                return Ok(false);
+            }
+            let ttl_seconds = ttl.as_secs();
+            anyhow::ensure!(
+                (1..=vida_core::keyring_cache::MAX_CACHE_SECONDS).contains(&ttl_seconds),
+                "口令记住时长必须在 1 秒到 7 天之间"
+            );
+            self.call(HostRequest::CacheUnlock {
+                passphrase: HostSecret(passphrase.expose_secret().to_owned()),
+                ttl_seconds,
+            })?;
+            Ok(true)
+        }
+
+        pub fn read_unlock_cache(&self) -> Result<Option<SecretString>> {
+            if !self.supports_unlock_cache {
+                return Ok(None);
+            }
+            let mut response = self.exchange(HostRequest::ReadUnlockCache)?;
+            Ok(response
+                .secret
+                .take()
+                .map(|mut secret| SecretString::from(std::mem::take(&mut secret.0))))
+        }
+
+        pub fn clear_unlock_cache(&self) -> Result<bool> {
+            if !self.supports_unlock_cache {
+                return Ok(false);
+            }
+            self.call(HostRequest::ClearUnlockCache)?;
+            Ok(true)
         }
 
         pub fn open_session(&self, cols: u16, rows: u16) -> Result<String> {
@@ -417,6 +515,7 @@ mod unix {
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
         crate::pty::cleanup_stale_inline_keys()?;
         let engine = Arc::new(RwLock::new(PtyEngine::default()));
+        let unlock_cache = Arc::new(Mutex::new(None::<UnlockCache>));
         let connections = Arc::new(AtomicUsize::new(0));
         let original_parent = unsafe { libc::getppid() };
         loop {
@@ -425,9 +524,10 @@ mod unix {
                     stream.set_nonblocking(false)?;
                     connections.fetch_add(1, Ordering::Relaxed);
                     let engine = Arc::clone(&engine);
+                    let unlock_cache = Arc::clone(&unlock_cache);
                     let connections = Arc::clone(&connections);
                     thread::spawn(move || {
-                        let _ = handle_connection(stream, engine);
+                        let _ = handle_connection(stream, engine, unlock_cache);
                         connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -439,7 +539,17 @@ mod unix {
                         .map_err(|_| anyhow::anyhow!("PTY 锁异常"))?
                         .list_sessions()
                         .is_empty();
-                    if parent_changed && no_connections && no_sessions {
+                    let no_unlock_cache = unlock_cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("金库口令缓存锁异常"))?
+                        .as_ref()
+                        .is_none_or(|cache| !cache.is_valid());
+                    if no_unlock_cache {
+                        *unlock_cache
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("金库口令缓存锁异常"))? = None;
+                    }
+                    if parent_changed && no_connections && no_sessions && no_unlock_cache {
                         break;
                     }
                     thread::sleep(Duration::from_millis(25));
@@ -451,7 +561,11 @@ mod unix {
         Ok(())
     }
 
-    fn handle_connection(mut stream: UnixStream, engine: Arc<RwLock<PtyEngine>>) -> Result<()> {
+    fn handle_connection(
+        mut stream: UnixStream,
+        engine: Arc<RwLock<PtyEngine>>,
+        unlock_cache: Arc<Mutex<Option<UnlockCache>>>,
+    ) -> Result<()> {
         loop {
             let request: HostRequest = match read_json(&mut stream) {
                 Ok(request) => request,
@@ -482,9 +596,35 @@ mod unix {
                 return Ok(());
             }
 
-            let response = match dispatch(request, &engine) {
-                Ok(value) => HostResponse::success(value),
-                Err(error) => HostResponse::failure(error),
+            let response = match request {
+                HostRequest::ReadUnlockCache => {
+                    let mut cache = unlock_cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("金库口令缓存锁异常"))?;
+                    if cache.as_ref().is_some_and(UnlockCache::is_valid) {
+                        HostResponse::success_secret(SecretString::from(
+                            cache
+                                .as_ref()
+                                .expect("valid cache checked")
+                                .passphrase
+                                .expose_secret()
+                                .to_owned(),
+                        ))
+                    } else {
+                        *cache = None;
+                        HostResponse::success(serde_json::Value::Null)
+                    }
+                }
+                HostRequest::ClearUnlockCache => {
+                    *unlock_cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("金库口令缓存锁异常"))? = None;
+                    HostResponse::success(serde_json::json!({"ok": true}))
+                }
+                request => match dispatch(request, &engine, &unlock_cache) {
+                    Ok(value) => HostResponse::success(value),
+                    Err(error) => HostResponse::failure(error),
+                },
             };
             write_json(&mut stream, &response)?;
         }
@@ -506,9 +646,12 @@ mod unix {
     fn dispatch(
         request: HostRequest,
         engine: &Arc<RwLock<PtyEngine>>,
+        unlock_cache: &Arc<Mutex<Option<UnlockCache>>>,
     ) -> Result<serde_json::Value> {
         match request {
-            HostRequest::Ping => Ok(serde_json::json!({"version": PROTOCOL_VERSION})),
+            HostRequest::Ping => {
+                Ok(serde_json::json!({"version": PROTOCOL_VERSION, "unlock_cache": 1}))
+            }
             HostRequest::OpenLocal { cols, rows } => {
                 let id = engine
                     .write()
@@ -608,6 +751,23 @@ mod unix {
                     .read_screen_styled(&session_id)?,
             )?),
             HostRequest::Subscribe { .. } => unreachable!(),
+            HostRequest::CacheUnlock {
+                mut passphrase,
+                ttl_seconds,
+            } => {
+                anyhow::ensure!(
+                    (1..=vida_core::keyring_cache::MAX_CACHE_SECONDS).contains(&ttl_seconds),
+                    "口令记住时长必须在 1 秒到 7 天之间"
+                );
+                *unlock_cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("金库口令缓存锁异常"))? = Some(UnlockCache {
+                    passphrase: SecretString::from(std::mem::take(&mut passphrase.0)),
+                    expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
+                });
+                Ok(serde_json::json!({"ok": true}))
+            }
+            HostRequest::ReadUnlockCache | HostRequest::ClearUnlockCache => unreachable!(),
         }
     }
 
@@ -694,6 +854,7 @@ mod unix {
             SessionHostClient {
                 socket_path: socket_path.to_path_buf(),
                 control: Mutex::new(None),
+                supports_unlock_cache: true,
             }
         }
 
@@ -724,7 +885,7 @@ mod unix {
 
             let first = client(&socket_path);
             let deadline = Instant::now() + Duration::from_secs(3);
-            while first.ping().is_err() {
+            while first.call(HostRequest::Ping).is_err() {
                 assert!(Instant::now() < deadline, "session host did not start");
                 thread::sleep(Duration::from_millis(20));
             }
@@ -742,7 +903,7 @@ mod unix {
             // A replacement daemon connects through a new control client. The
             // shell process, environment and working directory remain intact.
             let second = client(&socket_path);
-            second.ping().unwrap();
+            second.call(HostRequest::Ping).unwrap();
             let sessions = second.list_sessions().unwrap();
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, session_id);
@@ -755,6 +916,35 @@ mod unix {
             let text = wait_for_text(&second, &session_id, "session-host-ok:/tmp");
             assert!(text.contains("first-ready"));
             second.close_session(&session_id).unwrap();
+        }
+
+        #[test]
+        fn unlock_cache_survives_control_client_replacement_and_can_be_cleared() {
+            let directory = tempfile::tempdir().unwrap();
+            let socket_path = directory.path().join("session-host.sock");
+            let host_path = socket_path.clone();
+            thread::spawn(move || run_host(&host_path).unwrap());
+
+            let first = client(&socket_path);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while first.call(HostRequest::Ping).is_err() {
+                assert!(Instant::now() < deadline, "session host did not start");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let passphrase = SecretString::from("memory-only-passphrase".to_owned());
+            assert!(
+                first
+                    .cache_unlock_passphrase(&passphrase, Duration::from_secs(60))
+                    .unwrap()
+            );
+            drop(first);
+
+            let second = client(&socket_path);
+            second.call(HostRequest::Ping).unwrap();
+            let restored = second.read_unlock_cache().unwrap().unwrap();
+            assert_eq!(restored.expose_secret(), "memory-only-passphrase");
+            assert!(second.clear_unlock_cache().unwrap());
+            assert!(second.read_unlock_cache().unwrap().is_none());
         }
 
         #[test]
@@ -795,6 +985,35 @@ mod unix {
             assert!(socket_path.exists(), "live host socket must be preserved");
             server.join().unwrap();
         }
+
+        #[test]
+        fn legacy_live_host_is_accepted_without_unlock_cache_capability() {
+            let directory = tempfile::tempdir().unwrap();
+            let socket_path = directory.path().join("session-host.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _: HostRequest = read_json(&mut stream).unwrap();
+                write_json(
+                    &mut stream,
+                    &HostResponse::success(serde_json::json!({"version": PROTOCOL_VERSION})),
+                )
+                .unwrap();
+                let mut closed = [0u8; 1];
+                let _ = stream.read(&mut closed);
+            });
+
+            let probe = client(&socket_path).probe().unwrap();
+            assert!(matches!(
+                &probe,
+                HostProbe::Compatible {
+                    supports_unlock_cache: false,
+                    ..
+                }
+            ));
+            drop(probe);
+            server.join().unwrap();
+        }
     }
 }
 
@@ -811,6 +1030,22 @@ impl SessionHostClient {
     }
 
     pub fn connect_or_spawn() -> anyhow::Result<Self> {
+        Self::unsupported()
+    }
+
+    pub fn cache_unlock_passphrase(
+        &self,
+        _passphrase: &secrecy::SecretString,
+        _ttl: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        Self::unsupported()
+    }
+
+    pub fn read_unlock_cache(&self) -> anyhow::Result<Option<secrecy::SecretString>> {
+        Self::unsupported()
+    }
+
+    pub fn clear_unlock_cache(&self) -> anyhow::Result<bool> {
         Self::unsupported()
     }
 

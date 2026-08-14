@@ -345,7 +345,7 @@ daemon 和 `vida-mcp`；MCP 完成 initialize、加载十个工具与 resources 
 - [x] 原子写入（temp → F_FULLFSYNC → rename → fsync 父目录）
 - [x] 备份轮转（写入前 shift，上限 10 份）
 - [x] 敏感字段 zeroize（SecureString: 私钥、口令、S3 密钥）
-- [x] Keyring 仅缓存，口令解锁独立可用
+- [x] session host 仅在内存中有期缓存，口令解锁独立可用
 - [x] 断电安全模拟（原子写入保证原文件不被部分覆写）
 - [x] 主口令设置与解锁流程
 - [x] 主机条目增删改（凭据 Option 语义）
@@ -378,8 +378,8 @@ daemon 和 `vida-mcp`；MCP 完成 initialize、加载十个工具与 resources 
 1. 再次启动 GUI → 看到 S2「解锁金库」页面（不出现 S1）
 2. 输入错误口令 → 显示错误提示，留在 S2
 3. 输入正确口令 → 解锁成功 → 进入 S3
-4. 选择「记住 7 天」解锁 → 口令有期缓存到系统钥匙串（Keychain）；
-   daemon 在有效期内重启可自动解锁，过期或主动锁定后必须重新输入口令
+4. 选择「记住 7 天」解锁 → 口令仅在独立 session host 内存中有期缓存；daemon 在有效期内
+   重启可自动解锁，且 macOS 不弹系统钥匙串确认框；过期、主动锁定或系统重启后必须重新输入口令
 
 ### 场景 4：主机编辑器
 
@@ -823,3 +823,25 @@ daemon 空闲不推帧（修复 alacritty 每帧光标 damage 的空转帧）。
 峰值 261.8M。该数值包含终端文字渲染管线和 wgpu 资源首次启用后的实际常驻开销，
 不使用 RSS 替代；与 M2b-2 同一原生文字管线的单终端隔离实测 264.8M 属于同一范围，
 没有出现按终端标签重复分配约 250M 渲染资源的现象。
+
+### M10 SFTP 文件管理器
+
+- daemon 新增 Owner-only `SftpList`、`SftpCreateDirectory`、`SftpUpload`、`SftpDownload`，
+  Agent token 无权调用。目录列表同时返回服务器确认的绝对工作目录。
+- 传输复用系统 OpenSSH `sftp`；密码和私钥口令继续走一次性 askpass，内嵌私钥临时文件在操作
+  完成后删除。batch 参数拒绝换行、回车和 NUL。
+- GUI 的 SSH 终端状态栏新增 SFTP 入口；文件标签支持远端目录浏览、从家目录返回根目录、
+  筛选、新建文件夹、刷新、文件/文件夹上传及批量递归下载。本地路径来自系统文件选择器或 iced
+  原生文件拖入事件；多项目传输通过 `VecDeque` 固定目标并顺序执行。
+- 已访问目录在 GUI 中保留最多 16 份、30 秒的新鲜缓存；返回目录可即时呈现，手动刷新始终绕过
+  缓存。大目录仍由系统 `sftp` 一次读取元数据，但 GUI 每批只创建 200 个可见行，滚动接近底部
+  再追加，避免一次构造数千个 iced 控件。加载状态位于路径操作区，并在请求期间屏蔽重复导航。
+- 没有新增 Vault 字段，因此不提升金库版本。
+
+#### M10 release 内存实测（2026-08-10）
+
+指标为 `vmmap --summary <pid>` 的 `Physical footprint`，显示器 scale factor 1（1920×1080）。
+
+- 空金库 daemon：3904K，peak 3904K。
+- 打开主窗口并恢复现有终端的 GUI：263.7M，peak 264.5M。该数字包含 wgpu 窗口交换链和终端
+  surface；SFTP 状态本身只保存目录条目字符串，不持有文件内容。

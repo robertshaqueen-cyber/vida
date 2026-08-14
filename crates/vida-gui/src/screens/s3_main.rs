@@ -50,6 +50,7 @@ impl State {
                 let glyph = match tab.kind {
                     TabKind::Host { .. } => icons::SERVER,
                     TabKind::Terminal { .. } => icons::TERMINAL,
+                    TabKind::Sftp { .. } => icons::FOLDER,
                     TabKind::AddHost => icons::CIRCLE_PLUS,
                     TabKind::EditHost { .. } => icons::PENCIL,
                     TabKind::Settings => icons::SETTINGS,

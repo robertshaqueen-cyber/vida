@@ -965,8 +965,7 @@ fn draw_grid(canvas: &mut Frame<iced::Renderer>, grid: &ClientGrid, options: Dra
                     font: cell_font,
                     content: cell.ch.to_string(),
                 });
-            } else if !is_spacer && !hidden && !covered_by_menu && cell.ch != ' ' && cell.ch != '\0'
-            {
+            } else if !is_spacer && !hidden && !covered_by_menu && is_renderable_glyph(cell.ch) {
                 draw_text(
                     canvas,
                     cell.ch.to_string(),
@@ -1072,6 +1071,14 @@ fn point_to_viewport_cell(
         ((position.y / cell_height).floor() as u16).min(grid.rows - 1),
         ((position.x / cell_width).floor() as u16).min(grid.cols - 1),
     ))
+}
+
+/// 控制字符由终端状态机负责产生布局效果，不能再交给字体绘制。
+///
+/// 例如 macOS `ls` 会用 Tab 对多列结果做定位；CoreText 收到 Tab 字形时会显示为
+/// 缺字方框，而终端网格中的列位置已经包含了正确的布局结果。
+fn is_renderable_glyph(ch: char) -> bool {
+    ch != ' ' && !ch.is_control()
 }
 
 fn selected_text(
@@ -1370,6 +1377,17 @@ mod tests {
             Some("x"),
         );
         assert_eq!(alt, KeyAction::Bytes(b"\x1bx".to_vec()));
+    }
+
+    #[test]
+    fn terminal_control_cells_are_not_drawn_as_missing_glyphs() {
+        assert!(!is_renderable_glyph(' '));
+        assert!(!is_renderable_glyph('\0'));
+        assert!(!is_renderable_glyph('\t'));
+        assert!(!is_renderable_glyph('\r'));
+        assert!(!is_renderable_glyph('\n'));
+        assert!(is_renderable_glyph('A'));
+        assert!(is_renderable_glyph('中'));
     }
 
     #[test]
